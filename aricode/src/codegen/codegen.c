@@ -48,7 +48,8 @@ static void cg_error(CodegenState *cg, const char *fmt, ...) {
 /*  Forward declarations                                              */
 /* ------------------------------------------------------------------ */
 
-static void emit_expression(CodegenState *cg, const ASTNode *node);
+/* Returns 0=int, 1=float to indicate result type */
+static int  emit_expression(CodegenState *cg, const ASTNode *node);
 static void emit_statement(CodegenState *cg, const ASTNode *node);
 static void emit_block(CodegenState *cg, const ASTNode *node);
 
@@ -108,15 +109,13 @@ static void emit_float_literal(CodegenState *cg, const ASTNode *node) {
     memcpy(&bits, &val, 8);
     int n;
 
-    /* mov rax, imm64 (the IEEE 754 bits) */
+    /* mov rax, imm64 (the IEEE 754 bits) - for stack storage */
     n = emit_mov_reg_imm64(BUF(cg), REG_RAX, bits);
     EMIT(cg, n);
 
-    /* Also load into xmm0 for float operations:
-     * push rax; movsd xmm0, [rsp]; pop rax */
-    n = emit_push(BUF(cg), REG_RAX); EMIT(cg, n);
-    n = emit_movsd_xmm_mem(BUF(cg), 0, REG_RSP, 0); EMIT(cg, n);
-    n = emit_pop(BUF(cg), REG_RAX); EMIT(cg, n);
+    /* Load into xmm0: movq xmm0, rax */
+    n = emit_movq_xmm_reg(BUF(cg), 0, REG_RAX);
+    EMIT(cg, n);
 }
 
 static void emit_int_literal(CodegenState *cg, const ASTNode *node) {
@@ -136,16 +135,23 @@ static void emit_int_literal(CodegenState *cg, const ASTNode *node) {
     }
 }
 
-static void emit_identifier(CodegenState *cg, const ASTNode *node) {
+static int emit_identifier(CodegenState *cg, const ASTNode *node) {
     LocalVar *v = find_local(cg, node->string_val);
     if (!v) {
         cg_error(cg, "undefined variable '%s' at %d:%d",
                  node->string_val, node->line, node->col);
-        return;
+        return 0;
     }
     /* Load from stack: mov rax, [rbp + offset] */
     int n = emit_mov_reg_mem(BUF(cg), REG_RAX, REG_RBP, v->rbp_off);
     EMIT(cg, n);
+
+    /* If float, also load into xmm0 */
+    if (v->is_float) {
+        n = emit_movq_xmm_reg(BUF(cg), 0, REG_RAX);
+        EMIT(cg, n);
+    }
+    return v->is_float;
 }
 
 /*
@@ -179,6 +185,80 @@ static void emit_binary_op(CodegenState *cg, const ASTNode *node) {
     int n;
 
     /*
+     * FLOAT PATH: If either operand is float, use SSE instructions.
+     * Convention: left in xmm0, right in xmm1, result in xmm0.
+     * Bits also stored in RAX for stack variable compatibility.
+     */
+    int left_is_float = (left->type == NODE_FLOAT_LITERAL) ||
+        (left->type == NODE_IDENTIFIER && find_local(cg, left->string_val) &&
+         find_local(cg, left->string_val)->is_float);
+    int right_is_float = (right->type == NODE_FLOAT_LITERAL) ||
+        (right->type == NODE_IDENTIFIER && find_local(cg, right->string_val) &&
+         find_local(cg, right->string_val)->is_float);
+
+    if (left_is_float || right_is_float) {
+        /* Evaluate left -> xmm0 */
+        emit_expression(cg, left);
+        /* Save xmm0 via RAX -> stack */
+        n = emit_movq_reg_xmm(BUF(cg), REG_RAX, 0); EMIT(cg, n);
+        n = emit_push(BUF(cg), REG_RAX); EMIT(cg, n);
+
+        /* Evaluate right -> xmm0 */
+        emit_expression(cg, right);
+        /* xmm1 = right (xmm0) */
+        n = emit_movsd_xmm_xmm(BUF(cg), 1, 0); EMIT(cg, n);
+
+        /* Pop left into xmm0 via stack */
+        n = emit_movsd_xmm_mem(BUF(cg), 0, REG_RSP, 0); EMIT(cg, n);
+        n = emit_add_reg_imm(BUF(cg), REG_RSP, 8); EMIT(cg, n);
+
+        /* xmm0 = left, xmm1 = right */
+        if (strcmp(op, "+") == 0) {
+            n = emit_addsd(BUF(cg), 0, 1); EMIT(cg, n);
+        } else if (strcmp(op, "-") == 0) {
+            n = emit_subsd(BUF(cg), 0, 1); EMIT(cg, n);
+        } else if (strcmp(op, "*") == 0) {
+            n = emit_mulsd(BUF(cg), 0, 1); EMIT(cg, n);
+        } else if (strcmp(op, "/") == 0) {
+            n = emit_divsd(BUF(cg), 0, 1); EMIT(cg, n);
+        } else if (strcmp(op, "<") == 0 || strcmp(op, ">") == 0 ||
+                   strcmp(op, "<=") == 0 || strcmp(op, ">=") == 0 ||
+                   strcmp(op, "==") == 0 || strcmp(op, "!=") == 0) {
+            /* ucomisd sets CF and ZF */
+            n = emit_ucomisd(BUF(cg), 0, 1); EMIT(cg, n);
+            if (strcmp(op, "<") == 0) {
+                /* below: CF=1 */
+                uint8_t *b = BUF(cg);
+                b[0] = 0x0F; b[1] = 0x92; b[2] = modrm(3, 0, REG_RAX); EMIT(cg, 3);
+            } else if (strcmp(op, ">") == 0) {
+                /* above: CF=0 and ZF=0 */
+                uint8_t *b = BUF(cg);
+                b[0] = 0x0F; b[1] = 0x97; b[2] = modrm(3, 0, REG_RAX); EMIT(cg, 3);
+            } else if (strcmp(op, "==") == 0) {
+                n = emit_sete(BUF(cg), REG_RAX); EMIT(cg, n);
+            } else if (strcmp(op, "!=") == 0) {
+                n = emit_setne(BUF(cg), REG_RAX); EMIT(cg, n);
+            } else if (strcmp(op, "<=") == 0) {
+                uint8_t *b = BUF(cg);
+                b[0] = 0x0F; b[1] = 0x96; b[2] = modrm(3, 0, REG_RAX); EMIT(cg, 3);
+            } else { /* >= */
+                uint8_t *b = BUF(cg);
+                b[0] = 0x0F; b[1] = 0x93; b[2] = modrm(3, 0, REG_RAX); EMIT(cg, 3);
+            }
+            n = emit_movzx_reg_reg8(BUF(cg), REG_RAX, REG_RAX); EMIT(cg, n);
+            return; /* comparison returns int, not float */
+        } else {
+            cg_error(cg, "unsupported float operator '%s'", op);
+            return;
+        }
+
+        /* Move result bits from xmm0 to RAX for stack storage */
+        n = emit_movq_reg_xmm(BUF(cg), REG_RAX, 0); EMIT(cg, n);
+        return;
+    }
+
+    /*
+     * INTEGER PATH below
      * PEEPHOLE OPTIMIZATION: Immediate operand path
      * If the right side is a constant, skip push/pop and use add rax, imm
      * For commutative ops, also handle left-constant case by swapping.
@@ -859,35 +939,41 @@ static void emit_call_expr(CodegenState *cg, const ASTNode *node) {
     /* Result is in RAX per System V ABI */
 }
 
-static void emit_expression(CodegenState *cg, const ASTNode *node) {
-    if (cg->had_error || !node) return;
+static int emit_expression(CodegenState *cg, const ASTNode *node) {
+    if (cg->had_error || !node) return 0;
 
     switch (node->type) {
     case NODE_INT_LITERAL:
         emit_int_literal(cg, node);
-        break;
+        return 0;
     case NODE_FLOAT_LITERAL:
         emit_float_literal(cg, node);
-        break;
+        return 1;
     case NODE_BOOL_LITERAL:
-        emit_int_literal(cg, node); /* bool_val stored in int_val=0/1 */
-        break;
+        emit_int_literal(cg, node);
+        return 0;
     case NODE_IDENTIFIER:
-        emit_identifier(cg, node);
-        break;
+        return emit_identifier(cg, node);
     case NODE_BINARY_OP:
         emit_binary_op(cg, node);
-        break;
+        /* Check if this is a float operation by looking at children */
+        if (node->child_count >= 2 &&
+            (node->children[0]->type == NODE_FLOAT_LITERAL ||
+             (node->children[0]->type == NODE_IDENTIFIER &&
+              find_local(cg, node->children[0]->string_val) &&
+              find_local(cg, node->children[0]->string_val)->is_float)))
+            return 1;
+        return 0;
     case NODE_UNARY_OP:
         emit_unary_op(cg, node);
-        break;
+        return 0;
     case NODE_CALL:
         emit_call_expr(cg, node);
-        break;
+        return 0;
     default:
         cg_error(cg, "unsupported expression node type %s at %d:%d",
                  node_type_name(node->type), node->line, node->col);
-        break;
+        return 0;
     }
 }
 
@@ -974,10 +1060,22 @@ static void emit_var_decl(CodegenState *cg, const ASTNode *node) {
     LocalVar *v = add_local(cg, node->string_val);
     if (!v) return;
 
+    /* Check type annotation for float */
+    if (node->child_count >= 1 && node->children[0] &&
+        node->children[0]->type == NODE_TYPE_ANNOTATION &&
+        node->children[0]->string_val) {
+        const char *tname = node->children[0]->string_val;
+        if (strcmp(tname, "f64") == 0 || strcmp(tname, "f32") == 0) {
+            v->is_float = 1;
+        }
+    }
+
     if (node->child_count >= 2) {
-        /* Evaluate initializer -> RAX */
-        emit_expression(cg, node->children[1]);
-        /* Store to stack */
+        /* Evaluate initializer -> RAX (and xmm0 if float) */
+        int expr_type = emit_expression(cg, node->children[1]);
+        /* Infer float from initializer if no type annotation */
+        if (expr_type == 1 && !v->is_float) v->is_float = 1;
+        /* Store to stack (both int and float use 8-byte RAX) */
         int n = emit_mov_mem_reg(BUF(cg), REG_RBP, v->rbp_off, REG_RAX);
         EMIT(cg, n);
     }

@@ -1,0 +1,29 @@
+// aricode - Circle area calculation with f64
+// area = pi * r * r
+
+fn main() -> i32 {
+    print_str("Circle area calculator");
+    print_str("Enter radius (integer):");
+    let r_int: i32 = read_int();
+
+    // Convert to float and compute
+    let pi: f64 = 3.14159265;
+    let r: f64 = 0.0;
+    // Manual int-to-float: multiply by 1.0
+    // (proper int_to_float builtin would be better)
+
+    // For now, hardcode r=5
+    let radius: f64 = 5.0;
+    let area: f64 = pi * radius * radius;
+
+    print_str("Area of circle with r=5:");
+    print_int(float_to_int(area));
+
+    // Also test: circumference = 2 * pi * r
+    let two: f64 = 2.0;
+    let circ: f64 = two * pi * radius;
+    print_str("Circumference:");
+    print_int(float_to_int(circ));
+
+    return 0;
+}

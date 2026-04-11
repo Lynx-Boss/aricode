@@ -982,4 +982,32 @@ static inline int emit_cvttsd2si(uint8_t *buf, int gpr_dst, int xmm_src) {
     return off;
 }
 
+/*
+ * MOVQ reg, xmm  (move quadword from XMM to GPR)
+ * Opcode: 66 REX.W 0F 7E /r
+ */
+static inline int emit_movq_reg_xmm(uint8_t *buf, int gpr, int xmm) {
+    int off = 0;
+    buf[off++] = 0x66;
+    buf[off++] = rex(1, reg_ext(xmm), 0, reg_ext(gpr));
+    buf[off++] = 0x0F;
+    buf[off++] = 0x7E;
+    buf[off++] = modrm(3, xmm & 7, gpr & 7);
+    return off;
+}
+
+/*
+ * MOVQ xmm, reg  (move quadword from GPR to XMM)
+ * Opcode: 66 REX.W 0F 6E /r
+ */
+static inline int emit_movq_xmm_reg(uint8_t *buf, int xmm, int gpr) {
+    int off = 0;
+    buf[off++] = 0x66;
+    buf[off++] = rex(1, reg_ext(xmm), 0, reg_ext(gpr));
+    buf[off++] = 0x0F;
+    buf[off++] = 0x6E;
+    buf[off++] = modrm(3, xmm & 7, gpr & 7);
+    return off;
+}
+
 #endif /* ARICODE_X86_64_H */

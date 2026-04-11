@@ -1,0 +1,29 @@
+Copyright (c) 2026 Edwin F. Veliz Jaramillo (lynxcraft)
+
+All rights reserved.
+
+The aricode programming language, compiler, runtime, specification,
+benchmark suite, and all associated documentation in this repository
+are the intellectual property of Edwin F. Veliz Jaramillo.
+
+TERMS:
+
+1. NO PERMISSION is granted to copy, modify, merge, publish, distribute,
+   sublicense, or sell copies of this software or any derivative works
+   without explicit written permission from the copyright holder.
+
+2. This software may be used for EVALUATION AND ACADEMIC REFERENCE ONLY.
+   Any academic work that references this software must cite:
+
+     Veliz Jaramillo, E.F. (2026). "Aricode: A Compiled Language with
+     Mandatory Error Handling and Direct x86_64 Code Generation."
+     arXiv preprint.
+
+3. The name "aricode", the five-level error classification system,
+   the Podium performance rating system, and the AriDecimal type
+   are original works of the copyright holder.
+
+4. Contributions to this repository, if accepted, transfer copyright
+   to the copyright holder unless otherwise agreed in writing.
+
+For licensing inquiries: lynxcraft@gmail.com

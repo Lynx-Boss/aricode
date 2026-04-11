@@ -27,6 +27,9 @@ sparring/results/
 *.swo
 *~
 
+# Credentials
+.env
+
 # OS files
 .DS_Store
 

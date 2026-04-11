@@ -80,10 +80,13 @@ typedef struct {
     int         catch_depth;       /* current nesting depth             */
 
     /* Loop break/continue targets */
-    size_t      loop_start[32];    /* code offset of loop condition     */
-    size_t      loop_end_patches[32][16]; /* JMP positions to patch at end */
+    size_t      loop_start[32];    /* continue target for while loops          */
+    size_t      loop_end_patches[32][16]; /* break JMP positions to patch    */
+    size_t      loop_cont_patches[32][16]; /* continue JMP positions (for)  */
     int         loop_end_count[32]; /* number of break JMPs per level   */
-    int         loop_depth;        /* current loop nesting depth        */
+    int         loop_cont_count[32]; /* number of continue JMPs (for)  */
+    int         loop_is_for[32];   /* 1=for loop, 0=while loop           */
+    int         loop_depth;
 
     /* Error tracking */
     int         had_error;

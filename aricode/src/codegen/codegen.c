@@ -1300,23 +1300,38 @@ static void emit_call_expr(CodegenState *cg, const ASTNode *node) {
         }
 
         if (strcmp(callee->string_val, "str_concat") == 0 && argc == 2) {
-            /* Evaluate b, push; evaluate a, pop b */
-            emit_expression(cg, node->children[2]);
-            int pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
-            emit_expression(cg, node->children[1]);
-            pn = emit_pop(BUF(cg), REG_RCX); EMIT(cg, pn);
-            /* RAX=a, RCX=b. Save both. */
-            pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn); /* save a */
-            pn = emit_push(BUF(cg), REG_RCX); EMIT(cg, pn); /* save b */
+            /* Simpler approach: use locals to save a, b, and their lengths.
+             * All mmap-clobberable state is in stack locals. */
+            int pn; uint8_t *b;
 
-            /* len_a = [rax-8], len_b = [rcx-8] */
-            uint8_t *b;
-            pn = emit_mov_reg_mem(BUF(cg), REG_R10, REG_RAX, -8); EMIT(cg, pn);
-            pn = emit_mov_reg_mem(BUF(cg), REG_R11, REG_RCX, -8); EMIT(cg, pn);
+            /* Evaluate a and b, save as locals */
+            LocalVar *va = add_local(cg, "__ca");
+            LocalVar *vb = add_local(cg, "__cb");
+            LocalVar *vn = add_local(cg, "__cn"); /* new buffer */
+            if (!va || !vb || !vn) return;
 
-            /* total = len_a + len_b + 8 (header) + 1 (safety) */
-            pn = emit_mov_reg_reg(BUF(cg), REG_RSI, REG_R10); EMIT(cg, pn);
-            pn = emit_add_reg_reg(BUF(cg), REG_RSI, REG_R11); EMIT(cg, pn);
+            emit_expression(cg, node->children[1]); /* a → RAX */
+            pn = emit_mov_mem_reg(BUF(cg), REG_RBP, va->rbp_off, REG_RAX);
+            EMIT(cg, pn);
+
+            emit_expression(cg, node->children[2]); /* b → RAX */
+            pn = emit_mov_mem_reg(BUF(cg), REG_RBP, vb->rbp_off, REG_RAX);
+            EMIT(cg, pn);
+
+            /* Compute total length: len_a + len_b */
+            pn = emit_mov_reg_mem(BUF(cg), REG_RAX, REG_RBP, va->rbp_off);
+            EMIT(cg, pn);
+            pn = emit_mov_reg_mem(BUF(cg), REG_RAX, REG_RAX, -8); EMIT(cg, pn);
+            pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn); /* save len_a */
+
+            pn = emit_mov_reg_mem(BUF(cg), REG_RAX, REG_RBP, vb->rbp_off);
+            EMIT(cg, pn);
+            pn = emit_mov_reg_mem(BUF(cg), REG_RAX, REG_RAX, -8); EMIT(cg, pn);
+            pn = emit_pop(BUF(cg), REG_RCX); EMIT(cg, pn); /* RCX = len_a */
+            /* RSI = len_a + len_b + 9 */
+            pn = emit_mov_reg_reg(BUF(cg), REG_RSI, REG_RAX); EMIT(cg, pn);
+            pn = emit_add_reg_reg(BUF(cg), REG_RSI, REG_RCX); EMIT(cg, pn);
+            pn = emit_push(BUF(cg), REG_RSI); EMIT(cg, pn); /* save total_len */
             pn = emit_add_reg_imm(BUF(cg), REG_RSI, 9); EMIT(cg, pn);
 
             /* mmap */
@@ -1328,38 +1343,37 @@ static void emit_call_expr(CodegenState *cg, const ASTNode *node) {
             v2=-1; memcpy(b+3,&v2,4); EMIT(cg,7);
             b = BUF(cg); b[0]=0x4D; b[1]=0x31; b[2]=0xC9; EMIT(cg,3);
             pn = emit_mov_reg_imm32(BUF(cg), REG_RAX, 9); EMIT(cg, pn);
-            /* Save r10, r11 (mmap clobbers) */
-            pn = emit_push(BUF(cg), REG_R10); EMIT(cg, pn);
-            pn = emit_push(BUF(cg), REG_R11); EMIT(cg, pn);
             pn = emit_syscall(BUF(cg)); EMIT(cg, pn);
-            pn = emit_pop(BUF(cg), REG_R11); EMIT(cg, pn);
-            pn = emit_pop(BUF(cg), REG_R10); EMIT(cg, pn);
 
-            /* RAX = new buffer. Store total length. */
-            pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn); /* save new_ptr */
-            pn = emit_mov_reg_reg(BUF(cg), REG_RCX, REG_R10); EMIT(cg, pn);
-            pn = emit_add_reg_reg(BUF(cg), REG_RCX, REG_R11); EMIT(cg, pn);
+            /* Save new buffer ptr to local */
+            pn = emit_mov_mem_reg(BUF(cg), REG_RBP, vn->rbp_off, REG_RAX);
+            EMIT(cg, pn);
+
+            /* Store total length at [new_ptr] */
+            pn = emit_pop(BUF(cg), REG_RCX); EMIT(cg, pn); /* total_len */
             b = BUF(cg);
             b[0]=rex(1,reg_ext(REG_RCX),0,reg_ext(REG_RAX));
             b[1]=0x89; b[2]=modrm(0,REG_RCX,REG_RAX); EMIT(cg,3);
 
-            /* Copy a: RDI=rax+8, RSI=a_base, RCX=len_a */
+            /* Copy a: dst=new_ptr+8, src=a_base, len=len_a */
+            pn = emit_mov_reg_mem(BUF(cg), REG_RDI, REG_RBP, vn->rbp_off);
+            EMIT(cg, pn);
+            pn = emit_add_reg_imm(BUF(cg), REG_RDI, 8); EMIT(cg, pn);
+            pn = emit_mov_reg_mem(BUF(cg), REG_RSI, REG_RBP, va->rbp_off);
+            EMIT(cg, pn);
+            pn = emit_mov_reg_mem(BUF(cg), REG_RCX, REG_RSI, -8); EMIT(cg, pn);
+            b = BUF(cg); b[0]=0xF3; b[1]=0xA4; EMIT(cg,2); /* rep movsb */
+
+            /* Copy b: dst=RDI (advanced), src=b_base, len=len_b */
+            pn = emit_mov_reg_mem(BUF(cg), REG_RSI, REG_RBP, vb->rbp_off);
+            EMIT(cg, pn);
+            pn = emit_mov_reg_mem(BUF(cg), REG_RCX, REG_RSI, -8); EMIT(cg, pn);
+            b = BUF(cg); b[0]=0xF3; b[1]=0xA4; EMIT(cg,2); /* rep movsb */
+
+            /* Return base = new_ptr + 8 */
+            pn = emit_mov_reg_mem(BUF(cg), REG_RAX, REG_RBP, vn->rbp_off);
+            EMIT(cg, pn);
             pn = emit_add_reg_imm(BUF(cg), REG_RAX, 8); EMIT(cg, pn);
-            pn = emit_mov_reg_reg(BUF(cg), REG_RDI, REG_RAX); EMIT(cg, pn);
-            /* Load a from stack [rsp+24] (new_ptr, b, a on stack) */
-            pn = emit_mov_reg_mem(BUF(cg), REG_RSI, REG_RSP, 16); EMIT(cg, pn);
-            pn = emit_mov_reg_reg(BUF(cg), REG_RCX, REG_R10); EMIT(cg, pn);
-            b = BUF(cg); b[0]=0xF3; b[1]=0xA4; EMIT(cg,2); /* rep movsb */
-
-            /* Copy b: RDI already advanced, RSI=b_base, RCX=len_b */
-            pn = emit_mov_reg_mem(BUF(cg), REG_RSI, REG_RSP, 8); EMIT(cg, pn);
-            pn = emit_mov_reg_reg(BUF(cg), REG_RCX, REG_R11); EMIT(cg, pn);
-            b = BUF(cg); b[0]=0xF3; b[1]=0xA4; EMIT(cg,2); /* rep movsb */
-
-            /* Clean up stack: pop new_ptr, b, a */
-            pn = emit_pop(BUF(cg), REG_RAX); EMIT(cg, pn); /* new_ptr */
-            pn = emit_add_reg_imm(BUF(cg), REG_RSP, 16); EMIT(cg, pn); /* discard a,b */
-            pn = emit_add_reg_imm(BUF(cg), REG_RAX, 8); EMIT(cg, pn); /* return base */
             return;
         }
 
@@ -1712,6 +1726,8 @@ static void emit_while(CodegenState *cg, const ASTNode *node) {
     int ld = cg->loop_depth;
     if (ld < 32) {
         cg->loop_end_count[ld] = 0;
+        cg->loop_cont_count[ld] = 0;
+        cg->loop_is_for[ld] = 0; /* while loop */
         cg->loop_depth++;
     }
 
@@ -1803,11 +1819,20 @@ static void emit_for(CodegenState *cg, const ASTNode *node) {
         return;
     }
 
+    /* Push loop context */
+    int ld = cg->loop_depth;
+    if (ld < 32) {
+        cg->loop_end_count[ld] = 0;
+        cg->loop_cont_count[ld] = 0;
+        cg->loop_is_for[ld] = 1; /* for loop: continue patches needed */
+        cg->loop_depth++;
+    }
+
     /* Initializer */
     emit_statement(cg, node->children[0]);
 
-    /* loop_start label */
-    size_t loop_start = cg->code_size;
+    /* Condition start (for JMP back after update) */
+    size_t cond_start = cg->code_size;
 
     /* Condition */
     emit_expression(cg, node->children[1]);
@@ -1822,6 +1847,16 @@ static void emit_for(CodegenState *cg, const ASTNode *node) {
     /* Body */
     emit_block(cg, node->children[3]);
 
+    /* Update position = continue target for `for` loops.
+     * Patch all continue JMPs emitted during the body to land here. */
+    if (ld < 32) {
+        for (int ci = 0; ci < cg->loop_cont_count[ld]; ci++) {
+            size_t cont_jmp = cg->loop_cont_patches[ld][ci];
+            int32_t cont_off = (int32_t)(cg->code_size - (cont_jmp + 5));
+            memcpy(cg->code + cont_jmp + 1, &cont_off, 4);
+        }
+    }
+
     /* Update (might be assignment expression) */
     if (node->children[2]->type == NODE_BINARY_OP &&
         node->children[2]->op && strcmp(node->children[2]->op, "=") == 0) {
@@ -1830,14 +1865,24 @@ static void emit_for(CodegenState *cg, const ASTNode *node) {
         emit_expression(cg, node->children[2]);
     }
 
-    /* JMP back to loop_start */
-    int32_t back_rel = (int32_t)((int64_t)loop_start - (int64_t)(cg->code_size + 5));
+    /* JMP back to condition */
+    int32_t back_rel = (int32_t)((int64_t)cond_start - (int64_t)(cg->code_size + 5));
     n = emit_jmp(BUF(cg), back_rel);
     EMIT(cg, n);
 
     /* Patch JE */
     int32_t je_off = (int32_t)(cg->code_size - (je_pos + 6));
     memcpy(cg->code + je_pos + 2, &je_off, 4);
+
+    /* Patch break JMPs */
+    if (ld < 32) {
+        for (int bi = 0; bi < cg->loop_end_count[ld]; bi++) {
+            size_t brk = cg->loop_end_patches[ld][bi];
+            int32_t brk_off = (int32_t)(cg->code_size - (brk + 5));
+            memcpy(cg->code + brk + 1, &brk_off, 4);
+        }
+        cg->loop_depth--;
+    }
 }
 
 static void emit_statement(CodegenState *cg, const ASTNode *node) {
@@ -1872,12 +1917,20 @@ static void emit_statement(CodegenState *cg, const ASTNode *node) {
         break;
     }
     case NODE_CONTINUE: {
-        /* JMP back to loop start */
         if (cg->loop_depth > 0) {
             int ld = cg->loop_depth - 1;
-            int32_t rel = (int32_t)((int64_t)cg->loop_start[ld] -
-                                    (int64_t)(cg->code_size + 5));
-            int n = emit_jmp(BUF(cg), rel); EMIT(cg, n);
+            if (cg->loop_is_for[ld]) {
+                /* For loop: continue → forward jump to update (patched later) */
+                if (cg->loop_cont_count[ld] < 16) {
+                    cg->loop_cont_patches[ld][cg->loop_cont_count[ld]++] = cg->code_size;
+                }
+                int n = emit_jmp(BUF(cg), 0); EMIT(cg, n); /* placeholder */
+            } else {
+                /* While loop: continue → jump back to condition */
+                int32_t rel = (int32_t)((int64_t)cg->loop_start[ld] -
+                                        (int64_t)(cg->code_size + 5));
+                int n = emit_jmp(BUF(cg), rel); EMIT(cg, n);
+            }
         }
         break;
     }

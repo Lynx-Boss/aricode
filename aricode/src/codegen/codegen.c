@@ -1618,12 +1618,21 @@ static void emit_var_decl(CodegenState *cg, const ASTNode *node) {
         }
     }
 
-    if (node->child_count >= 2) {
-        /* Evaluate initializer -> RAX (and xmm0 if float) */
-        int expr_type = emit_expression(cg, node->children[1]);
-        /* Infer float from initializer if no type annotation */
+    /* Find the initializer expression:
+     * If child[0] is TYPE_ANNOTATION, init is child[1]
+     * If child[0] is NOT TYPE_ANNOTATION, init is child[0] (no type given) */
+    ASTNode *init_expr = NULL;
+    if (node->child_count >= 2 && node->children[0] &&
+        node->children[0]->type == NODE_TYPE_ANNOTATION) {
+        init_expr = node->children[1];
+    } else if (node->child_count >= 1 && node->children[0] &&
+               node->children[0]->type != NODE_TYPE_ANNOTATION) {
+        init_expr = node->children[0];
+    }
+
+    if (init_expr) {
+        int expr_type = emit_expression(cg, init_expr);
         if (expr_type == 1 && !v->is_float) v->is_float = 1;
-        /* Store to stack (both int and float use 8-byte RAX) */
         int n = emit_mov_mem_reg(BUF(cg), REG_RBP, v->rbp_off, REG_RAX);
         EMIT(cg, n);
     }

@@ -124,12 +124,10 @@ static AriType *analyze_binary_op(Analyzer *a, ASTNode *node) {
                        node->line, node->col,
                        "Division by constant zero");
         }
-        /* Variable divisor without guard -- in aricode, any division
-         * by a variable that is not wrapped in an if-check is flagged.
-         * The analyzer is conservative: if the RHS is an identifier,
-         * we require a guard. */
+        /* Variable divisor without guard -- warn but don't block.
+         * Constant zero is SILENT (blocks), variable is WARNING. */
         else if (node->children[1]->type == NODE_IDENTIFIER) {
-            emit_error(a, ARI_LEVEL_SILENT, ARI_S001_CODE, ARI_S001_FIX,
+            emit_error(a, ARI_LEVEL_WARNING, ARI_W004_CODE, ARI_S001_FIX,
                        node->line, node->col,
                        "Division by '%s' without zero-check guard",
                        node->children[1]->string_val);

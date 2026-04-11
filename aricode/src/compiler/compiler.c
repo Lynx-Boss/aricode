@@ -262,9 +262,11 @@ int compiler_compile_string(Compiler *c, const char *source,
                CLR_DIM, CLR_RESET);
     }
 
-    if (c->error_count == 0 && ast && c->options.verbose) {
-        /* Semantic analysis runs in verbose mode. Use --verbose to enable.
-         * The analyzer enforces aricode's 5-level error hierarchy. */
+    if (c->error_count == 0 && ast) {
+        /* THE GUARDIAN: Semantic analysis enforces aricode's error hierarchy.
+         * Level 0 (SILENT) errors BLOCK compilation - zero silent errors.
+         * Level 1 (LOGIC) errors are reported as warnings (codegen handles many).
+         * Level 2 warnings are informational. */
         Analyzer analyzer;
         analyzer_init(&analyzer, ast);
 
@@ -291,23 +293,25 @@ int compiler_compile_string(Compiler *c, const char *source,
                                    ft, 0, 0);
         }
 
-        bool sem_ok = analyzer_analyze(&analyzer);
+        analyzer_analyze(&analyzer);
 
-        if (analyzer.level2_count > 0) {
-            /* Print warnings (level 2) - don't block compilation */
+        if (analyzer.level0_count > 0) {
+            /* Level 0 (SILENT) errors BLOCK compilation.
+             * This is aricode's core promise: code that can fail
+             * silently does NOT compile. */
+            printf("  %s[FAIL]%s Semantic analysis: %zu SILENT error(s) — "
+                   "compilation BLOCKED\n",
+                   CLR_RED, CLR_RESET, analyzer.level0_count);
             analyzer_print_errors(&analyzer);
-        }
-
-        if (!sem_ok) {
-            /* Level 0 (SILENT) or Level 1 (LOGIC) errors block compilation */
-            printf("  %s[FAIL]%s Semantic analysis: %zu error(s)\n",
-                   CLR_RED, CLR_RESET, analyzer.error_count);
-            analyzer_print_errors(&analyzer);
-            c->error_count += analyzer.level0_count + analyzer.level1_count;
+            c->error_count += analyzer.level0_count;
             analyzer_destroy(&analyzer);
         } else {
+            size_t total_warnings = analyzer.level1_count + analyzer.level2_count;
+            if (total_warnings > 0 && c->options.verbose) {
+                analyzer_print_errors(&analyzer);
+            }
             printf("  %s[OK]%s Semantic analysis: %zu warning(s)\n",
-                   CLR_GREEN, CLR_RESET, analyzer.level2_count);
+                   CLR_GREEN, CLR_RESET, total_warnings);
             analyzer_destroy(&analyzer);
         }
     } else if (c->error_count > 0) {

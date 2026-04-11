@@ -21,60 +21,57 @@ Every language lets bugs slip through. Aricode doesn't.
 | Null without check | segfault | panic | `unwrap` panic | **won't compile** |
 | Empty catch block | swallows error | - | - | **won't compile** |
 | Data loss (i64->i32) | silent | silent | warning | **won't compile** |
-| Unused variable | ignored | error | warning | **warning** |
-
-Aricode classifies all errors into 5 levels:
-
-| Level | Name | Action |
-|-------|------|--------|
-| 0 | SILENT | **Blocks compilation** - code that could fail silently |
-| 1 | LOGIC | **Blocks compilation** - type errors, undefined vars |
-| 2 | WARNING | Reports but compiles - unused vars, shadowing |
-| 3 | SYSTEM | Must be caught at runtime - file I/O, network |
-| 4 | CATASTROPHIC | Log and terminate - out of memory |
+| 0.1 + 0.2 = 0.3? | false | false | false | **true (dec type)** |
 
 ## Features
 
+### Language
+- **Types:** i32, f64 (SSE2), dec (exact decimal), str (heap strings), bool, arrays, structs
+- **Control flow:** if/else, while, for, match, break, continue, return
+- **Operators:** `+` `-` `*` `/` `%` `&` `|` `^` `<<` `>>` `==` `!=` `<` `>` `<=` `>=` `&&` `||` `!` `?:`
+- **Compound:** `+=` `-=` `*=` `/=`
+- **Functions:** parameters, return values, recursion, tail call optimization
+- **Error handling:** try/catch across functions, error.raise
+- **Data structures:** heap arrays (mmap), struct patterns
+
+### Builtins (23)
+| Category | Functions |
+|----------|-----------|
+| **Console** | print_str, print_int, print_float, print_dec, read_int, read_float |
+| **Strings** | str_new, str_len, str_eq, str_char_at, str_println, str_concat |
+| **Arrays** | arr_new, arr_get, arr_set, arr_len |
+| **Files** | file_open, file_read, file_write, file_close |
+| **Convert** | int_to_float, float_to_int, dec |
+
+### Compiler
 - **Direct x86_64 codegen** - AST to machine code, no LLVM, no IR
-- **Minimal binaries** - 157 bytes (addition) to 2.2 KB (structs)
-- **try/catch** - Cross-function error handling via callee-saved registers
-- **error.raise** - Explicit error propagation, never silent
-- **Optimizer** - Constant folding, strength reduction, tail call optimization, dead code elimination
-- **f64 floats** - SSE2 instructions for double-precision arithmetic
-- **Heap arrays** - mmap-allocated, length-prefixed
-- **Structs** - Via array pattern with constructor/accessor functions
-- **I/O** - print_str, print_int, read_int builtins
-- **Loops** - while, for with full variable assignment
-- **Bitwise** - &, |, ^, <<, >> operators
-- **Podium system** - Compile-time code quality rating (Gold/Silver/Bronze/Iron)
-- **Decimal arithmetic** - Native AriDecimal type (0.1 + 0.2 = 0.3 exactly)
+- **Minimal ELF binaries** - 199 bytes (Hello World) to 3.3 KB (physics sim)
+- **6 optimization passes** - constant folding, strength reduction, peephole, TCO, DCE, decimal folding
+- **Semantic analyzer** - 5-level error hierarchy, always-on, zero false positives
+- **Podium system** - compile-time code quality rating (Gold/Silver/Bronze/Iron)
 
 ## Benchmarks
 
-Aricode competes with hand-written x86_64 assembly across 12 challenges:
+14 challenges, 154 binaries, 12 implementations:
 
 ```
-  OVERALL SPARRING CHAMPION (108 binaries, 10 implementations)
+  OVERALL SPARRING CHAMPION
 
-  #1   aricode            334 points
-  #2   NASM x86_64 asm    331 points
-  #3   C (gcc -O3)        213 points
-  #4   C (gcc -O2)        208 points
-  ...
-  #9   Rust               86 points
-  #10  Go                 72 points
+  #1   NASM x86_64 asm    475 points
+  #2   aricode            468 points
+  #3   C (gcc -O2)        315 points
+  #7   C (clang -O2)      262 points
+  #11  Rust               100 points  (4.7x behind aricode)
+  #12  Go                  84 points  (5.6x behind aricode)
 ```
 
 **Binary size comparison:**
 
-| Program | Aricode | NASM | GCC static | Rust | Go |
-|---------|---------|------|------------|------|-----|
-| Hello World | **199 B** | - | 754 KB | 11.3 MB | 1.8 MB |
-| Fibonacci | **268 B** | 408 B | 754 KB | 11.3 MB | 1.8 MB |
-| Bubble Sort | **1,315 B** | - | 754 KB | 11.3 MB | 1.8 MB |
-| Mersenne prime | **374 B** | 400 B | 754 KB | 11.3 MB | 1.8 MB |
-
-Aricode binaries are **72,000x smaller than Rust** and **12,000x smaller than Go**.
+| Program | Aricode | GCC static | Rust | Go |
+|---------|---------|------------|------|-----|
+| Hello World | **199 B** | 754 KB | 11.3 MB | 1.8 MB |
+| Bubble Sort | **1,315 B** | 754 KB | 11.3 MB | 1.8 MB |
+| File I/O | **947 B** | 754 KB | 11.3 MB | 1.8 MB |
 
 ## Quick Start
 
@@ -82,24 +79,18 @@ Aricode binaries are **72,000x smaller than Rust** and **12,000x smaller than Go
 # Build the compiler
 cd aricode/src/compiler && make
 
-# Compile and run Hello World
+# Hello World
 ./aric ../../examples/hello_world.ari -o hello
 ./hello
-# Output: Hello, World!
 
-# Interactive calculator
-./aric ../../examples/calculator.ari -o calc
-./calc
-
-# Error handling demo
-./aric ../../examples/error_handling.ari -o errors
-./errors
+# Run all 23 automated tests
+cd ../../tests && bash run_all.sh
 ```
 
 ## Examples
 
-| File | What it does | Binary size |
-|------|-------------|-------------|
+| File | What it does | Binary |
+|------|-------------|--------|
 | [hello_world.ari](aricode/examples/hello_world.ari) | Hello World | 199 B |
 | [fibonacci.ari](aricode/examples/fibonacci.ari) | First 20 Fibonacci numbers | 422 B |
 | [primes.ari](aricode/examples/primes.ari) | All primes below 100 | 674 B |
@@ -107,8 +98,34 @@ cd aricode/src/compiler && make
 | [circle.ari](aricode/examples/circle.ari) | f64 circle area (SSE2) | 1,069 B |
 | [sort.ari](aricode/examples/sort.ari) | Bubble sort with arrays | 1,315 B |
 | [structs.ari](aricode/examples/structs.ari) | Point and Rectangle structs | 2,270 B |
+| [structs2.ari](aricode/examples/structs2.ari) | Vector collection with for loops | 1,845 B |
 | [error_handling.ari](aricode/examples/error_handling.ari) | try/catch across functions | 1,605 B |
 | [demo.ari](aricode/examples/demo.ari) | Full language showcase | 1,538 B |
+| [physics.ari](aricode/examples/physics.ari) | Projectile motion simulation | 3,347 B |
+| [exact_math.ari](aricode/examples/exact_math.ari) | 0.1 + 0.2 = 0.3 (exact decimal) | 1,290 B |
+| [strings.ari](aricode/examples/strings.ari) | String operations | 2,272 B |
+| [guessing_game.ari](aricode/examples/guessing_game.ari) | Interactive number guessing | 1,021 B |
+| [fileio.ari](aricode/examples/fileio.ari) | File read/write | 947 B |
+
+## Test Suite
+
+23 automated tests covering all language features:
+
+```bash
+cd aricode/tests && bash run_all.sh
+```
+
+```
+  --- Basic Output ---       3/3 PASS
+  --- Arithmetic ---         2/2 PASS
+  --- Control Flow ---       6/6 PASS
+  --- Functions ---          2/2 PASS
+  --- Types ---              2/2 PASS (f64 + exact decimal)
+  --- Data Structures ---    5/5 PASS
+  --- Error Handling ---     1/1 PASS
+  --- I/O ---                2/2 PASS
+  Total: 23/23 PASS
+```
 
 ## Compiler Architecture
 
@@ -116,27 +133,37 @@ cd aricode/src/compiler && make
 Source (.ari)
     |
     v
- [Lexer] --> tokens (40+ types)
+ [Lexer] ──────── 40+ token types, keywords, operators
     |
     v
- [Parser] --> AST (recursive descent)
+ [Parser] ─────── recursive descent, AST generation
     |
     v
- [Semantic Analyzer] --> 5-level error enforcement
+ [Semantic] ───── 5-level error enforcement (THE GUARDIAN)
     |
     v
- [Optimizer] --> constant fold, strength reduce, TCO, DCE
+ [Optimizer] ──── constant fold, strength reduce, TCO, DCE, decimal fold
     |
     v
- [Codegen] --> raw x86_64 machine code
+ [Codegen] ────── x86_64 + SSE2, 23 builtins, try/catch via R12-R15
     |
     v
- [ELF Writer] --> minimal Linux binary (120 byte header)
+ [ELF Writer] ─── minimal Linux binary (120 byte header)
 ```
+
+## Error Levels
+
+| Level | Name | Action | Example |
+|-------|------|--------|---------|
+| 0 | SILENT | **Blocks compilation** | `10 / 0` |
+| 1 | LOGIC | Warning | Type mismatch |
+| 2 | WARNING | Informational | Unused variable |
+| 3 | SYSTEM | Must catch at runtime | File not found |
+| 4 | CATASTROPHIC | Log and terminate | Out of memory |
 
 ## Sparring Challenges
 
-12 challenges across 5 categories, benchmarked against C, Rust, Go, NASM, Python:
+14 challenges across 7 categories:
 
 | Category | Challenges |
 |----------|-----------|
@@ -145,66 +172,22 @@ Source (.ari)
 | Number Theory | Collatz conjecture, Mersenne M31 prime |
 | Algorithms | GCD, Prime counting, Integer sqrt, Powmod |
 | AI/ML | Perceptron neural network, Minimax game AI |
+| Float | Leibniz pi approximation |
+| Arrays | Array sum |
 
-Run the sparring suite:
 ```bash
 cd aricode/sparring
-bash build_all.sh      # Build all 108 binaries
-bash benchmark.sh      # Run benchmarks
-bash sparring_report.sh # Generate podium report
-```
-
-## Language Syntax
-
-```javascript
-// Functions
-fn add(a: i32, b: i32) -> i32 {
-    return a + b;
-}
-
-// Variables and loops
-let sum: i32 = 0;
-for (let i: i32 = 0; i < 10; i = i + 1) {
-    sum = sum + i;
-}
-
-// Error handling
-fn safe_divide(a: i32, b: i32) -> i32 {
-    if (b == 0) {
-        error.raise(1, "division by zero");
-    }
-    return a / b;
-}
-
-try {
-    let result: i32 = safe_divide(10, 0);
-} catch (e: Error) {
-    print_str("Caught error!");
-    print_int(e);
-}
-
-// Arrays and structs
-let data: i32 = arr_new(5);
-arr_set(data, 0, 42);
-print_int(arr_get(data, 0));
-
-// Floats (SSE2)
-let pi: f64 = 3.14159265;
-let area: f64 = pi * r * r;
+bash build_all.sh        # Build 154 binaries
+bash benchmark.sh        # Run benchmarks
+bash sparring_report.sh  # Podium report
 ```
 
 ## Paper
 
-A scientific paper describing aricode's design is available:
-
 **"Aricode: A Compiled Language with Mandatory Error Handling and Direct x86_64 Code Generation"**
 
-See [paper/aricode_paper.tex](paper/aricode_paper.tex) for the full LaTeX source.
+See [paper/aricode_paper.tex](paper/aricode_paper.tex)
 
 ## License
 
 Copyright (c) 2026 Edwin F. Veliz Jaramillo. All rights reserved. See [LICENSE](LICENSE).
-
-## Author
-
-Edwin F. Veliz Jaramillo (lynxcraft) - Independent Researcher

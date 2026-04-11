@@ -910,6 +910,16 @@ static ASTNode *parse_statement(Parser *p) {
     if (match(p, TOKEN_MATCH))   return parse_match(p);
     if (match(p, TOKEN_TRY))     return parse_try_catch(p);
     if (match(p, TOKEN_ERROR))   return parse_error_raise(p);
+    if (match(p, TOKEN_BREAK)) {
+        ASTNode *n = ast_create_node(NODE_BREAK, previous(p)->line, previous(p)->col);
+        expect(p, TOKEN_SEMICOLON, "';' after break");
+        return n;
+    }
+    if (match(p, TOKEN_CONTINUE)) {
+        ASTNode *n = ast_create_node(NODE_CONTINUE, previous(p)->line, previous(p)->col);
+        expect(p, TOKEN_SEMICOLON, "';' after continue");
+        return n;
+    }
 
     if (check(p, TOKEN_LBRACE))  return parse_block(p);
 

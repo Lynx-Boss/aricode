@@ -79,6 +79,12 @@ typedef struct {
     size_t      catch_rsp_slots[32]; /* stack slot offsets for saved RSP */
     int         catch_depth;       /* current nesting depth             */
 
+    /* Loop break/continue targets */
+    size_t      loop_start[32];    /* code offset of loop condition     */
+    size_t      loop_end_patches[32][16]; /* JMP positions to patch at end */
+    int         loop_end_count[32]; /* number of break JMPs per level   */
+    int         loop_depth;        /* current loop nesting depth        */
+
     /* Error tracking */
     int         had_error;
     char        error_msg[512];

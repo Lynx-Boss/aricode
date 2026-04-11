@@ -1708,8 +1708,16 @@ static void emit_while(CodegenState *cg, const ASTNode *node) {
         return;
     }
 
+    /* Push loop context for break/continue */
+    int ld = cg->loop_depth;
+    if (ld < 32) {
+        cg->loop_end_count[ld] = 0;
+        cg->loop_depth++;
+    }
+
     /* loop_start label */
     size_t loop_start = cg->code_size;
+    if (ld < 32) cg->loop_start[ld] = loop_start;
 
     /* Evaluate condition -> RAX */
     emit_expression(cg, node->children[0]);
@@ -1734,6 +1742,16 @@ static void emit_while(CodegenState *cg, const ASTNode *node) {
     /* Patch JE to point here (loop_end) */
     int32_t je_off = (int32_t)(cg->code_size - (je_pos + 6));
     memcpy(cg->code + je_pos + 2, &je_off, 4);
+
+    /* Patch all break JMPs to point here */
+    if (ld < 32) {
+        for (int bi = 0; bi < cg->loop_end_count[ld]; bi++) {
+            size_t brk = cg->loop_end_patches[ld][bi];
+            int32_t brk_off = (int32_t)(cg->code_size - (brk + 5));
+            memcpy(cg->code + brk + 1, &brk_off, 4);
+        }
+        cg->loop_depth--;
+    }
 }
 
 /*
@@ -1842,6 +1860,27 @@ static void emit_statement(CodegenState *cg, const ASTNode *node) {
     case NODE_FOR:
         emit_for(cg, node);
         break;
+    case NODE_BREAK: {
+        /* JMP to loop end (will be patched when loop finishes) */
+        if (cg->loop_depth > 0) {
+            int ld = cg->loop_depth - 1;
+            if (cg->loop_end_count[ld] < 16) {
+                cg->loop_end_patches[ld][cg->loop_end_count[ld]++] = cg->code_size;
+            }
+            int n = emit_jmp(BUF(cg), 0); EMIT(cg, n); /* placeholder */
+        }
+        break;
+    }
+    case NODE_CONTINUE: {
+        /* JMP back to loop start */
+        if (cg->loop_depth > 0) {
+            int ld = cg->loop_depth - 1;
+            int32_t rel = (int32_t)((int64_t)cg->loop_start[ld] -
+                                    (int64_t)(cg->code_size + 5));
+            int n = emit_jmp(BUF(cg), rel); EMIT(cg, n);
+        }
+        break;
+    }
     case NODE_EXPR_STMT:
         /* Check for assignment expression (NODE_BINARY_OP with op="=") */
         if (node->child_count > 0 && node->children[0]->type == NODE_BINARY_OP &&

@@ -36,6 +36,8 @@ typedef enum {
     NODE_ERROR_RAISE,
     NODE_BLOCK,
     NODE_EXPR_STMT,
+    NODE_BREAK,
+    NODE_CONTINUE,
 
     /* Expressions */
     NODE_BINARY_OP,         /* a + b, a == b, etc.          */

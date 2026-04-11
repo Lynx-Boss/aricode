@@ -94,6 +94,8 @@ static const KWEntry keywords[] = {
     { "export", TOKEN_EXPORT },
     { "in",     TOKEN_IN },
     { "struct", TOKEN_STRUCT },
+    { "break",    TOKEN_BREAK },
+    { "continue", TOKEN_CONTINUE },
     { "true",   TOKEN_TRUE },
     { "false",  TOKEN_FALSE },
     { "Some",   TOKEN_SOME },

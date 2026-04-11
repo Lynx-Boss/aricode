@@ -625,4 +625,189 @@ static inline int emit_nop(uint8_t *buf) {
     return 1;
 }
 
+/* ------------------------------------------------------------------ */
+/*  Bitwise and shift instructions                                    */
+/* ------------------------------------------------------------------ */
+
+/*
+ * AND dst, src  (64-bit)
+ * Opcode: REX.W 21 /r
+ */
+static inline int emit_and_reg_reg(uint8_t *buf, int dst, int src) {
+    int off = 0;
+    buf[off++] = rex(1, reg_ext(src), 0, reg_ext(dst));
+    buf[off++] = 0x21;
+    buf[off++] = modrm(3, src, dst);
+    return off;
+}
+
+/*
+ * AND dst, imm32  (64-bit)
+ * Opcode: REX.W 81 /4 id  or  REX.W 83 /4 ib  (short form)
+ */
+static inline int emit_and_reg_imm(uint8_t *buf, int dst, int32_t value) {
+    int off = 0;
+    if (value >= -128 && value <= 127) {
+        buf[off++] = rex(1, 0, 0, reg_ext(dst));
+        buf[off++] = 0x83;
+        buf[off++] = modrm(3, 4, dst);
+        buf[off++] = (uint8_t)(int8_t)value;
+        return off;
+    }
+    buf[off++] = rex(1, 0, 0, reg_ext(dst));
+    buf[off++] = 0x81;
+    buf[off++] = modrm(3, 4, dst);
+    memcpy(buf + off, &value, 4);
+    off += 4;
+    return off;
+}
+
+/*
+ * OR dst, src  (64-bit)
+ * Opcode: REX.W 09 /r
+ */
+static inline int emit_or_reg_reg(uint8_t *buf, int dst, int src) {
+    int off = 0;
+    buf[off++] = rex(1, reg_ext(src), 0, reg_ext(dst));
+    buf[off++] = 0x09;
+    buf[off++] = modrm(3, src, dst);
+    return off;
+}
+
+/*
+ * OR dst, imm32  (64-bit)
+ */
+static inline int emit_or_reg_imm(uint8_t *buf, int dst, int32_t value) {
+    int off = 0;
+    if (value >= -128 && value <= 127) {
+        buf[off++] = rex(1, 0, 0, reg_ext(dst));
+        buf[off++] = 0x83;
+        buf[off++] = modrm(3, 1, dst);
+        buf[off++] = (uint8_t)(int8_t)value;
+        return off;
+    }
+    buf[off++] = rex(1, 0, 0, reg_ext(dst));
+    buf[off++] = 0x81;
+    buf[off++] = modrm(3, 1, dst);
+    memcpy(buf + off, &value, 4);
+    off += 4;
+    return off;
+}
+
+/*
+ * TEST dst, imm32  (64-bit)
+ * Opcode: REX.W F7 /0 id  (or  REX.W A9 id for RAX)
+ * Sets flags based on AND without storing result.
+ */
+static inline int emit_test_reg_imm(uint8_t *buf, int reg, int32_t value) {
+    int off = 0;
+    if (reg == REG_RAX) {
+        buf[off++] = rex(1, 0, 0, 0);
+        buf[off++] = 0xA9;
+        memcpy(buf + off, &value, 4);
+        off += 4;
+        return off;
+    }
+    buf[off++] = rex(1, 0, 0, reg_ext(reg));
+    buf[off++] = 0xF7;
+    buf[off++] = modrm(3, 0, reg);
+    memcpy(buf + off, &value, 4);
+    off += 4;
+    return off;
+}
+
+/*
+ * TEST dst, src  (64-bit)
+ * Opcode: REX.W 85 /r
+ */
+static inline int emit_test_reg_reg(uint8_t *buf, int dst, int src) {
+    int off = 0;
+    buf[off++] = rex(1, reg_ext(src), 0, reg_ext(dst));
+    buf[off++] = 0x85;
+    buf[off++] = modrm(3, src, dst);
+    return off;
+}
+
+/*
+ * SHL dst, imm8  (64-bit shift left)
+ * Opcode: REX.W C1 /4 ib
+ */
+static inline int emit_shl_reg_imm(uint8_t *buf, int dst, uint8_t count) {
+    int off = 0;
+    if (count == 1) {
+        /* Short form: REX.W D1 /4 */
+        buf[off++] = rex(1, 0, 0, reg_ext(dst));
+        buf[off++] = 0xD1;
+        buf[off++] = modrm(3, 4, dst);
+        return off;
+    }
+    buf[off++] = rex(1, 0, 0, reg_ext(dst));
+    buf[off++] = 0xC1;
+    buf[off++] = modrm(3, 4, dst);
+    buf[off++] = count;
+    return off;
+}
+
+/*
+ * SHR dst, imm8  (64-bit logical shift right)
+ * Opcode: REX.W C1 /5 ib
+ */
+static inline int emit_shr_reg_imm(uint8_t *buf, int dst, uint8_t count) {
+    int off = 0;
+    if (count == 1) {
+        buf[off++] = rex(1, 0, 0, reg_ext(dst));
+        buf[off++] = 0xD1;
+        buf[off++] = modrm(3, 5, dst);
+        return off;
+    }
+    buf[off++] = rex(1, 0, 0, reg_ext(dst));
+    buf[off++] = 0xC1;
+    buf[off++] = modrm(3, 5, dst);
+    buf[off++] = count;
+    return off;
+}
+
+/*
+ * SAR dst, imm8  (64-bit arithmetic shift right, preserves sign)
+ * Opcode: REX.W C1 /7 ib
+ */
+static inline int emit_sar_reg_imm(uint8_t *buf, int dst, uint8_t count) {
+    int off = 0;
+    if (count == 1) {
+        buf[off++] = rex(1, 0, 0, reg_ext(dst));
+        buf[off++] = 0xD1;
+        buf[off++] = modrm(3, 7, dst);
+        return off;
+    }
+    buf[off++] = rex(1, 0, 0, reg_ext(dst));
+    buf[off++] = 0xC1;
+    buf[off++] = modrm(3, 7, dst);
+    buf[off++] = count;
+    return off;
+}
+
+/*
+ * INC reg  (64-bit)
+ * Opcode: REX.W FF /0
+ */
+static inline int emit_inc_reg(uint8_t *buf, int reg) {
+    int off = 0;
+    buf[off++] = rex(1, 0, 0, reg_ext(reg));
+    buf[off++] = 0xFF;
+    buf[off++] = modrm(3, 0, reg);
+    return off;
+}
+
+/*
+ * DEC reg  (64-bit)
+ * Opcode: REX.W FF /1
+ */
+static inline int emit_dec_reg(uint8_t *buf, int reg) {
+    int off = 0;
+    buf[off++] = rex(1, 0, 0, reg_ext(reg));
+    buf[off++] = 0xFF;
+    buf[off++] = modrm(3, 1, reg);
+    return off;
+}
+
 #endif /* ARICODE_X86_64_H */

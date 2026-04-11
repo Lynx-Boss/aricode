@@ -194,6 +194,24 @@ static void emit_binary_op(CodegenState *cg, const ASTNode *node) {
             EMIT(cg, off);
             return;
         }
+        /* Bitwise with immediate */
+        else if (strcmp(op, "&") == 0) {
+            n = emit_and_reg_imm(BUF(cg), REG_RAX, imm_val);
+            EMIT(cg, n);
+            return;
+        } else if (strcmp(op, "|") == 0) {
+            n = emit_or_reg_imm(BUF(cg), REG_RAX, imm_val);
+            EMIT(cg, n);
+            return;
+        } else if (strcmp(op, ">>") == 0) {
+            n = emit_sar_reg_imm(BUF(cg), REG_RAX, (uint8_t)imm_val);
+            EMIT(cg, n);
+            return;
+        } else if (strcmp(op, "<<") == 0) {
+            n = emit_shl_reg_imm(BUF(cg), REG_RAX, (uint8_t)imm_val);
+            EMIT(cg, n);
+            return;
+        }
         /* For comparisons with immediate, use cmp rax, imm */
         else if (strcmp(op, "<") == 0 || strcmp(op, ">") == 0 ||
                  strcmp(op, "<=") == 0 || strcmp(op, ">=") == 0 ||
@@ -254,6 +272,25 @@ do_div_mod:
             n = emit_mov_reg_reg(BUF(cg), REG_RAX, REG_RDX);
             EMIT(cg, n);
         }
+    } else if (strcmp(op, "&") == 0) {
+        n = emit_and_reg_reg(BUF(cg), REG_RAX, REG_RCX);
+        EMIT(cg, n);
+    } else if (strcmp(op, "|") == 0) {
+        n = emit_or_reg_reg(BUF(cg), REG_RAX, REG_RCX);
+        EMIT(cg, n);
+    } else if (strcmp(op, "^") == 0) {
+        n = emit_xor_reg_reg(BUF(cg), REG_RAX, REG_RCX);
+        EMIT(cg, n);
+    } else if (strcmp(op, "<<") == 0) {
+        /* SHL RAX, CL (shift count in CL register) */
+        uint8_t *b = BUF(cg);
+        b[0] = rex(1, 0, 0, 0); b[1] = 0xD3; b[2] = modrm(3, 4, REG_RAX);
+        EMIT(cg, 3);
+    } else if (strcmp(op, ">>") == 0) {
+        /* SAR RAX, CL (arithmetic shift right, preserves sign) */
+        uint8_t *b = BUF(cg);
+        b[0] = rex(1, 0, 0, 0); b[1] = 0xD3; b[2] = modrm(3, 7, REG_RAX);
+        EMIT(cg, 3);
     } else if (strcmp(op, "==") == 0 || strcmp(op, "!=") == 0 ||
                strcmp(op, "<") == 0  || strcmp(op, ">") == 0  ||
                strcmp(op, "<=") == 0 || strcmp(op, ">=") == 0) {
@@ -543,6 +580,88 @@ static void emit_if(CodegenState *cg, const ASTNode *node) {
     }
 }
 
+/*
+ * WHILE loop codegen.
+ *   child[0] = condition
+ *   child[1] = body block
+ *
+ * Emits:
+ *   loop_start:
+ *     evaluate condition -> RAX
+ *     cmp rax, 0
+ *     je loop_end
+ *     <body>
+ *     jmp loop_start
+ *   loop_end:
+ */
+static void emit_while(CodegenState *cg, const ASTNode *node) {
+    if (node->child_count < 2) {
+        cg_error(cg, "malformed while at %d:%d", node->line, node->col);
+        return;
+    }
+
+    /* loop_start label */
+    size_t loop_start = cg->code_size;
+
+    /* Evaluate condition -> RAX */
+    emit_expression(cg, node->children[0]);
+
+    /* Test: cmp rax, 0 */
+    int n = emit_cmp_reg_imm(BUF(cg), REG_RAX, 0);
+    EMIT(cg, n);
+
+    /* JE to loop_end (placeholder) */
+    size_t je_pos = cg->code_size;
+    n = emit_je(BUF(cg), 0);
+    EMIT(cg, n);
+
+    /* Body */
+    emit_block(cg, node->children[1]);
+
+    /* JMP back to loop_start */
+    int32_t back_rel = (int32_t)((int64_t)loop_start - (int64_t)(cg->code_size + 5));
+    n = emit_jmp(BUF(cg), back_rel);
+    EMIT(cg, n);
+
+    /* Patch JE to point here (loop_end) */
+    int32_t je_off = (int32_t)(cg->code_size - (je_pos + 6));
+    memcpy(cg->code + je_pos + 2, &je_off, 4);
+}
+
+/*
+ * Variable assignment (x = expr).
+ * The parser stores this as NODE_BINARY_OP with op="=".
+ *   child[0] = identifier (lvalue)
+ *   child[1] = expression (rvalue)
+ */
+static void emit_assignment(CodegenState *cg, const ASTNode *node) {
+    if (node->child_count < 2) {
+        cg_error(cg, "malformed assignment at %d:%d", node->line, node->col);
+        return;
+    }
+
+    ASTNode *lhs = node->children[0];
+    if (lhs->type != NODE_IDENTIFIER || !lhs->string_val) {
+        cg_error(cg, "left side of assignment must be a variable at %d:%d",
+                 node->line, node->col);
+        return;
+    }
+
+    LocalVar *v = find_local(cg, lhs->string_val);
+    if (!v) {
+        cg_error(cg, "undefined variable '%s' in assignment at %d:%d",
+                 lhs->string_val, node->line, node->col);
+        return;
+    }
+
+    /* Evaluate rvalue -> RAX */
+    emit_expression(cg, node->children[1]);
+
+    /* Store to stack: mov [rbp + offset], rax */
+    int n = emit_mov_mem_reg(BUF(cg), REG_RBP, v->rbp_off, REG_RAX);
+    EMIT(cg, n);
+}
+
 static void emit_statement(CodegenState *cg, const ASTNode *node) {
     if (cg->had_error || !node) return;
 
@@ -557,9 +676,17 @@ static void emit_statement(CodegenState *cg, const ASTNode *node) {
     case NODE_IF:
         emit_if(cg, node);
         break;
+    case NODE_WHILE:
+        emit_while(cg, node);
+        break;
     case NODE_EXPR_STMT:
-        if (node->child_count > 0)
+        /* Check for assignment expression (NODE_BINARY_OP with op="=") */
+        if (node->child_count > 0 && node->children[0]->type == NODE_BINARY_OP &&
+            node->children[0]->op && strcmp(node->children[0]->op, "=") == 0) {
+            emit_assignment(cg, node->children[0]);
+        } else if (node->child_count > 0) {
             emit_expression(cg, node->children[0]);
+        }
         break;
     case NODE_BLOCK:
         emit_block(cg, node);

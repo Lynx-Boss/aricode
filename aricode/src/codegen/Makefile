@@ -2,7 +2,7 @@
 # Build the x86_64 code generator library and test suite.
 
 CC       = gcc
-CFLAGS   = -Wall -Wextra -Wpedantic -std=c11 -g -O2
+CFLAGS   = -Wall -Wextra -Wpedantic -std=c11 -g -O2 -D_POSIX_C_SOURCE=200809L
 CFLAGS  += -I.. -I. -Wno-unused-variable -Wno-unused-function
 
 # Source files

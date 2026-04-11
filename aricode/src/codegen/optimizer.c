@@ -271,6 +271,79 @@ int optimizer_dead_code_elim(ASTNode *root) {
 }
 
 /* ================================================================== */
+/*  Strength Reduction                                                */
+/* ================================================================== */
+
+/*
+ * Check if a value is a power of 2.
+ * Returns the exponent (log2), or -1 if not a power of 2.
+ */
+static int is_power_of_2(int64_t val) {
+    if (val <= 0) return -1;
+    if ((val & (val - 1)) != 0) return -1;
+    int exp = 0;
+    while (val > 1) { val >>= 1; exp++; }
+    return exp;
+}
+
+/*
+ * Strength reduction pass.
+ * Replaces expensive operations with cheaper equivalents:
+ *   n / 2^k  ->  n >> k   (for positive divisors, unsigned semantics)
+ *   n % 2^k  ->  n & (2^k - 1)
+ *   n * 2^k  ->  n << k
+ *
+ * Returns the number of replacements made.
+ */
+static int strength_reduce_node(ASTNode *node) {
+    if (!node) return 0;
+
+    int count = 0;
+
+    /* Recurse into children first (bottom-up) */
+    for (size_t i = 0; i < node->child_count; i++) {
+        count += strength_reduce_node(node->children[i]);
+    }
+
+    if (node->type != NODE_BINARY_OP || !node->op) return count;
+    if (node->child_count < 2) return count;
+
+    ASTNode *right = node->children[1];
+    if (!is_const_int(right)) return count;
+
+    int64_t rv = right->int_val;
+    int exp = is_power_of_2(rv);
+    if (exp < 0) return count;
+
+    if (strcmp(node->op, "/") == 0 && exp > 0) {
+        /* n / 2^k  ->  n >> k */
+        free(node->op);
+        node->op = strdup(">>");
+        right->int_val = exp;
+        count++;
+    } else if (strcmp(node->op, "%") == 0) {
+        /* n % 2^k  ->  n & (2^k - 1) */
+        free(node->op);
+        node->op = strdup("&");
+        right->int_val = rv - 1;
+        count++;
+    } else if (strcmp(node->op, "*") == 0 && exp > 0) {
+        /* n * 2^k  ->  n << k */
+        free(node->op);
+        node->op = strdup("<<");
+        right->int_val = exp;
+        count++;
+    }
+
+    return count;
+}
+
+static int optimizer_strength_reduce(ASTNode *root) {
+    if (!root) return 0;
+    return strength_reduce_node(root);
+}
+
+/* ================================================================== */
 /*  Main optimizer entry point                                        */
 /* ================================================================== */
 
@@ -278,6 +351,9 @@ int optimizer_run(ASTNode *root) {
     if (!root) return 0;
 
     int total = 0;
+
+    /* Strength reduction BEFORE constant folding (creates new patterns) */
+    total += optimizer_strength_reduce(root);
 
     /* Run constant folding iteratively until no more changes */
     int changed;

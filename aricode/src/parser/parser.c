@@ -679,7 +679,7 @@ static ASTNode *parse_for(Parser *p) {
 
             /* Create: let __i: i32 = 0 */
             ASTNode *init = ast_create_node(NODE_VAR_DECL, t->line, t->col);
-            init->string_val = str_dup("__foreach_i");
+            init->string_val = str_dup("__fi");
             ASTNode *i_type = ast_create_node(NODE_TYPE_ANNOTATION, t->line, t->col);
             i_type->string_val = str_dup("i32");
             ast_add_child(init, i_type);
@@ -692,7 +692,7 @@ static ASTNode *parse_for(Parser *p) {
             ASTNode *cond = ast_create_node(NODE_BINARY_OP, t->line, t->col);
             cond->op = str_dup("<");
             ASTNode *i_ref = ast_create_node(NODE_IDENTIFIER, t->line, t->col);
-            i_ref->string_val = str_dup("__foreach_i");
+            i_ref->string_val = str_dup("__fi");
             ast_add_child(cond, i_ref);
             /* arr_len(collection) */
             ASTNode *len_call = ast_create_node(NODE_CALL, t->line, t->col);
@@ -701,18 +701,19 @@ static ASTNode *parse_for(Parser *p) {
             ast_add_child(len_call, len_id);
             ast_add_child(len_call, ast_create_node(NODE_IDENTIFIER, t->line, t->col));
             len_call->children[1]->string_val = str_dup(collection->string_val ? collection->string_val : "__arr");
+            ast_add_child(cond, len_call);
             ast_add_child(node, cond);
 
             /* Update: __i = __i + 1 */
             ASTNode *update = ast_create_node(NODE_BINARY_OP, t->line, t->col);
             update->op = str_dup("=");
             ASTNode *i_lhs = ast_create_node(NODE_IDENTIFIER, t->line, t->col);
-            i_lhs->string_val = str_dup("__foreach_i");
+            i_lhs->string_val = str_dup("__fi");
             ast_add_child(update, i_lhs);
             ASTNode *inc = ast_create_node(NODE_BINARY_OP, t->line, t->col);
             inc->op = str_dup("+");
             ASTNode *i_val = ast_create_node(NODE_IDENTIFIER, t->line, t->col);
-            i_val->string_val = str_dup("__foreach_i");
+            i_val->string_val = str_dup("__fi");
             ast_add_child(inc, i_val);
             ASTNode *one = ast_create_node(NODE_INT_LITERAL, t->line, t->col);
             one->int_val = 1;
@@ -734,7 +735,7 @@ static ASTNode *parse_for(Parser *p) {
             coll_ref->string_val = str_dup(collection->string_val ? collection->string_val : "__arr");
             ast_add_child(get_call, coll_ref);
             ASTNode *i_idx = ast_create_node(NODE_IDENTIFIER, t->line, t->col);
-            i_idx->string_val = str_dup("__foreach_i");
+            i_idx->string_val = str_dup("__fi");
             ast_add_child(get_call, i_idx);
             ast_add_child(elem_decl, get_call);
 

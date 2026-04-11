@@ -84,6 +84,7 @@ typedef enum {
     TOKEN_BIT_NOT,       /* ~ */
     TOKEN_SHL,           /* << */
     TOKEN_SHR,           /* >> */
+    TOKEN_QUESTION,      /* ? */
 
     /* Delimiters */
     TOKEN_LPAREN,        /* ( */

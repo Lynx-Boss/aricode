@@ -581,6 +581,25 @@ static ASTNode *parse_or(Parser *p) {
 static ASTNode *parse_assignment(Parser *p) {
     ASTNode *left = parse_or(p);
 
+    /* Ternary: cond ? then_expr : else_expr */
+    if (check(p, TOKEN_QUESTION)) {
+        advance(p);
+        ASTNode *then_expr = parse_expression(p);
+        expect(p, TOKEN_COLON, "':' in ternary operator");
+        ASTNode *else_expr = parse_expression(p);
+        ASTNode *node = ast_create_node(NODE_IF, left->line, left->col);
+        ast_add_child(node, left);
+        ASTNode *tb = ast_create_node(NODE_BLOCK, then_expr->line, then_expr->col);
+        ASTNode *ts = ast_create_node(NODE_EXPR_STMT, then_expr->line, then_expr->col);
+        ast_add_child(ts, then_expr); ast_add_child(tb, ts);
+        ast_add_child(node, tb);
+        ASTNode *eb = ast_create_node(NODE_BLOCK, else_expr->line, else_expr->col);
+        ASTNode *es = ast_create_node(NODE_EXPR_STMT, else_expr->line, else_expr->col);
+        ast_add_child(es, else_expr); ast_add_child(eb, es);
+        ast_add_child(node, eb);
+        return node;
+    }
+
     if (check(p, TOKEN_ASSIGN)) {
         const ParserToken *op = advance(p);
         ASTNode *right = parse_assignment(p); /* right-associative */

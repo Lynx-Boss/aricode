@@ -463,6 +463,7 @@ static Token lex_token(Lexer *lex)
         case '|': return make_token(TOKEN_BIT_OR,   "|", line, col, lex->filename);
         case '^': return make_token(TOKEN_BIT_XOR,  "^", line, col, lex->filename);
         case '~': return make_token(TOKEN_BIT_NOT,  "~", line, col, lex->filename);
+        case '?': return make_token(TOKEN_QUESTION, "?", line, col, lex->filename);
         case '(': return make_token(TOKEN_LPAREN,   "(", line, col, lex->filename);
         case ')': return make_token(TOKEN_RPAREN,   ")", line, col, lex->filename);
         case '{': return make_token(TOKEN_LBRACE,   "{", line, col, lex->filename);

@@ -52,6 +52,7 @@ static void cg_error(CodegenState *cg, const char *fmt, ...) {
 static int  emit_expression(CodegenState *cg, const ASTNode *node);
 static void emit_statement(CodegenState *cg, const ASTNode *node);
 static void emit_block(CodegenState *cg, const ASTNode *node);
+static void emit_if(CodegenState *cg, const ASTNode *node);
 
 /* ------------------------------------------------------------------ */
 /*  Symbol lookup                                                     */
@@ -1531,6 +1532,10 @@ static int emit_expression(CodegenState *cg, const ASTNode *node) {
         return 0;
     case NODE_CALL:
         emit_call_expr(cg, node);
+        return 0;
+    case NODE_IF:
+        /* Ternary expression: if used as expression, result in RAX */
+        emit_if(cg, node);
         return 0;
     default:
         cg_error(cg, "unsupported expression node type %s at %d:%d",

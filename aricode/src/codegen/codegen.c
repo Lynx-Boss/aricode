@@ -1164,11 +1164,17 @@ static void emit_call_expr(CodegenState *cg, const ASTNode *node) {
             return;
         }
 
+        /* int_to_float(x): convert i32 to f64 */
+        if (strcmp(callee->string_val, "int_to_float") == 0 && argc == 1) {
+            emit_expression(cg, node->children[1]);
+            int pn = emit_cvtsi2sd(BUF(cg), 0, REG_RAX); EMIT(cg, pn);
+            pn = emit_movq_reg_xmm(BUF(cg), REG_RAX, 0); EMIT(cg, pn);
+            return;
+        }
+
         /* float_to_int(x): convert f64 bits in RAX/xmm0 to truncated i32 */
         if (strcmp(callee->string_val, "float_to_int") == 0 && argc == 1) {
             emit_expression(cg, node->children[1]);
-            /* xmm0 has the f64 value (loaded by emit_float_literal) */
-            /* cvttsd2si rax, xmm0 */
             int pn = emit_cvttsd2si(BUF(cg), REG_RAX, 0);
             EMIT(cg, pn);
             return;
@@ -1582,6 +1588,74 @@ static void emit_statement(CodegenState *cg, const ASTNode *node) {
     case NODE_BLOCK:
         emit_block(cg, node);
         break;
+
+    case NODE_MATCH: {
+        /*
+         * match (expr) { pattern1 => body1, pattern2 => body2, ... }
+         * Compiled as a chain of if/else: evaluate expr once,
+         * compare against each pattern, execute matching body.
+         */
+        if (node->child_count < 2) break;
+        int n;
+
+        /* Evaluate match expression -> RAX */
+        emit_expression(cg, node->children[0]);
+
+        /* Save to a temp local so each arm can compare */
+        LocalVar *match_val = add_local(cg, "__match_val");
+        if (!match_val) break;
+        n = emit_mov_mem_reg(BUF(cg), REG_RBP, match_val->rbp_off, REG_RAX);
+        EMIT(cg, n);
+
+        /* Collect JMP-to-end positions for each arm */
+        size_t jmp_ends[64];
+        int jmp_count = 0;
+
+        for (size_t arm_i = 1; arm_i < node->child_count; arm_i++) {
+            ASTNode *arm = node->children[arm_i];
+            if (!arm || arm->type != NODE_MATCH_ARM || arm->child_count < 2)
+                continue;
+
+            /* Load match value */
+            n = emit_mov_reg_mem(BUF(cg), REG_RAX, REG_RBP, match_val->rbp_off);
+            EMIT(cg, n);
+            /* Save to RCX for comparison */
+            n = emit_mov_reg_reg(BUF(cg), REG_RCX, REG_RAX);
+            EMIT(cg, n);
+
+            /* Evaluate pattern -> RAX */
+            emit_expression(cg, arm->children[0]);
+
+            /* cmp rcx, rax (match_val == pattern?) */
+            n = emit_cmp_reg_reg(BUF(cg), REG_RCX, REG_RAX);
+            EMIT(cg, n);
+
+            /* JNE to next arm */
+            size_t jne_pos = cg->code_size;
+            uint8_t *b = BUF(cg); b[0]=0x0F; b[1]=0x85;
+            memset(b+2, 0, 4); EMIT(cg, 6);
+
+            /* Execute arm body */
+            emit_statement(cg, arm->children[1]);
+
+            /* JMP to end of match */
+            if (jmp_count < 64) {
+                jmp_ends[jmp_count++] = cg->code_size;
+            }
+            n = emit_jmp(BUF(cg), 0); EMIT(cg, n);
+
+            /* Patch JNE to here */
+            int32_t jne_off = (int32_t)(cg->code_size - (jne_pos + 6));
+            memcpy(cg->code + jne_pos + 2, &jne_off, 4);
+        }
+
+        /* Patch all JMP-to-end */
+        for (int ji = 0; ji < jmp_count; ji++) {
+            int32_t off = (int32_t)(cg->code_size - (jmp_ends[ji] + 5));
+            memcpy(cg->code + jmp_ends[ji] + 1, &off, 4);
+        }
+        break;
+    }
 
     case NODE_TRY_CATCH: {
         /*

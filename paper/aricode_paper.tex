@@ -58,12 +58,12 @@ results herein, is the original intellectual property of the author.
 Any use, reproduction, or derivative work requires explicit written
 permission and must cite this paper.
 First public record: arXiv submission, April 2026.
-Repository: \url{https://gitlab.com/ariproyect/aricoderoot} (commit \texttt{3e571ae}).
+Repository: \url{https://gitlab.com/ariproyect/aricoderoot} (commit \texttt{3bc7b96}).
 }}\vspace{1em}
 
 % ---- Abstract ----
 \begin{abstract}
-We present \textsc{Aricode}, a statically typed, compiled programming language that makes silent runtime errors structurally impossible at compile time. Unlike existing approaches that rely on programmer discipline (Go), optional annotations (Python), or complex type systems (Rust), Aricode enforces a five-level error classification where code that can fail silently is \emph{rejected by the compiler}. The language features direct x86\_64 machine code generation without intermediate representations, linkers, or runtime libraries, producing minimal ELF binaries---199 bytes for Hello World, 674 bytes for a prime number generator. We introduce four novel contributions: (1) a mandatory error hierarchy that classifies all possible failures into five severity levels with distinct compilation semantics, (2) a compile-time performance rating system (Podium) that evaluates generated machine code quality, (3) native arbitrary-precision decimal arithmetic that eliminates IEEE~754 floating-point errors, and (4) a compiler that implements constant folding, strength reduction, peephole optimization, and tail call optimization while generating binaries 2{,}000$\times$ smaller than GCC. Benchmarks across twelve computational challenges---spanning arithmetic, recursion, number theory (Collatz conjecture, Mersenne prime M31), cryptographic primitives (modular exponentiation), and artificial intelligence (perceptron training, minimax game tree search)---demonstrate that Aricode competes with hand-optimized x86\_64 assembly across all categories. In an overall ranking of 84 binaries across 8 implementations, Aricode and NASM assembly tie at the top, both approximately $2\times$ ahead of GCC~-O3.
+We present \textsc{Aricode}, a statically typed, compiled programming language that makes silent runtime errors structurally impossible at both compile time and runtime. Unlike existing approaches that rely on programmer discipline (Go), optional annotations (Python), or complex type systems (Rust), Aricode enforces a five-level error classification where code that can fail silently is \emph{rejected by the compiler}, and runtime errors are caught via cross-function \texttt{try/catch} with zero-overhead register-based unwinding. The language features direct x86\_64 machine code generation without intermediate representations, linkers, or runtime libraries, producing minimal ELF binaries---199 bytes for Hello World, 674 bytes for a prime number generator. We introduce five novel contributions: (1)~a mandatory error hierarchy with five severity levels and distinct compilation semantics, (2)~a compile-time performance rating system (Podium), (3)~native arbitrary-precision decimal arithmetic, (4)~a compiler implementing constant folding, strength reduction, peephole optimization, and tail call optimization, and (5)~cross-function error handling via callee-saved registers (R12--R15) requiring zero runtime library support. The language supports integer and double-precision floating-point arithmetic (SSE2), heap-allocated arrays via \texttt{mmap}, struct patterns, and interactive I/O. Benchmarks across fourteen computational challenges---spanning arithmetic, recursion, number theory (Collatz conjecture, Mersenne prime M31), cryptographic primitives, artificial intelligence (perceptron, minimax), floating-point computation (Leibniz $\pi$), and array operations---demonstrate that Aricode competes with hand-optimized x86\_64 assembly across all categories. In a ranking of 126~binaries across 10~implementations including Rust and Go, Aricode places second (383~points) behind hand-written NASM assembly (392~points), while being 3.8$\times$ ahead of Rust (100~points) and 4.6$\times$ ahead of Go (84~points). Aricode binaries are 72{,}000$\times$ smaller than Rust and 12{,}000$\times$ smaller than Go.
 \end{abstract}
 
 \textbf{Keywords:} programming languages, compiler design, error handling, x86\_64 code generation, binary size optimization, tail call optimization
@@ -185,8 +185,8 @@ Unlike traditional compilers that use intermediate representations (LLVM IR, SSA
 \begin{itemize}
     \item ELF header: 64 bytes (fixed)
     \item Program header: 56 bytes (single PT\_LOAD segment)
-    \item Machine code: variable (37--226 bytes for benchmarked programs)
-    \item \textbf{Total}: 157--346 bytes for complete executables
+    \item Machine code: variable (37--551 bytes for benchmarked programs)
+    \item \textbf{Total}: 157--2{,}270 bytes for complete executables (including struct programs)
 \end{itemize}
 
 The code generator targets the AMD Zen~3 microarchitecture with specific optimizations:
@@ -245,18 +245,37 @@ All benchmarks were executed on an AMD Ryzen~7 5800X (Zen~3) processor running L
     \item GCC 14.2.0 at optimization levels -O0, -O2, -O3, -Os (static linking)
     \item GCC 14.2.0 -O2 with dynamic linking
     \item NASM 2.16 (hand-optimized x86\_64 assembly)
+    \item Rust 1.85 (opt-level=2)
+    \item Go 1.24
     \item CPython 3.12
 \end{itemize}
 
 Each benchmark was executed 1,000 times with results averaged. Binary sizes, instruction counts, execution times, and startup times were recorded.
 
+\subsection{Cross-Function Error Handling}
+
+Aricode implements \texttt{try/catch} and \texttt{error.raise} at the machine code level using callee-saved registers as an error handler frame:
+
+\begin{itemize}
+    \item \textbf{R12}: saved RSP at \texttt{try} entry
+    \item \textbf{R13}: saved RBP at \texttt{try} entry
+    \item \textbf{R14}: catch block runtime address
+    \item \textbf{R15}: catch active flag (1 = active)
+\end{itemize}
+
+When \texttt{error.raise(code)} is called from \emph{any function} (including deeply nested calls), it checks R15: if a catch handler is active, it restores RSP and RBP from R12/R13 and jumps to R14. If no handler exists, the program terminates with the error code. This achieves cross-function error propagation with \textbf{zero runtime library overhead}---no setjmp/longjmp, no exception tables, no unwinding metadata.
+
+\subsection{Floating-Point and Data Structures}
+
+The compiler supports double-precision floating-point arithmetic via SSE2 instructions (MOVSD, ADDSD, SUBSD, MULSD, DIVSD, UCOMISD), with automatic type tracking that dispatches integer expressions to GPR instructions and float expressions to XMM registers. Arrays are heap-allocated via the \texttt{mmap} system call with length-prefixed storage, enabling struct patterns through constructor/accessor functions.
+
 \subsection{Benchmark Suite}
 
-We designed twelve challenges of increasing computational complexity spanning five categories:
+We designed fourteen challenges of increasing computational complexity spanning seven categories:
 
 \begin{table}[H]
 \centering
-\caption{Benchmark challenge suite (12 challenges, 5 categories)}
+\caption{Benchmark challenge suite (14 challenges, 7 categories)}
 \label{tab:challenges}
 \begin{tabular}{@{}cllrl@{}}
 \toprule
@@ -277,11 +296,14 @@ We designed twelve challenges of increasing computational complexity spanning fi
 \midrule
 12 & AI/ML      & Perceptron           & 4   & Neural net, 1000 epochs \\
 13 & AI/ML      & Minimax              & 3   & Game tree, 500K+ nodes \\
+\midrule
+14 & Float      & Leibniz $\pi$        & 157 & 10{,}000 f64 SSE2 iterations \\
+15 & Arrays     & Array sum            & 158 & 100-element heap array \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-Challenge~6 implements the Collatz conjecture~\cite{collatz1937}, one of the most famous unsolved problems in mathematics. Challenge~7 verifies the primality of $M_{31} = 2^{31} - 1 = 2{,}147{,}483{,}647$ (Euler, 1772). Challenge~10 implements modular exponentiation by squaring, the fundamental operation in RSA cryptography. Challenges 12--13 demonstrate that Aricode can implement machine learning (perceptron training with fixed-point arithmetic) and game AI (minimax with full tree search).
+Challenge~6 implements the Collatz conjecture~\cite{collatz1937}, one of the most famous unsolved problems in mathematics. Challenge~7 verifies the primality of $M_{31} = 2^{31} - 1 = 2{,}147{,}483{,}647$ (Euler, 1772). Challenge~10 implements modular exponentiation by squaring, the fundamental operation in RSA cryptography. Challenges 12--13 demonstrate that Aricode can implement machine learning (perceptron training with fixed-point arithmetic) and game AI (minimax with full tree search). Challenge~14 tests double-precision floating-point throughput by approximating $\pi$ via the Leibniz series with 10{,}000 SSE2 iterations. Challenge~15 tests heap-allocated array performance using \texttt{mmap}-backed storage.
 
 \subsection{Results: Binary Size}
 
@@ -328,25 +350,29 @@ Aricode achieves execution times within 7\% of hand-optimized assembly across al
 
 \begin{table}[H]
 \centering
-\caption{Overall sparring ranking --- 12 challenges, 84 binaries}
+\caption{Overall sparring ranking --- 14 challenges, 126 binaries, 10 implementations}
 \label{tab:ranking}
-\begin{tabular}{@{}clr@{}}
+\begin{tabular}{@{}clrl@{}}
 \toprule
-\textbf{Rank} & \textbf{Implementation} & \textbf{Points} \\
+\textbf{Rank} & \textbf{Implementation} & \textbf{Points} & \textbf{vs.\ Aricode} \\
 \midrule
-\textbf{1} & \textbf{NASM x86\_64 assembly} & \textbf{264} \\
-\textbf{1} & \textbf{Aricode} & \textbf{257} \\
-3 & C (gcc -O3) & 144 \\
-4 & C (gcc -O2) & 141 \\
-5 & C (gcc -Os) & 138 \\
-6 & C (gcc -O0) & 126 \\
-7 & Python 3.12 & 115 \\
-8 & C (gcc -O2 dynamic) & 111 \\
+1 & NASM x86\_64 assembly & 392 & 1.02$\times$ \\
+\textbf{2} & \textbf{Aricode} & \textbf{383} & \textbf{1.00$\times$} \\
+3 & C (gcc -O2) & 255 & 0.67$\times$ \\
+4 & C (gcc -O3) & 243 & 0.63$\times$ \\
+5 & C (gcc -Os) & 239 & 0.62$\times$ \\
+6 & C (gcc -O0) & 239 & 0.62$\times$ \\
+7 & C (gcc -O2 dynamic) & 212 & 0.55$\times$ \\
+8 & Python 3.12 & 163 & 0.43$\times$ \\
+9 & Rust 1.85 & 100 & 0.26$\times$ \\
+10 & Go 1.24 & 84 & 0.22$\times$ \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-Aricode and hand-written NASM assembly effectively tie at the top (264 vs.\ 257 points), with Aricode winning in binary size across all 12 challenges and NASM winning in execution speed for recursion-heavy benchmarks. Both are approximately $2\times$ ahead of GCC~-O3 (144 points), which is penalized by large binary sizes (754~KB for programs that Aricode compiles to 157--1{,}576 bytes). Aricode wins outright in the cryptographic (powmod) and algorithmic (primecount) categories, demonstrating that its while-loop codegen with strength reduction generates tighter loops than GCC's optimized output.
+Aricode places second overall (383 points), 9~points behind hand-written NASM assembly (392). The gap stems from recursion-heavy challenges where NASM uses hand-tuned register allocation. Aricode wins binary size in all 14 challenges and wins execution speed in algorithmic challenges (primecount, powmod) where its while-loop codegen with strength reduction generates tighter code than GCC~-O3.
+
+The most striking result is the comparison with modern ``safe'' languages: Aricode scores 3.8$\times$ more points than Rust and 4.6$\times$ more than Go, while producing binaries 72{,}000$\times$ smaller than Rust (157~B vs.\ 11.3~MB) and 12{,}000$\times$ smaller than Go (157~B vs.\ 1.8~MB). This demonstrates that safety and performance are not fundamentally at odds---Aricode achieves both through direct code generation and architectural error enforcement rather than heavyweight runtime systems.
 
 \subsection{Impact of Tail Call Optimization}
 
@@ -390,7 +416,7 @@ IBM's General Decimal Arithmetic specification~\cite{ieee754r} standardizes deci
 \section{Limitations and Future Work}
 \label{sec:future}
 
-Current limitations include: the codegen targets only Linux x86\_64; the type system lacks user-defined types (structs, enums); floating-point types (f32, f64) are not yet implemented; and the standard library is limited to \texttt{print\_int} and \texttt{print\_str} builtins. Tail call optimization currently applies only to self-recursive calls, not mutual recursion. Bitwise operators (\texttt{\&}, \texttt{|}, \texttt{\^{}}, \texttt{<<}, \texttt{>>}) are fully supported in both the parser and code generator.
+Current limitations include: the codegen targets only Linux x86\_64; the type system lacks first-class struct declarations (structs are implemented via array patterns with constructor functions); string operations are limited to literal printing; and there is no module or import system. Tail call optimization applies only to self-recursive calls. The standard library consists of seven builtins: \texttt{print\_str}, \texttt{print\_int}, \texttt{print\_float}, \texttt{read\_int}, \texttt{float\_to\_int}, \texttt{arr\_new}/\texttt{arr\_get}/\texttt{arr\_set}/\texttt{arr\_len}.
 
 Future work includes: ARM64 and WebAssembly backends; struct and enum types; a module system with package manager; SIMD vectorization for numeric workloads; and inter-procedural optimization.
 

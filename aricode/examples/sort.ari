@@ -1,0 +1,50 @@
+// aricode - Bubble Sort
+// Sorts an array of integers using bubble sort algorithm
+
+fn bubble_sort(data: i32, n: i32) -> i32 {
+    let i: i32 = 0;
+    while (i < n - 1) {
+        let j: i32 = 0;
+        while (j < n - 1 - i) {
+            let a: i32 = arr_get(data, j);
+            let b: i32 = arr_get(data, j + 1);
+            if (a > b) {
+                arr_set(data, j, b);
+                arr_set(data, j + 1, a);
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn main() -> i32 {
+    let data: i32 = arr_new(8);
+    arr_set(data, 0, 42);
+    arr_set(data, 1, 17);
+    arr_set(data, 2, 93);
+    arr_set(data, 3, 5);
+    arr_set(data, 4, 71);
+    arr_set(data, 5, 28);
+    arr_set(data, 6, 64);
+    arr_set(data, 7, 11);
+
+    print_str("Before sort:");
+    let i: i32 = 0;
+    while (i < 8) {
+        print_int(arr_get(data, i));
+        i = i + 1;
+    }
+
+    bubble_sort(data, 8);
+
+    print_str("After sort:");
+    i = 0;
+    while (i < 8) {
+        print_int(arr_get(data, i));
+        i = i + 1;
+    }
+
+    return 0;
+}

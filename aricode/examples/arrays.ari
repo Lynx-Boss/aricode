@@ -1,0 +1,34 @@
+// aricode - Array operations
+// Demonstrates: arr_new, arr_set, arr_get, arr_len
+
+fn main() -> i32 {
+    // Create array of 5 elements
+    let a: i32 = arr_new(5);
+
+    // Fill with squares: 0, 1, 4, 9, 16
+    let i: i32 = 0;
+    while (i < 5) {
+        arr_set(a, i, i * i);
+        i = i + 1;
+    }
+
+    // Print all elements
+    print_str("Squares:");
+    i = 0;
+    while (i < arr_len(a)) {
+        print_int(arr_get(a, i));
+        i = i + 1;
+    }
+
+    // Sum all elements
+    let sum: i32 = 0;
+    i = 0;
+    while (i < 5) {
+        sum = sum + arr_get(a, i);
+        i = i + 1;
+    }
+    print_str("Sum:");
+    print_int(sum);
+
+    return 0;
+}

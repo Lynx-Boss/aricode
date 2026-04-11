@@ -879,6 +879,101 @@ static void emit_call_expr(CodegenState *cg, const ASTNode *node) {
             emit_builtin_read_int(cg);
             return;
         }
+        /*
+         * ARRAY BUILTINS
+         * arr_new(n): allocate n-element array on stack, store length, return base
+         * arr_get(base, idx): return element at index
+         * arr_set(base, idx, val): store value at index
+         * arr_len(base): return stored length
+         */
+        if (strcmp(callee->string_val, "arr_new") == 0 && argc == 1) {
+            /* Evaluate size -> RAX */
+            emit_expression(cg, node->children[1]);
+            int pn;
+            /* r10 = n (save size) */
+            pn = emit_mov_reg_reg(BUF(cg), REG_R10, REG_RAX); EMIT(cg, pn);
+            /* Allocate (n+1)*8 bytes: n elements + 1 for length header */
+            /* lea rcx, [rax + 1] */
+            uint8_t *b = BUF(cg);
+            b[0] = rex(1, reg_ext(REG_RCX), 0, reg_ext(REG_RAX));
+            b[1] = 0x8D; b[2] = modrm(1, REG_RCX, REG_RAX); b[3] = 1;
+            EMIT(cg, 4);
+            /* shl rcx, 3 (multiply by 8) */
+            pn = emit_shl_reg_imm(BUF(cg), REG_RCX, 3); EMIT(cg, pn);
+            /* sub rsp, rcx */
+            b = BUF(cg);
+            b[0] = rex(1, reg_ext(REG_RCX), 0, reg_ext(REG_RSP));
+            b[1] = 0x29; b[2] = modrm(3, REG_RCX, REG_RSP);
+            EMIT(cg, 3);
+            /* Store length at [rsp]: mov [rsp], r10 */
+            b = BUF(cg);
+            b[0] = rex(1, reg_ext(REG_R10), 0, 0);
+            b[1] = 0x89; b[2] = modrm(0, REG_R10 & 7, REG_RSP);
+            b[3] = 0x24; /* SIB for RSP */
+            EMIT(cg, 4);
+            /* Return base = rsp + 8 (skip length header) */
+            /* lea rax, [rsp + 8] */
+            b = BUF(cg);
+            b[0] = rex(1, reg_ext(REG_RAX), 0, 0);
+            b[1] = 0x8D; b[2] = modrm(1, REG_RAX, REG_RSP);
+            b[3] = 0x24; b[4] = 8; /* SIB + disp8 */
+            EMIT(cg, 5);
+            return;
+        }
+        if (strcmp(callee->string_val, "arr_get") == 0 && argc == 2) {
+            /* arr_get(base, idx): load [base + idx*8] */
+            emit_expression(cg, node->children[2]); /* idx -> RAX */
+            int pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
+            emit_expression(cg, node->children[1]); /* base -> RAX */
+            pn = emit_pop(BUF(cg), REG_RCX); EMIT(cg, pn); /* RCX = idx */
+            /* lea rcx, [rax + rcx*8] */
+            uint8_t *b = BUF(cg);
+            b[0] = rex(1, reg_ext(REG_RCX), reg_ext(REG_RCX), reg_ext(REG_RAX));
+            b[1] = 0x8D;
+            b[2] = modrm(0, REG_RCX & 7, 4); /* SIB */
+            b[3] = (uint8_t)((3 << 6) | ((REG_RCX & 7) << 3) | (REG_RAX & 7)); /* scale=8 */
+            EMIT(cg, 4);
+            /* mov rax, [rcx] */
+            b = BUF(cg);
+            b[0] = rex(1, reg_ext(REG_RAX), 0, reg_ext(REG_RCX));
+            b[1] = 0x8B; b[2] = modrm(0, REG_RAX, REG_RCX & 7);
+            EMIT(cg, 3);
+            return;
+        }
+        if (strcmp(callee->string_val, "arr_set") == 0 && argc == 3) {
+            /* arr_set(base, idx, val) */
+            emit_expression(cg, node->children[3]); /* val -> RAX */
+            int pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
+            emit_expression(cg, node->children[2]); /* idx -> RAX */
+            pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
+            emit_expression(cg, node->children[1]); /* base -> RAX */
+            pn = emit_pop(BUF(cg), REG_RCX); EMIT(cg, pn); /* RCX = idx */
+            pn = emit_pop(BUF(cg), REG_RDX); EMIT(cg, pn); /* RDX = val */
+            /* lea rcx, [rax + rcx*8] */
+            uint8_t *b = BUF(cg);
+            b[0] = rex(1, reg_ext(REG_RCX), reg_ext(REG_RCX), reg_ext(REG_RAX));
+            b[1] = 0x8D;
+            b[2] = modrm(0, REG_RCX & 7, 4);
+            b[3] = (uint8_t)((3 << 6) | ((REG_RCX & 7) << 3) | (REG_RAX & 7));
+            EMIT(cg, 4);
+            /* mov [rcx], rdx */
+            b = BUF(cg);
+            b[0] = rex(1, reg_ext(REG_RDX), 0, reg_ext(REG_RCX));
+            b[1] = 0x89; b[2] = modrm(0, REG_RDX, REG_RCX & 7);
+            EMIT(cg, 3);
+            /* Return 0 */
+            pn = emit_xor_reg_reg(BUF(cg), REG_RAX, REG_RAX); EMIT(cg, pn);
+            return;
+        }
+        if (strcmp(callee->string_val, "arr_len") == 0 && argc == 1) {
+            /* arr_len(base): load [base - 8] */
+            emit_expression(cg, node->children[1]); /* base -> RAX */
+            /* mov rax, [rax - 8] */
+            int pn = emit_mov_reg_mem(BUF(cg), REG_RAX, REG_RAX, -8);
+            EMIT(cg, pn);
+            return;
+        }
+
         /* float_to_int(x): convert f64 bits in RAX/xmm0 to truncated i32 */
         if (strcmp(callee->string_val, "float_to_int") == 0 && argc == 1) {
             emit_expression(cg, node->children[1]);

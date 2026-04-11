@@ -7,6 +7,7 @@
 #include "compiler.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #define ARICODE_VERSION "0.1.0"
@@ -55,7 +56,8 @@ int main(int argc, char *argv[]) {
     CompilerOptions opts = {0};
     opts.output_file = "a.out";
 
-    const char *input = NULL;
+    const char *inputs[64];
+    int input_count = 0;
 
     /* Parse command line */
     for (int i = 1; i < argc; i++) {
@@ -81,26 +83,58 @@ int main(int argc, char *argv[]) {
             print_usage(argv[0]);
             return 1;
         } else {
-            if (input != NULL) {
-                fprintf(stderr, "Error: multiple input files not supported\n");
-                return 1;
-            }
-            input = argv[i];
+            if (input_count < 64)
+                inputs[input_count++] = argv[i];
         }
     }
 
     print_banner();
 
-    if (!input) {
+    if (input_count == 0) {
         fprintf(stderr, "Error: no input file specified\n\n");
         print_usage(argv[0]);
         return 1;
     }
 
-    opts.input_file = input;
+    /* Multi-file: concatenate all input files into one source string */
+    if (input_count == 1) {
+        opts.input_file = inputs[0];
+        Compiler compiler;
+        compiler_init(&compiler, opts);
+        return compiler_compile_file(&compiler, inputs[0]);
+    }
 
+    /* Multiple files: read and concatenate */
+    size_t total_size = 0;
+    for (int i = 0; i < input_count; i++) {
+        FILE *f = fopen(inputs[i], "r");
+        if (!f) {
+            fprintf(stderr, "Error: could not open '%s'\n", inputs[i]);
+            return 1;
+        }
+        fseek(f, 0, SEEK_END);
+        total_size += (size_t)ftell(f) + 2; /* +2 for newline separator */
+        fclose(f);
+    }
+
+    char *combined = malloc(total_size + 1);
+    if (!combined) { fprintf(stderr, "Error: out of memory\n"); return 1; }
+    size_t pos = 0;
+
+    for (int i = 0; i < input_count; i++) {
+        FILE *f = fopen(inputs[i], "r");
+        fseek(f, 0, SEEK_END);
+        size_t sz = (size_t)ftell(f);
+        fseek(f, 0, SEEK_SET);
+        fread(combined + pos, 1, sz, f);
+        pos += sz;
+        combined[pos++] = '\n';
+        fclose(f);
+    }
+    combined[pos] = '\0';
+
+    opts.input_file = inputs[0];
     Compiler compiler;
     compiler_init(&compiler, opts);
-
-    return compiler_compile_file(&compiler, input);
+    return compiler_compile_string(&compiler, combined, inputs[0]);
 }

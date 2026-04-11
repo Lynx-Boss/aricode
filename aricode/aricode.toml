@@ -1,0 +1,22 @@
+[compiler]
+name = "aric"
+version = "0.1.0"
+target = "x86_64-linux"
+optimization = "aggressive"
+
+[errors]
+level_0_action = "block"      # SILENT errors block compilation
+level_1_action = "block"      # LOGIC errors block compilation
+level_2_action = "warn"       # Warnings shown but don't block
+level_2_as_errors = false     # Set true to also block on warnings
+log_file = ".aricode/errors.log"
+
+[podium]
+show_after_compile = true
+iron_blocks_compile = false   # Set true to block compilation of IRON-rated code
+
+[output]
+colors = true
+verbose = false
+show_ast = false
+show_tokens = false

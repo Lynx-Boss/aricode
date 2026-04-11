@@ -1,0 +1,6 @@
+// aricode - Challenge 01: Simple Addition
+// Return 37 + 5 = 42 as exit code
+
+fn main() -> i32 {
+    return 37 + 5;
+}

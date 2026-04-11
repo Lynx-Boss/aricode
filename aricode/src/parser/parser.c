@@ -1,0 +1,910 @@
+/*
+ * aricode - Ari Code Language
+ * Recursive-descent parser with precedence climbing for expressions.
+ *
+ * Grammar (simplified):
+ *
+ *   program      = declaration* EOF
+ *   declaration  = fn_decl | var_decl | const_decl | statement
+ *   fn_decl      = "fn" IDENT "(" params ")" ("->" type)? block
+ *   var_decl     = "let" IDENT ":" type "=" expr ";"
+ *   const_decl   = "const" IDENT ":" type "=" expr ";"
+ *   statement    = if | for | while | match | try_catch
+ *                | error_raise | return | block | expr_stmt
+ *   block        = "{" declaration* "}"
+ *   if           = "if" "(" expr ")" block ("else" (if | block))?
+ *   for          = "for" "(" (var_decl | expr_stmt) expr ";" expr ")" block
+ *   while        = "while" "(" expr ")" block
+ *   match        = "match" "(" expr ")" "{" match_arm* "}"
+ *   match_arm    = expr "=>" (block | expr ";")
+ *   try_catch    = "try" block "catch" "(" IDENT ":" type ")" block
+ *   error_raise  = "error" "." "raise" "(" expr "," expr ")" ";"
+ *   return       = "return" expr? ";"
+ *   expr_stmt    = expr ";"
+ *
+ *   expr         = assignment
+ *   assignment   = or ("=" or)?
+ *   or           = and ("||" and)*
+ *   and          = equality ("&&" equality)*
+ *   equality     = comparison (("==" | "!=") comparison)*
+ *   comparison   = addition (("<" | ">" | "<=" | ">=") addition)*
+ *   addition     = multiplication (("+" | "-") multiplication)*
+ *   multiplication = unary (("*" | "/" | "%") unary)*
+ *   unary        = ("-" | "!") unary | call
+ *   call         = primary ("(" args ")" | "." IDENT)*
+ *   primary      = INT | FLOAT | STRING | "true" | "false" | "None"
+ *                | "Some" "(" expr ")"
+ *                | IDENT | "[" expr_list "]" | "(" expr ")"
+ *
+ *   type         = base_type | "Option" "<" type ">"
+ *                | "arr" "<" type ">" | "map" "<" type "," type ">"
+ *   base_type    = i8|i16|i32|i64|u8|u16|u32|u64|f32|f64|str|bool
+ */
+
+#include "parser.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdarg.h>
+
+/* ================================================================== */
+/*  Internal helpers                                                   */
+/* ================================================================== */
+
+/* --- Token access ------------------------------------------------- */
+
+static const ParserToken *peek(Parser *p) {
+    if (p->pos < p->token_count)
+        return &p->tokens[p->pos];
+    /* Should not happen if token stream ends with EOF, but be safe. */
+    return &p->tokens[p->token_count - 1];
+}
+
+static const ParserToken *previous(Parser *p) {
+    if (p->pos > 0)
+        return &p->tokens[p->pos - 1];
+    return &p->tokens[0];
+}
+
+static const ParserToken *advance(Parser *p) {
+    if (peek(p)->type != TOKEN_EOF)
+        p->pos++;
+    return previous(p);
+}
+
+static bool check(Parser *p, TokenType type) {
+    return peek(p)->type == type;
+}
+
+static bool match(Parser *p, TokenType type) {
+    if (check(p, type)) {
+        advance(p);
+        return true;
+    }
+    return false;
+}
+
+/* Match any one of several types.  Variadic, terminated by -1. */
+static bool match_any(Parser *p, ...) {
+    va_list ap;
+    va_start(ap, p);
+    int t;
+    while ((t = va_arg(ap, int)) != -1) {
+        if (check(p, (TokenType)t)) {
+            advance(p);
+            va_end(ap);
+            return true;
+        }
+    }
+    va_end(ap);
+    return false;
+}
+
+/* --- Error handling ----------------------------------------------- */
+
+__attribute__((unused))
+static void parser_error(Parser *p, int line, int col,
+                         const char *fmt, ...) {
+    if (p->panic_mode) return;
+    if (p->error_count >= PARSER_MAX_ERRORS) return;
+
+    ParserError *e = &p->errors[p->error_count++];
+    e->line = line;
+    e->col  = col;
+
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(e->message, sizeof(e->message), fmt, ap);
+    va_end(ap);
+
+    p->panic_mode = true;
+}
+
+static void error_at_current(Parser *p, const char *fmt, ...) {
+    const ParserToken *t = peek(p);
+    if (p->panic_mode) return;
+    if (p->error_count >= PARSER_MAX_ERRORS) return;
+
+    ParserError *e = &p->errors[p->error_count++];
+    e->line = t->line;
+    e->col  = t->col;
+
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(e->message, sizeof(e->message), fmt, ap);
+    va_end(ap);
+
+    p->panic_mode = true;
+}
+
+/* Expect a specific token or report an error. */
+static const ParserToken *expect(Parser *p, TokenType type, const char *what) {
+    if (check(p, type))
+        return advance(p);
+
+    const ParserToken *t = peek(p);
+    error_at_current(p,
+        "expected %s, found '%s'",
+        what,
+        t->lexeme ? t->lexeme : token_type_names[t->type]);
+    return NULL;
+}
+
+/* Synchronise after an error: skip tokens until we reach something
+ * that looks like the start of a new statement/declaration. */
+static void synchronize(Parser *p) {
+    p->panic_mode = false;
+
+    while (peek(p)->type != TOKEN_EOF) {
+        /* If previous token was ';', the next statement starts here. */
+        if (previous(p)->type == TOKEN_SEMICOLON) return;
+
+        switch (peek(p)->type) {
+        case TOKEN_FN:
+        case TOKEN_LET:
+        case TOKEN_CONST:
+        case TOKEN_IF:
+        case TOKEN_FOR:
+        case TOKEN_WHILE:
+        case TOKEN_RETURN:
+        case TOKEN_MATCH:
+        case TOKEN_TRY:
+        case TOKEN_ERROR:
+            return;
+        default:
+            break;
+        }
+        advance(p);
+    }
+}
+
+/* --- String helpers ----------------------------------------------- */
+
+static char *str_dup(const char *s) {
+    if (!s) return NULL;
+    size_t len = strlen(s);
+    char *d = malloc(len + 1);
+    if (d) memcpy(d, s, len + 1);
+    return d;
+}
+
+/* ================================================================== */
+/*  Forward declarations for recursive descent                        */
+/* ================================================================== */
+
+static ASTNode *parse_declaration(Parser *p);
+static ASTNode *parse_statement(Parser *p);
+static ASTNode *parse_block(Parser *p);
+static ASTNode *parse_expression(Parser *p);
+static ASTNode *parse_type(Parser *p);
+
+/* ================================================================== */
+/*  Type parsing                                                      */
+/* ================================================================== */
+
+static bool is_base_type(TokenType t) {
+    return t >= TOKEN_TYPE_I8 && t <= TOKEN_TYPE_MAP;
+}
+
+static ASTNode *parse_type(Parser *p) {
+    const ParserToken *t = peek(p);
+
+    /* Option<T> */
+    if (match(p, TOKEN_OPTION)) {
+        ASTNode *node = ast_create_node(NODE_TYPE_ANNOTATION, t->line, t->col);
+        node->string_val = str_dup("Option");
+        expect(p, TOKEN_LT, "'<' after Option");
+        ASTNode *inner = parse_type(p);
+        ast_add_child(node, inner);
+        expect(p, TOKEN_GT, "'>' to close Option type");
+        return node;
+    }
+
+    /* arr<T> */
+    if (match(p, TOKEN_TYPE_ARR)) {
+        ASTNode *node = ast_create_node(NODE_TYPE_ANNOTATION, t->line, t->col);
+        node->string_val = str_dup("arr");
+        expect(p, TOKEN_LT, "'<' after arr");
+        ASTNode *inner = parse_type(p);
+        ast_add_child(node, inner);
+        expect(p, TOKEN_GT, "'>' to close arr type");
+        return node;
+    }
+
+    /* map<K,V> */
+    if (match(p, TOKEN_TYPE_MAP)) {
+        ASTNode *node = ast_create_node(NODE_TYPE_ANNOTATION, t->line, t->col);
+        node->string_val = str_dup("map");
+        expect(p, TOKEN_LT, "'<' after map");
+        ASTNode *key = parse_type(p);
+        ast_add_child(node, key);
+        expect(p, TOKEN_COMMA, "',' between map key and value types");
+        ASTNode *val = parse_type(p);
+        ast_add_child(node, val);
+        expect(p, TOKEN_GT, "'>' to close map type");
+        return node;
+    }
+
+    /* Base types: i8..bool */
+    if (is_base_type(peek(p)->type)) {
+        const ParserToken *bt = advance(p);
+        ASTNode *node = ast_create_node(NODE_TYPE_ANNOTATION, bt->line, bt->col);
+        node->string_val = str_dup(bt->lexeme ? bt->lexeme
+                                              : token_type_names[bt->type]);
+        return node;
+    }
+
+    /* Identifier used as a type name (user-defined types in the future) */
+    if (check(p, TOKEN_IDENTIFIER)) {
+        const ParserToken *id = advance(p);
+        ASTNode *node = ast_create_node(NODE_TYPE_ANNOTATION, id->line, id->col);
+        node->string_val = str_dup(id->lexeme);
+        return node;
+    }
+
+    error_at_current(p, "expected type annotation");
+    return ast_create_node(NODE_TYPE_ANNOTATION, t->line, t->col);
+}
+
+/* ================================================================== */
+/*  Expression parsing  (precedence climbing)                         */
+/* ================================================================== */
+
+/* --- Primary ------------------------------------------------------ */
+
+static ASTNode *parse_primary(Parser *p) {
+    const ParserToken *t = peek(p);
+
+    /* Integer literal */
+    if (match(p, TOKEN_INTEGER)) {
+        ASTNode *n = ast_create_node(NODE_INT_LITERAL, t->line, t->col);
+        n->int_val = t->lexeme ? strtol(t->lexeme, NULL, 0) : 0;
+        n->string_val = str_dup(t->lexeme);
+        return n;
+    }
+
+    /* Float literal */
+    if (match(p, TOKEN_FLOAT)) {
+        ASTNode *n = ast_create_node(NODE_FLOAT_LITERAL, t->line, t->col);
+        n->float_val = t->lexeme ? strtod(t->lexeme, NULL) : 0.0;
+        n->string_val = str_dup(t->lexeme);
+        return n;
+    }
+
+    /* String literal */
+    if (match(p, TOKEN_STRING)) {
+        ASTNode *n = ast_create_node(NODE_STRING_LITERAL, t->line, t->col);
+        n->string_val = str_dup(t->lexeme);
+        return n;
+    }
+
+    /* Boolean literals */
+    if (match(p, TOKEN_TRUE)) {
+        ASTNode *n = ast_create_node(NODE_BOOL_LITERAL, t->line, t->col);
+        n->bool_val = 1;
+        n->string_val = str_dup("true");
+        return n;
+    }
+    if (match(p, TOKEN_FALSE)) {
+        ASTNode *n = ast_create_node(NODE_BOOL_LITERAL, t->line, t->col);
+        n->bool_val = 0;
+        n->string_val = str_dup("false");
+        return n;
+    }
+
+    /* None */
+    if (match(p, TOKEN_NONE)) {
+        return ast_create_node(NODE_NONE, t->line, t->col);
+    }
+
+    /* Some(expr) */
+    if (match(p, TOKEN_SOME)) {
+        ASTNode *n = ast_create_node(NODE_SOME, t->line, t->col);
+        expect(p, TOKEN_LPAREN, "'(' after Some");
+        ASTNode *val = parse_expression(p);
+        ast_add_child(n, val);
+        expect(p, TOKEN_RPAREN, "')' after Some value");
+        return n;
+    }
+
+    /* Array literal [expr, ...] */
+    if (match(p, TOKEN_LBRACKET)) {
+        ASTNode *arr = ast_create_node(NODE_ARRAY_LITERAL, t->line, t->col);
+        if (!check(p, TOKEN_RBRACKET)) {
+            do {
+                ast_add_child(arr, parse_expression(p));
+            } while (match(p, TOKEN_COMMA));
+        }
+        expect(p, TOKEN_RBRACKET, "']' to close array literal");
+        return arr;
+    }
+
+    /* Grouped expression (expr) */
+    if (match(p, TOKEN_LPAREN)) {
+        ASTNode *expr = parse_expression(p);
+        expect(p, TOKEN_RPAREN, "')' to close grouped expression");
+        return expr;
+    }
+
+    /* Error level literals: Level.SILENT, etc. */
+    if (match_any(p, TOKEN_LEVEL_SILENT, TOKEN_LEVEL_LOGIC,
+                  TOKEN_LEVEL_WARNING, TOKEN_LEVEL_SYSTEM,
+                  TOKEN_LEVEL_CATASTROPHIC, -1)) {
+        ASTNode *n = ast_create_node(NODE_IDENTIFIER, t->line, t->col);
+        n->string_val = str_dup(t->lexeme ? t->lexeme
+                                          : token_type_names[t->type]);
+        return n;
+    }
+
+    /* Identifier */
+    if (match(p, TOKEN_IDENTIFIER)) {
+        ASTNode *n = ast_create_node(NODE_IDENTIFIER, t->line, t->col);
+        n->string_val = str_dup(t->lexeme);
+        return n;
+    }
+
+    error_at_current(p, "expected expression, found '%s'",
+                     t->lexeme ? t->lexeme : token_type_names[t->type]);
+    advance(p); /* skip the unexpected token */
+    return ast_create_node(NODE_IDENTIFIER, t->line, t->col);
+}
+
+/* --- Postfix: calls and member access ----------------------------- */
+
+static ASTNode *parse_call(Parser *p) {
+    ASTNode *expr = parse_primary(p);
+
+    for (;;) {
+        if (match(p, TOKEN_LPAREN)) {
+            /* Function call */
+            ASTNode *call = ast_create_node(NODE_CALL, expr->line, expr->col);
+            ast_add_child(call, expr); /* callee */
+
+            if (!check(p, TOKEN_RPAREN)) {
+                do {
+                    ast_add_child(call, parse_expression(p));
+                } while (match(p, TOKEN_COMMA));
+            }
+            expect(p, TOKEN_RPAREN, "')' after arguments");
+            expr = call;
+
+        } else if (match(p, TOKEN_DOT)) {
+            /* Member access */
+            const ParserToken *member = expect(p, TOKEN_IDENTIFIER, "member name after '.'");
+            ASTNode *access = ast_create_node(NODE_MEMBER_ACCESS,
+                                              expr->line, expr->col);
+            ast_add_child(access, expr);
+            access->string_val = member ? str_dup(member->lexeme) : str_dup("");
+            expr = access;
+
+        } else {
+            break;
+        }
+    }
+
+    return expr;
+}
+
+/* --- Unary -------------------------------------------------------- */
+
+static ASTNode *parse_unary(Parser *p) {
+    if (check(p, TOKEN_MINUS) || check(p, TOKEN_NOT)) {
+        const ParserToken *op = advance(p);
+        ASTNode *operand = parse_unary(p);
+        ASTNode *node = ast_create_node(NODE_UNARY_OP, op->line, op->col);
+        node->op = str_dup(op->lexeme ? op->lexeme : token_type_names[op->type]);
+        ast_add_child(node, operand);
+        return node;
+    }
+    return parse_call(p);
+}
+
+/* --- Binary (precedence climbing) --------------------------------- */
+
+static ASTNode *parse_multiplication(Parser *p) {
+    ASTNode *left = parse_unary(p);
+
+    while (check(p, TOKEN_STAR) || check(p, TOKEN_SLASH) ||
+           check(p, TOKEN_PERCENT)) {
+        const ParserToken *op = advance(p);
+        ASTNode *right = parse_unary(p);
+        ASTNode *bin = ast_create_node(NODE_BINARY_OP, op->line, op->col);
+        bin->op = str_dup(op->lexeme ? op->lexeme : token_type_names[op->type]);
+        ast_add_child(bin, left);
+        ast_add_child(bin, right);
+        left = bin;
+    }
+    return left;
+}
+
+static ASTNode *parse_addition(Parser *p) {
+    ASTNode *left = parse_multiplication(p);
+
+    while (check(p, TOKEN_PLUS) || check(p, TOKEN_MINUS)) {
+        const ParserToken *op = advance(p);
+        ASTNode *right = parse_multiplication(p);
+        ASTNode *bin = ast_create_node(NODE_BINARY_OP, op->line, op->col);
+        bin->op = str_dup(op->lexeme ? op->lexeme : token_type_names[op->type]);
+        ast_add_child(bin, left);
+        ast_add_child(bin, right);
+        left = bin;
+    }
+    return left;
+}
+
+static ASTNode *parse_comparison(Parser *p) {
+    ASTNode *left = parse_addition(p);
+
+    while (check(p, TOKEN_LT) || check(p, TOKEN_GT) ||
+           check(p, TOKEN_LTE) || check(p, TOKEN_GTE)) {
+        const ParserToken *op = advance(p);
+        ASTNode *right = parse_addition(p);
+        ASTNode *bin = ast_create_node(NODE_BINARY_OP, op->line, op->col);
+        bin->op = str_dup(op->lexeme ? op->lexeme : token_type_names[op->type]);
+        ast_add_child(bin, left);
+        ast_add_child(bin, right);
+        left = bin;
+    }
+    return left;
+}
+
+static ASTNode *parse_equality(Parser *p) {
+    ASTNode *left = parse_comparison(p);
+
+    while (check(p, TOKEN_EQ) || check(p, TOKEN_NEQ)) {
+        const ParserToken *op = advance(p);
+        ASTNode *right = parse_comparison(p);
+        ASTNode *bin = ast_create_node(NODE_BINARY_OP, op->line, op->col);
+        bin->op = str_dup(op->lexeme ? op->lexeme : token_type_names[op->type]);
+        ast_add_child(bin, left);
+        ast_add_child(bin, right);
+        left = bin;
+    }
+    return left;
+}
+
+static ASTNode *parse_and(Parser *p) {
+    ASTNode *left = parse_equality(p);
+
+    while (check(p, TOKEN_AND)) {
+        const ParserToken *op = advance(p);
+        ASTNode *right = parse_equality(p);
+        ASTNode *bin = ast_create_node(NODE_BINARY_OP, op->line, op->col);
+        bin->op = str_dup("&&");
+        ast_add_child(bin, left);
+        ast_add_child(bin, right);
+        left = bin;
+    }
+    return left;
+}
+
+static ASTNode *parse_or(Parser *p) {
+    ASTNode *left = parse_and(p);
+
+    while (check(p, TOKEN_OR)) {
+        const ParserToken *op = advance(p);
+        ASTNode *right = parse_and(p);
+        ASTNode *bin = ast_create_node(NODE_BINARY_OP, op->line, op->col);
+        bin->op = str_dup("||");
+        ast_add_child(bin, left);
+        ast_add_child(bin, right);
+        left = bin;
+    }
+    return left;
+}
+
+static ASTNode *parse_assignment(Parser *p) {
+    ASTNode *left = parse_or(p);
+
+    if (check(p, TOKEN_ASSIGN)) {
+        const ParserToken *op = advance(p);
+        ASTNode *right = parse_assignment(p); /* right-associative */
+        ASTNode *bin = ast_create_node(NODE_BINARY_OP, op->line, op->col);
+        bin->op = str_dup("=");
+        ast_add_child(bin, left);
+        ast_add_child(bin, right);
+        return bin;
+    }
+    return left;
+}
+
+static ASTNode *parse_expression(Parser *p) {
+    return parse_assignment(p);
+}
+
+/* ================================================================== */
+/*  Statement parsing                                                 */
+/* ================================================================== */
+
+/* --- Block -------------------------------------------------------- */
+
+static ASTNode *parse_block(Parser *p) {
+    const ParserToken *t = peek(p);
+    expect(p, TOKEN_LBRACE, "'{'");
+
+    ASTNode *block = ast_create_node(NODE_BLOCK, t->line, t->col);
+
+    while (!check(p, TOKEN_RBRACE) && !check(p, TOKEN_EOF)) {
+        ASTNode *decl = parse_declaration(p);
+        if (decl)
+            ast_add_child(block, decl);
+    }
+
+    expect(p, TOKEN_RBRACE, "'}'");
+    return block;
+}
+
+/* --- Return ------------------------------------------------------- */
+
+static ASTNode *parse_return(Parser *p) {
+    const ParserToken *t = previous(p); /* TOKEN_RETURN already consumed */
+    ASTNode *node = ast_create_node(NODE_RETURN, t->line, t->col);
+
+    if (!check(p, TOKEN_SEMICOLON)) {
+        ast_add_child(node, parse_expression(p));
+    }
+    expect(p, TOKEN_SEMICOLON, "';' after return statement");
+    return node;
+}
+
+/* --- If ----------------------------------------------------------- */
+
+static ASTNode *parse_if(Parser *p) {
+    const ParserToken *t = previous(p); /* TOKEN_IF already consumed */
+    ASTNode *node = ast_create_node(NODE_IF, t->line, t->col);
+
+    expect(p, TOKEN_LPAREN, "'(' after if");
+    ast_add_child(node, parse_expression(p)); /* condition */
+    expect(p, TOKEN_RPAREN, "')' after if condition");
+
+    ast_add_child(node, parse_block(p));      /* then branch */
+
+    if (match(p, TOKEN_ELSE)) {
+        if (check(p, TOKEN_IF)) {
+            advance(p);
+            ast_add_child(node, parse_if(p)); /* else if */
+        } else {
+            ast_add_child(node, parse_block(p)); /* else */
+        }
+    }
+
+    return node;
+}
+
+/* --- For ---------------------------------------------------------- */
+
+static ASTNode *parse_for(Parser *p) {
+    const ParserToken *t = previous(p); /* TOKEN_FOR already consumed */
+    ASTNode *node = ast_create_node(NODE_FOR, t->line, t->col);
+
+    expect(p, TOKEN_LPAREN, "'(' after for");
+
+    /* Initializer */
+    if (check(p, TOKEN_LET)) {
+        advance(p);
+        /* Inline var_decl parsing (let name: type = expr;) */
+        const ParserToken *name_tok = expect(p, TOKEN_IDENTIFIER, "variable name");
+        ASTNode *init = ast_create_node(NODE_VAR_DECL,
+                                        t->line, t->col);
+        init->string_val = name_tok ? str_dup(name_tok->lexeme) : str_dup("");
+
+        if (match(p, TOKEN_COLON)) {
+            ast_add_child(init, parse_type(p));
+        }
+        if (match(p, TOKEN_ASSIGN)) {
+            ast_add_child(init, parse_expression(p));
+        }
+        expect(p, TOKEN_SEMICOLON, "';' after for initializer");
+        ast_add_child(node, init);
+    } else if (check(p, TOKEN_SEMICOLON)) {
+        advance(p);
+        /* empty initializer -- add a null placeholder */
+        ast_add_child(node, ast_create_node(NODE_EXPR_STMT, t->line, t->col));
+    } else {
+        ASTNode *init_expr = parse_expression(p);
+        ASTNode *init_stmt = ast_create_node(NODE_EXPR_STMT,
+                                             init_expr->line, init_expr->col);
+        ast_add_child(init_stmt, init_expr);
+        expect(p, TOKEN_SEMICOLON, "';' after for initializer");
+        ast_add_child(node, init_stmt);
+    }
+
+    /* Condition */
+    if (!check(p, TOKEN_SEMICOLON))
+        ast_add_child(node, parse_expression(p));
+    else
+        ast_add_child(node, ast_create_node(NODE_BOOL_LITERAL, t->line, t->col));
+    expect(p, TOKEN_SEMICOLON, "';' after for condition");
+
+    /* Update */
+    if (!check(p, TOKEN_RPAREN))
+        ast_add_child(node, parse_expression(p));
+    else
+        ast_add_child(node, ast_create_node(NODE_EXPR_STMT, t->line, t->col));
+
+    expect(p, TOKEN_RPAREN, "')' after for clauses");
+    ast_add_child(node, parse_block(p));
+
+    return node;
+}
+
+/* --- While -------------------------------------------------------- */
+
+static ASTNode *parse_while(Parser *p) {
+    const ParserToken *t = previous(p);
+    ASTNode *node = ast_create_node(NODE_WHILE, t->line, t->col);
+
+    expect(p, TOKEN_LPAREN, "'(' after while");
+    ast_add_child(node, parse_expression(p));
+    expect(p, TOKEN_RPAREN, "')' after while condition");
+    ast_add_child(node, parse_block(p));
+
+    return node;
+}
+
+/* --- Match -------------------------------------------------------- */
+
+static ASTNode *parse_match(Parser *p) {
+    const ParserToken *t = previous(p);
+    ASTNode *node = ast_create_node(NODE_MATCH, t->line, t->col);
+
+    expect(p, TOKEN_LPAREN, "'(' after match");
+    ast_add_child(node, parse_expression(p));
+    expect(p, TOKEN_RPAREN, "')' after match expression");
+
+    expect(p, TOKEN_LBRACE, "'{' to open match body");
+
+    while (!check(p, TOKEN_RBRACE) && !check(p, TOKEN_EOF)) {
+        const ParserToken *arm_tok = peek(p);
+        ASTNode *arm = ast_create_node(NODE_MATCH_ARM,
+                                       arm_tok->line, arm_tok->col);
+
+        /* Pattern (for now just an expression) */
+        ast_add_child(arm, parse_expression(p));
+        expect(p, TOKEN_FAT_ARROW, "'=>' in match arm");
+
+        /* Body: block or single expression followed by comma/semicolon */
+        if (check(p, TOKEN_LBRACE)) {
+            ast_add_child(arm, parse_block(p));
+            match(p, TOKEN_COMMA); /* optional trailing comma */
+        } else {
+            ASTNode *body_expr = parse_expression(p);
+            ASTNode *body_stmt = ast_create_node(NODE_EXPR_STMT,
+                                                 body_expr->line, body_expr->col);
+            ast_add_child(body_stmt, body_expr);
+            ast_add_child(arm, body_stmt);
+            /* expect comma or allow the closing brace */
+            if (!check(p, TOKEN_RBRACE))
+                expect(p, TOKEN_COMMA, "',' after match arm expression");
+        }
+
+        ast_add_child(node, arm);
+    }
+
+    expect(p, TOKEN_RBRACE, "'}' to close match");
+    return node;
+}
+
+/* --- Try / Catch -------------------------------------------------- */
+
+static ASTNode *parse_try_catch(Parser *p) {
+    const ParserToken *t = previous(p);
+    ASTNode *node = ast_create_node(NODE_TRY_CATCH, t->line, t->col);
+
+    ast_add_child(node, parse_block(p)); /* try block */
+
+    expect(p, TOKEN_CATCH, "'catch' after try block");
+    expect(p, TOKEN_LPAREN, "'(' after catch");
+
+    const ParserToken *name = expect(p, TOKEN_IDENTIFIER, "catch variable name");
+    node->string_val = name ? str_dup(name->lexeme) : str_dup("");
+
+    expect(p, TOKEN_COLON, "':' after catch variable");
+    ast_add_child(node, parse_type(p));  /* catch type */
+    expect(p, TOKEN_RPAREN, "')' after catch clause");
+
+    ast_add_child(node, parse_block(p)); /* catch block */
+
+    return node;
+}
+
+/* --- error.raise(...) --------------------------------------------- */
+
+static ASTNode *parse_error_raise(Parser *p) {
+    const ParserToken *t = previous(p); /* TOKEN_ERROR already consumed */
+    ASTNode *node = ast_create_node(NODE_ERROR_RAISE, t->line, t->col);
+
+    expect(p, TOKEN_DOT, "'.' after error");
+    const ParserToken *member = expect(p, TOKEN_IDENTIFIER, "'raise' after error.");
+    /* We could validate member->lexeme == "raise" here */
+    if (member && member->lexeme)
+        node->string_val = str_dup(member->lexeme);
+
+    expect(p, TOKEN_LPAREN, "'(' after error.raise");
+
+    /* Arguments: level, message */
+    ast_add_child(node, parse_expression(p));
+    if (match(p, TOKEN_COMMA))
+        ast_add_child(node, parse_expression(p));
+
+    expect(p, TOKEN_RPAREN, "')' after error.raise arguments");
+    expect(p, TOKEN_SEMICOLON, "';' after error.raise");
+
+    return node;
+}
+
+/* --- Statement dispatcher ----------------------------------------- */
+
+static ASTNode *parse_statement(Parser *p) {
+    if (match(p, TOKEN_RETURN))  return parse_return(p);
+    if (match(p, TOKEN_IF))      return parse_if(p);
+    if (match(p, TOKEN_FOR))     return parse_for(p);
+    if (match(p, TOKEN_WHILE))   return parse_while(p);
+    if (match(p, TOKEN_MATCH))   return parse_match(p);
+    if (match(p, TOKEN_TRY))     return parse_try_catch(p);
+    if (match(p, TOKEN_ERROR))   return parse_error_raise(p);
+
+    if (check(p, TOKEN_LBRACE))  return parse_block(p);
+
+    /* Expression statement */
+    ASTNode *expr = parse_expression(p);
+    ASTNode *stmt = ast_create_node(NODE_EXPR_STMT, expr->line, expr->col);
+    ast_add_child(stmt, expr);
+    expect(p, TOKEN_SEMICOLON, "';' after expression");
+    return stmt;
+}
+
+/* ================================================================== */
+/*  Declaration parsing                                               */
+/* ================================================================== */
+
+/* --- Variable / constant declaration ------------------------------ */
+
+static ASTNode *parse_var_declaration(Parser *p, bool is_const) {
+    const ParserToken *kw = previous(p);
+    NodeType ntype = is_const ? NODE_CONST_DECL : NODE_VAR_DECL;
+
+    const ParserToken *name = expect(p, TOKEN_IDENTIFIER, "variable name");
+
+    ASTNode *node = ast_create_node(ntype, kw->line, kw->col);
+    node->string_val = name ? str_dup(name->lexeme) : str_dup("");
+
+    /* Type annotation (required) */
+    expect(p, TOKEN_COLON, "':' for type annotation");
+    ast_add_child(node, parse_type(p));
+
+    /* Initializer */
+    expect(p, TOKEN_ASSIGN, "'=' for initializer");
+    ast_add_child(node, parse_expression(p));
+
+    expect(p, TOKEN_SEMICOLON, "';' after declaration");
+    return node;
+}
+
+/* --- Function declaration ----------------------------------------- */
+
+static ASTNode *parse_fn_declaration(Parser *p) {
+    const ParserToken *kw = previous(p); /* TOKEN_FN already consumed */
+
+    const ParserToken *name = expect(p, TOKEN_IDENTIFIER, "function name");
+
+    ASTNode *fn = ast_create_node(NODE_FN_DECL, kw->line, kw->col);
+    fn->string_val = name ? str_dup(name->lexeme) : str_dup("");
+
+    /* Parameter list */
+    expect(p, TOKEN_LPAREN, "'(' after function name");
+
+    /* We create a temporary BLOCK node to hold parameter declarations. */
+    ASTNode *params = ast_create_node(NODE_BLOCK, kw->line, kw->col);
+
+    if (!check(p, TOKEN_RPAREN)) {
+        do {
+            const ParserToken *pname = expect(p, TOKEN_IDENTIFIER, "parameter name");
+            expect(p, TOKEN_COLON, "':' after parameter name");
+            ASTNode *ptype = parse_type(p);
+
+            ASTNode *param = ast_create_node(NODE_VAR_DECL,
+                                             pname ? pname->line : kw->line,
+                                             pname ? pname->col  : kw->col);
+            param->string_val = pname ? str_dup(pname->lexeme) : str_dup("");
+            ast_add_child(param, ptype);
+            ast_add_child(params, param);
+        } while (match(p, TOKEN_COMMA));
+    }
+
+    expect(p, TOKEN_RPAREN, "')' after parameters");
+    ast_add_child(fn, params); /* child 0: params */
+
+    /* Return type (optional, indicated by ->) */
+    if (match(p, TOKEN_ARROW)) {
+        ast_add_child(fn, parse_type(p)); /* child 1: return type */
+    }
+
+    /* Body */
+    ast_add_child(fn, parse_block(p)); /* child 1 or 2: body */
+
+    return fn;
+}
+
+/* --- Top-level declaration dispatcher ----------------------------- */
+
+static ASTNode *parse_declaration(Parser *p) {
+    ASTNode *node = NULL;
+
+    if (match(p, TOKEN_FN)) {
+        node = parse_fn_declaration(p);
+    } else if (match(p, TOKEN_LET)) {
+        node = parse_var_declaration(p, false);
+    } else if (match(p, TOKEN_CONST)) {
+        node = parse_var_declaration(p, true);
+    } else {
+        node = parse_statement(p);
+    }
+
+    if (p->panic_mode) synchronize(p);
+    return node;
+}
+
+/* ================================================================== */
+/*  Program (entry point)                                             */
+/* ================================================================== */
+
+static ASTNode *parse_program(Parser *p) {
+    ASTNode *program = ast_create_node(NODE_PROGRAM, 1, 1);
+
+    while (!check(p, TOKEN_EOF)) {
+        ASTNode *decl = parse_declaration(p);
+        if (decl)
+            ast_add_child(program, decl);
+    }
+
+    return program;
+}
+
+/* ================================================================== */
+/*  Public API                                                        */
+/* ================================================================== */
+
+void parser_init(Parser *p, const ParserToken *tokens, size_t token_count) {
+    memset(p, 0, sizeof(*p));
+    p->tokens      = tokens;
+    p->token_count = token_count;
+    p->pos         = 0;
+}
+
+ASTNode *parser_parse(Parser *p) {
+    return parse_program(p);
+}
+
+bool parser_has_errors(const Parser *p) {
+    return p->error_count > 0;
+}
+
+void parser_print_errors(const Parser *p) {
+    for (size_t i = 0; i < p->error_count; i++) {
+        const ParserError *e = &p->errors[i];
+        fprintf(stderr, "aricode:parser: [%d:%d] error: %s\n",
+                e->line, e->col, e->message);
+    }
+}

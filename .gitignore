@@ -1,0 +1,35 @@
+# Build artifacts
+*.o
+*.bin
+*.out
+build/
+
+# Test binaries
+lexer_test
+parser_test
+test_errors_bin
+test_podium_bin
+codegen_test
+test_decimal
+test_decimal_codegen
+test_semantic
+aric
+
+# Generated binaries from sparring
+sparring/challenges/*/build/
+sparring/results/
+
+# Error logs
+.aricode/
+
+# Editor files
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+
+# Python cache
+__pycache__/
+*.pyc

@@ -1,0 +1,22 @@
+# Build artifacts
+*.o
+*.bin
+*.out
+build/
+
+# Test binaries
+lexer_test
+parser_test
+test_errors_bin
+test_podium_bin
+
+# Error logs
+.aricode/
+
+# Editor files
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store

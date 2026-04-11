@@ -1,0 +1,16 @@
+// aricode precise decimal arithmetic
+// No IEEE 754 - pure decimal, 20+ digit precision
+
+fn main() -> i32 {
+  let a: dec = 0.1;
+  let b: dec = 0.2;
+  let result: dec = a + b;
+
+  // In aricode: result is EXACTLY 0.3
+  // In Python/C/JS: result is 0.30000000000000004
+
+  if (result == 0.3) {
+    return 1;  // PASS
+  }
+  return 0;    // FAIL
+}

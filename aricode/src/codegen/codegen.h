@@ -1,0 +1,101 @@
+/*
+ * aricode - Ari Code Language
+ * Code Generator: AST -> x86_64 Machine Code
+ *
+ * Takes an AST produced by the parser and generates raw x86_64 machine
+ * code targeting Linux System V ABI on AMD Ryzen 7 5800X (Zen 3).
+ *
+ * The codegen produces a position-dependent code buffer that can be
+ * wrapped in an ELF binary via elf_create().
+ */
+
+#ifndef ARICODE_CODEGEN_H
+#define ARICODE_CODEGEN_H
+
+#include "../parser/ast.h"
+#include "elf.h"
+
+#include <stdint.h>
+#include <stddef.h>
+
+/* ------------------------------------------------------------------ */
+/*  Code buffer                                                       */
+/* ------------------------------------------------------------------ */
+
+#define CODEGEN_MAX_CODE   (64 * 1024)   /* 64 KiB max code size     */
+#define CODEGEN_MAX_FUNCS  256           /* max function definitions  */
+#define CODEGEN_MAX_VARS   256           /* max locals per function   */
+
+/* ------------------------------------------------------------------ */
+/*  Symbol / variable tracking                                        */
+/* ------------------------------------------------------------------ */
+
+typedef struct {
+    const char *name;      /* variable name (borrowed from AST)       */
+    int32_t     rbp_off;   /* offset from RBP (negative = locals)     */
+} LocalVar;
+
+typedef struct {
+    const char *name;      /* function name (borrowed from AST)       */
+    size_t      code_off;  /* byte offset in code buffer              */
+    int         param_cnt; /* number of parameters                    */
+} FuncEntry;
+
+/* ------------------------------------------------------------------ */
+/*  Codegen state                                                     */
+/* ------------------------------------------------------------------ */
+
+typedef struct {
+    /* Output code buffer */
+    uint8_t     code[CODEGEN_MAX_CODE];
+    size_t      code_size;
+
+    /* Function table */
+    FuncEntry   funcs[CODEGEN_MAX_FUNCS];
+    size_t      func_count;
+
+    /* Current function's local variables */
+    LocalVar    locals[CODEGEN_MAX_VARS];
+    size_t      local_count;
+    int32_t     stack_offset;   /* current RBP offset for next local  */
+
+    /* Patch list: locations of CALL rel32 that need fixup */
+    struct {
+        size_t  code_pos;      /* position of the rel32 in code[]     */
+        const char *target;    /* target function name                 */
+    } call_patches[1024];
+    size_t      patch_count;
+
+    /* Entry point offset (set when _start is emitted) */
+    size_t      entry_offset;
+
+    /* Error tracking */
+    int         had_error;
+    char        error_msg[512];
+} CodegenState;
+
+/* ------------------------------------------------------------------ */
+/*  API                                                               */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Initialize a codegen state.  Must be called before codegen_generate().
+ */
+void codegen_init(CodegenState *cg);
+
+/*
+ * Generate x86_64 machine code from an AST.
+ *
+ * Returns 0 on success, -1 on error (check cg->error_msg).
+ * On success, the code is in cg->code[0..cg->code_size-1] and
+ * cg->entry_offset points to _start.
+ */
+int codegen_generate(CodegenState *cg, const ASTNode *ast);
+
+/*
+ * Convenience: generate code and write an ELF binary in one step.
+ * Returns 0 on success.
+ */
+int codegen_compile_to_file(const ASTNode *ast, const char *output_path);
+
+#endif /* ARICODE_CODEGEN_H */

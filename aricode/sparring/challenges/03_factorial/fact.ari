@@ -1,0 +1,13 @@
+// aricode - Challenge 03: Factorial
+// Compute 5! = 120, return as exit code
+
+fn factorial(n: i32) -> i32 {
+    if (n < 2) {
+        return 1;
+    }
+    return n * factorial(n - 1);
+}
+
+fn main() -> i32 {
+    return factorial(5);
+}

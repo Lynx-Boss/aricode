@@ -74,6 +74,11 @@ typedef struct {
     const char *current_fn_name;   /* name of function being compiled   */
     size_t      current_fn_entry;  /* code offset of function entry     */
 
+    /* Error handling: try/catch frame stack */
+    size_t      catch_targets[32]; /* code offsets of catch entry points */
+    size_t      catch_rsp_slots[32]; /* stack slot offsets for saved RSP */
+    int         catch_depth;       /* current nesting depth             */
+
     /* Error tracking */
     int         had_error;
     char        error_msg[512];

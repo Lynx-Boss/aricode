@@ -1,0 +1,47 @@
+// aricode - Error Handling Demo
+// Demonstrates try/catch and error.raise
+// Zero silent errors - the core philosophy of aricode.
+
+fn safe_divide(a: i32, b: i32) -> i32 {
+    if (b == 0) {
+        error.raise(1, "division by zero");
+    }
+    return a / b;
+}
+
+fn main() -> i32 {
+    // Test 1: Normal division
+    print_str("Test 1: 42 / 6");
+    try {
+        let result: i32 = safe_divide(42, 6);
+        print_str("Result:");
+        print_int(result);
+    } catch (e: Error) {
+        print_str("ERROR caught!");
+        print_int(e);
+    }
+
+    // Test 2: Division by zero - caught!
+    print_str("Test 2: 10 / 0");
+    try {
+        let result: i32 = safe_divide(10, 0);
+        print_str("This should NOT print");
+        print_int(result);
+    } catch (e: Error) {
+        print_str("ERROR caught! Code:");
+        print_int(e);
+    }
+
+    // Test 3: Normal again after catch
+    print_str("Test 3: 100 / 4");
+    try {
+        let result: i32 = safe_divide(100, 4);
+        print_str("Result:");
+        print_int(result);
+    } catch (e: Error) {
+        print_str("ERROR caught!");
+    }
+
+    print_str("All tests passed - errors handled!");
+    return 0;
+}

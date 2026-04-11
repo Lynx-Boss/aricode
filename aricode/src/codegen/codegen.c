@@ -1397,6 +1397,121 @@ static void emit_statement(CodegenState *cg, const ASTNode *node) {
     case NODE_BLOCK:
         emit_block(cg, node);
         break;
+
+    case NODE_TRY_CATCH: {
+        /*
+         * try { body } catch (e: Error) { handler }
+         *
+         * Cross-function error handling via callee-saved registers:
+         *   R12 = saved RSP (try entry)
+         *   R13 = saved RBP (try entry)
+         *   R14 = catch entry address (code offset + load base)
+         *   R15 = catch active (1 = active, 0 = inactive)
+         *
+         * error.raise anywhere (even in called functions) restores
+         * R12->RSP, R13->RBP, and jumps to R14. Error code in RAX.
+         */
+        int n; uint8_t *b;
+
+        /* Save RSP -> R12 */
+        b = BUF(cg); b[0]=0x49; b[1]=0x89; b[2]=0xE4; EMIT(cg,3); /* mov r12, rsp */
+        /* Save RBP -> R13 */
+        b = BUF(cg); b[0]=0x49; b[1]=0x89; b[2]=0xED; EMIT(cg,3); /* mov r13, rbp */
+
+        /* Load catch entry address into R14 (LEA with RIP-relative) */
+        /* We don't know the address yet, so emit a placeholder MOV R14, imm64
+         * and patch it later. */
+        size_t r14_patch = cg->code_size;
+        b = BUF(cg);
+        b[0] = 0x49; b[1] = 0xBE; /* mov r14, imm64 */
+        memset(b+2, 0, 8); /* placeholder */
+        EMIT(cg, 10);
+
+        /* Set R15 = 1 (catch active) */
+        b = BUF(cg); b[0]=0x49; b[1]=0xC7; b[2]=0xC7;
+        int32_t one=1; memcpy(b+3,&one,4); EMIT(cg,7); /* mov r15, 1 */
+
+        /* Emit try body */
+        emit_block(cg, node->children[0]);
+
+        /* Success: deactivate catch */
+        b = BUF(cg); b[0]=0x4D; b[1]=0x31; b[2]=0xFF; EMIT(cg,3); /* xor r15, r15 */
+
+        /* JMP over catch */
+        size_t jmp_after = cg->code_size;
+        n = emit_jmp(BUF(cg), 0); EMIT(cg, n);
+
+        /* === CATCH ENTRY POINT === */
+        size_t catch_addr = cg->code_size;
+
+        /* Patch R14 with the catch address + ELF load base (0x400000 + header) */
+        uint64_t catch_runtime_addr = 0x400078 + catch_addr; /* ELF base + header */
+        memcpy(cg->code + r14_patch + 2, &catch_runtime_addr, 8);
+
+        /* Restore RSP and RBP from R12/R13 */
+        b = BUF(cg); b[0]=0x4C; b[1]=0x89; b[2]=0xE4; EMIT(cg,3); /* mov rsp, r12 */
+        b = BUF(cg); b[0]=0x4C; b[1]=0x89; b[2]=0xED; EMIT(cg,3); /* mov rbp, r13 */
+
+        /* Deactivate catch */
+        b = BUF(cg); b[0]=0x4D; b[1]=0x31; b[2]=0xFF; EMIT(cg,3); /* xor r15, r15 */
+
+        /* Define catch variable (error code in RAX) */
+        if (node->string_val) {
+            LocalVar *catch_var = add_local(cg, node->string_val);
+            if (catch_var) {
+                n = emit_mov_mem_reg(BUF(cg), REG_RBP, catch_var->rbp_off, REG_RAX);
+                EMIT(cg, n);
+            }
+        }
+
+        /* Emit catch body (children[2]) */
+        if (node->child_count >= 3) {
+            emit_block(cg, node->children[2]);
+        }
+
+        /* Patch JMP after try */
+        int32_t jmp_off = (int32_t)(cg->code_size - (jmp_after + 5));
+        memcpy(cg->code + jmp_after + 1, &jmp_off, 4);
+
+        break;
+    }
+
+    case NODE_ERROR_RAISE: {
+        /*
+         * error.raise(code, "message")
+         * If R15 != 0 (catch active): restore RSP=R12, RBP=R13, jmp R14
+         * If R15 == 0: exit with error code (unhandled error)
+         * Error code in RAX.
+         */
+        int n; uint8_t *b;
+
+        /* Evaluate error code -> RAX */
+        if (node->child_count >= 1) {
+            emit_expression(cg, node->children[0]);
+        }
+
+        /* test r15, r15 (is catch active?) */
+        b = BUF(cg); b[0]=0x4D; b[1]=0x85; b[2]=0xFF; EMIT(cg,3);
+
+        /* jz .no_catch */
+        size_t jz_pos = cg->code_size;
+        b = BUF(cg); b[0]=0x74; b[1]=0x00; EMIT(cg,2);
+
+        /* Catch is active: restore and jump */
+        b = BUF(cg); b[0]=0x4C; b[1]=0x89; b[2]=0xE4; EMIT(cg,3); /* mov rsp, r12 */
+        b = BUF(cg); b[0]=0x4C; b[1]=0x89; b[2]=0xED; EMIT(cg,3); /* mov rbp, r13 */
+        /* jmp r14 */
+        b = BUF(cg); b[0]=0x41; b[1]=0xFF; b[2]=0xE6; EMIT(cg,3);
+
+        /* .no_catch: exit with error code */
+        cg->code[jz_pos+1] = (uint8_t)(cg->code_size - (jz_pos+2));
+        n = emit_mov_reg_reg(BUF(cg), REG_RDI, REG_RAX); EMIT(cg, n);
+        n = emit_mov_reg_imm32(BUF(cg), REG_RAX, 60); EMIT(cg, n);
+        n = emit_syscall(BUF(cg)); EMIT(cg, n);
+
+        break;
+    }
+
     default:
         cg_error(cg, "unsupported statement node type %s at %d:%d",
                  node_type_name(node->type), node->line, node->col);
@@ -1582,6 +1697,9 @@ static int patch_calls(CodegenState *cg) {
     for (size_t i = 0; i < cg->patch_count; i++) {
         const char *target = cg->call_patches[i].target;
         size_t call_site   = cg->call_patches[i].code_pos;
+
+        /* Skip already-patched entries (e.g. error.raise jumps) */
+        if (!target) continue;
 
         FuncEntry *fe = find_func(cg, target);
         if (!fe) {

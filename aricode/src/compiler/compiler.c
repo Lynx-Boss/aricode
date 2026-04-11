@@ -13,6 +13,7 @@
 #include "../errors/podium.h"
 #include "../codegen/codegen.h"
 #include "../codegen/elf.h"
+#include "../semantic/analyzer.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -255,16 +256,61 @@ int compiler_compile_string(Compiler *c, const char *source,
                CLR_BOLD, CLR_CYAN, CLR_RESET);
     }
 
-    /* ── Stage 3: Semantic Analysis (placeholder) ───────────────────── */
+    /* ── Stage 3: Semantic Analysis (THE GUARDIAN) ───────────────────── */
     if (c->options.verbose) {
         printf("%s[verbose]%s Stage 3: Semantic analysis...\n",
                CLR_DIM, CLR_RESET);
     }
 
-    if (c->error_count == 0) {
-        printf("  %s[OK]%s Semantic analysis: OK (placeholder)\n",
-               CLR_GREEN, CLR_RESET);
-    } else {
+    if (c->error_count == 0 && ast && c->options.verbose) {
+        /* Semantic analysis runs in verbose mode. Use --verbose to enable.
+         * The analyzer enforces aricode's 5-level error hierarchy. */
+        Analyzer analyzer;
+        analyzer_init(&analyzer, ast);
+
+        /* Register builtin functions with correct param counts */
+        struct { const char *name; int params; } builtins[] = {
+            {"print_str", 1}, {"print_int", 1}, {"print_float", 1},
+            {"print_dec", 1}, {"read_int", 0}, {"read_float", 0},
+            {"arr_new", 1}, {"arr_get", 2}, {"arr_set", 3}, {"arr_len", 1},
+            {"str_new", 1}, {"str_len", 1}, {"str_eq", 2},
+            {"str_char_at", 2}, {"str_println", 1}, {"str_concat", 2},
+            {"int_to_float", 1}, {"float_to_int", 1}, {"dec", 1},
+            {NULL, 0}
+        };
+        for (int bi = 0; builtins[bi].name; bi++) {
+            AriType *ft = type_create(TYPE_FUNCTION);
+            ft->return_type = type_create(TYPE_UNKNOWN);
+            ft->param_count = builtins[bi].params;
+            if (ft->param_count > 0) {
+                ft->param_types = malloc(ft->param_count * sizeof(AriType *));
+                for (size_t pi = 0; pi < ft->param_count; pi++)
+                    ft->param_types[pi] = type_create(TYPE_UNKNOWN);
+            }
+            symtab_define_function(analyzer.symbols, builtins[bi].name,
+                                   ft, 0, 0);
+        }
+
+        bool sem_ok = analyzer_analyze(&analyzer);
+
+        if (analyzer.level2_count > 0) {
+            /* Print warnings (level 2) - don't block compilation */
+            analyzer_print_errors(&analyzer);
+        }
+
+        if (!sem_ok) {
+            /* Level 0 (SILENT) or Level 1 (LOGIC) errors block compilation */
+            printf("  %s[FAIL]%s Semantic analysis: %zu error(s)\n",
+                   CLR_RED, CLR_RESET, analyzer.error_count);
+            analyzer_print_errors(&analyzer);
+            c->error_count += analyzer.level0_count + analyzer.level1_count;
+            analyzer_destroy(&analyzer);
+        } else {
+            printf("  %s[OK]%s Semantic analysis: %zu warning(s)\n",
+                   CLR_GREEN, CLR_RESET, analyzer.level2_count);
+            analyzer_destroy(&analyzer);
+        }
+    } else if (c->error_count > 0) {
         printf("  %s[SKIP]%s Semantic analysis: skipped due to errors\n",
                CLR_YELLOW, CLR_RESET);
     }

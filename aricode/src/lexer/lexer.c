@@ -92,6 +92,8 @@ static const KWEntry keywords[] = {
     { "log",    TOKEN_LOG },
     { "import", TOKEN_IMPORT },
     { "export", TOKEN_EXPORT },
+    { "in",     TOKEN_IN },
+    { "struct", TOKEN_STRUCT },
     { "true",   TOKEN_TRUE },
     { "false",  TOKEN_FALSE },
     { "Some",   TOKEN_SOME },

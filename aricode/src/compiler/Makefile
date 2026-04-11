@@ -12,6 +12,7 @@ PARSER_DIR  = ../parser
 ERRORS_DIR  = ../errors
 CODEGEN_DIR = ../codegen
 DECIMAL_DIR = ../decimal
+SEMANTIC_DIR = ../semantic
 COMPILER_DIR = .
 
 # Source files
@@ -28,10 +29,13 @@ SRCS = \
 	$(CODEGEN_DIR)/optimizer.c \
 	$(CODEGEN_DIR)/elf.c \
 	$(DECIMAL_DIR)/decimal.c \
-	$(DECIMAL_DIR)/decimal_ops.c
+	$(DECIMAL_DIR)/decimal_ops.c \
+	$(SEMANTIC_DIR)/analyzer.c \
+	$(SEMANTIC_DIR)/types.c \
+	$(SEMANTIC_DIR)/symbol_table.c
 
 # Include paths
-INCLUDES = -I$(COMPILER_DIR) -I$(LEXER_DIR) -I$(PARSER_DIR) -I$(ERRORS_DIR) -I$(CODEGEN_DIR) -I$(DECIMAL_DIR)
+INCLUDES = -I$(COMPILER_DIR) -I$(LEXER_DIR) -I$(PARSER_DIR) -I$(ERRORS_DIR) -I$(CODEGEN_DIR) -I$(DECIMAL_DIR) -I$(SEMANTIC_DIR)
 
 # Output binary
 TARGET = aric

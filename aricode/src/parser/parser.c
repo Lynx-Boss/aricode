@@ -664,13 +664,94 @@ static ASTNode *parse_for(Parser *p) {
 
     expect(p, TOKEN_LPAREN, "'(' after for");
 
-    /* Initializer */
+    /* Check for for-each: for (let x in arr) { ... }
+     * Desugars to: for (let __i=0; __i < arr_len(arr); __i = __i+1)
+     * with `let x = arr_get(arr, __i)` prepended to body. */
     if (check(p, TOKEN_LET)) {
         advance(p);
-        /* Inline var_decl parsing (let name: type = expr;) */
         const ParserToken *name_tok = expect(p, TOKEN_IDENTIFIER, "variable name");
-        ASTNode *init = ast_create_node(NODE_VAR_DECL,
-                                        t->line, t->col);
+
+        if (check(p, TOKEN_IN)) {
+            /* FOR-EACH syntax: for (let x in collection) { ... } */
+            advance(p); /* consume 'in' */
+            ASTNode *collection = parse_expression(p);
+            expect(p, TOKEN_RPAREN, "')' after for-in");
+
+            /* Create: let __i: i32 = 0 */
+            ASTNode *init = ast_create_node(NODE_VAR_DECL, t->line, t->col);
+            init->string_val = str_dup("__foreach_i");
+            ASTNode *i_type = ast_create_node(NODE_TYPE_ANNOTATION, t->line, t->col);
+            i_type->string_val = str_dup("i32");
+            ast_add_child(init, i_type);
+            ASTNode *zero = ast_create_node(NODE_INT_LITERAL, t->line, t->col);
+            zero->int_val = 0;
+            ast_add_child(init, zero);
+            ast_add_child(node, init);
+
+            /* Condition: __i < arr_len(collection) */
+            ASTNode *cond = ast_create_node(NODE_BINARY_OP, t->line, t->col);
+            cond->op = str_dup("<");
+            ASTNode *i_ref = ast_create_node(NODE_IDENTIFIER, t->line, t->col);
+            i_ref->string_val = str_dup("__foreach_i");
+            ast_add_child(cond, i_ref);
+            /* arr_len(collection) */
+            ASTNode *len_call = ast_create_node(NODE_CALL, t->line, t->col);
+            ASTNode *len_id = ast_create_node(NODE_IDENTIFIER, t->line, t->col);
+            len_id->string_val = str_dup("arr_len");
+            ast_add_child(len_call, len_id);
+            ast_add_child(len_call, ast_create_node(NODE_IDENTIFIER, t->line, t->col));
+            len_call->children[1]->string_val = str_dup(collection->string_val ? collection->string_val : "__arr");
+            ast_add_child(node, cond);
+
+            /* Update: __i = __i + 1 */
+            ASTNode *update = ast_create_node(NODE_BINARY_OP, t->line, t->col);
+            update->op = str_dup("=");
+            ASTNode *i_lhs = ast_create_node(NODE_IDENTIFIER, t->line, t->col);
+            i_lhs->string_val = str_dup("__foreach_i");
+            ast_add_child(update, i_lhs);
+            ASTNode *inc = ast_create_node(NODE_BINARY_OP, t->line, t->col);
+            inc->op = str_dup("+");
+            ASTNode *i_val = ast_create_node(NODE_IDENTIFIER, t->line, t->col);
+            i_val->string_val = str_dup("__foreach_i");
+            ast_add_child(inc, i_val);
+            ASTNode *one = ast_create_node(NODE_INT_LITERAL, t->line, t->col);
+            one->int_val = 1;
+            ast_add_child(inc, one);
+            ast_add_child(update, inc);
+            ast_add_child(node, update);
+
+            /* Parse body block */
+            ASTNode *body = parse_block(p);
+
+            /* Prepend: let x = arr_get(collection, __i) */
+            ASTNode *elem_decl = ast_create_node(NODE_VAR_DECL, t->line, t->col);
+            elem_decl->string_val = name_tok ? str_dup(name_tok->lexeme) : str_dup("_");
+            ASTNode *get_call = ast_create_node(NODE_CALL, t->line, t->col);
+            ASTNode *get_id = ast_create_node(NODE_IDENTIFIER, t->line, t->col);
+            get_id->string_val = str_dup("arr_get");
+            ast_add_child(get_call, get_id);
+            ASTNode *coll_ref = ast_create_node(NODE_IDENTIFIER, t->line, t->col);
+            coll_ref->string_val = str_dup(collection->string_val ? collection->string_val : "__arr");
+            ast_add_child(get_call, coll_ref);
+            ASTNode *i_idx = ast_create_node(NODE_IDENTIFIER, t->line, t->col);
+            i_idx->string_val = str_dup("__foreach_i");
+            ast_add_child(get_call, i_idx);
+            ast_add_child(elem_decl, get_call);
+
+            /* Insert elem_decl at the beginning of body */
+            /* Shift children right and insert at 0 */
+            ast_add_child(body, NULL); /* make room */
+            for (size_t bi = body->child_count - 1; bi > 0; bi--)
+                body->children[bi] = body->children[bi - 1];
+            body->children[0] = elem_decl;
+
+            ast_add_child(node, body);
+            ast_free(collection);
+            return node;
+        }
+
+        /* Regular C-style for: continue parsing let init */
+        ASTNode *init = ast_create_node(NODE_VAR_DECL, t->line, t->col);
         init->string_val = name_tok ? str_dup(name_tok->lexeme) : str_dup("");
 
         if (match(p, TOKEN_COLON)) {

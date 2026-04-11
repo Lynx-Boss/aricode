@@ -33,8 +33,8 @@
 \lstset{style=aricode}
 
 % ---- Metadata ----
-\title{\textbf{Aricode: A Compiled Language with Mandatory Error Handling\\and Direct x86\_64 Code Generation}\\[0.5em]
-\large Eliminating Silent Failures Through Architectural Enforcement}
+\title{\textbf{Aricode: The First Native Compilation Target for AI Agents}\\[0.5em]
+\large Direct x86\_64 Code Generation Without Runtime, Linker, or Standard Library}
 
 \author{
 Edwin F. Veliz Jaramillo\\
@@ -63,10 +63,14 @@ Repository: \url{https://gitlab.com/ariproyect/aricoderoot} (commit \texttt{3bc7
 
 % ---- Abstract ----
 \begin{abstract}
-We present \textsc{Aricode}, a statically typed, compiled programming language that makes silent runtime errors structurally impossible at both compile time and runtime. Unlike existing approaches that rely on programmer discipline (Go), optional annotations (Python), or complex type systems (Rust), Aricode enforces a five-level error classification where code that can fail silently is \emph{rejected by the compiler}, and runtime errors are caught via cross-function \texttt{try/catch} with zero-overhead register-based unwinding. The language features direct x86\_64 machine code generation without intermediate representations, linkers, or runtime libraries, producing minimal ELF binaries---199 bytes for Hello World, 674 bytes for a prime number generator. We introduce five novel contributions: (1)~a mandatory error hierarchy with five severity levels and distinct compilation semantics, (2)~a compile-time performance rating system (Podium), (3)~native arbitrary-precision decimal arithmetic, (4)~a compiler implementing constant folding, strength reduction, peephole optimization, and tail call optimization, and (5)~cross-function error handling via callee-saved registers (R12--R15) requiring zero runtime library support. The language supports three precision levels---integer (i32), IEEE~754 double (f64/SSE2), and \emph{compile-time exact decimal arithmetic} (dec)---where $0.1 + 0.2 = 0.3$ evaluates to \texttt{true} without floating-point error. It also features heap-allocated arrays via \texttt{mmap}, struct patterns, pattern matching (\texttt{match}), and interactive I/O (\texttt{print\_str}, \texttt{print\_int}, \texttt{print\_float}, \texttt{read\_int}). Benchmarks across fourteen computational challenges---spanning arithmetic, recursion, number theory (Collatz conjecture, Mersenne prime M31), cryptographic primitives, artificial intelligence (perceptron, minimax), floating-point computation (Leibniz $\pi$), and array operations---demonstrate that Aricode competes with hand-optimized x86\_64 assembly across all categories. In a ranking of 154~binaries across 12~implementations including Rust, Go, GCC, and Clang, Aricode places second (468~points) behind hand-written NASM assembly (475~points), while being 4.7$\times$ ahead of Rust (100~points) and 5.6$\times$ ahead of Go (84~points). Aricode binaries are 72{,}000$\times$ smaller than Rust and 12{,}000$\times$ smaller than Go.
+Every existing AI coding system---GitHub Copilot, Claude, GPT-4, Devin---generates code in languages designed for humans (Python, C, Rust, JavaScript) and depends on heavyweight toolchains to compile and execute it. We present \textsc{Aricode}, the first programming language designed explicitly as a \emph{native compilation target for AI agents}. Unlike human-oriented languages, Aricode prioritizes properties that matter for machine-generated code: sub-millisecond compilation, deterministic code generation, zero runtime overhead, direct hardware access via syscalls, and minimal binary size (199 bytes for Hello World). The compiler generates x86\_64 machine code directly from the AST---no LLVM, no linker, no standard library---producing standalone ELF binaries that an AI agent can generate, compile, and execute in a single pipeline under 1ms.
+
+The language provides 23 built-in operations spanning console I/O, heap memory (\texttt{mmap}), file system access (direct syscalls), SSE2 floating-point, exact decimal arithmetic, and cross-function error handling via register-based unwinding (R12--R15). Six optimization passes---constant folding, strength reduction, peephole optimization, tail call optimization, dead code elimination, and compile-time decimal evaluation---ensure that generated code competes with hand-written assembly.
+
+Benchmarks across 14 computational challenges (154 binaries, 12 implementations including GCC, Clang, Rust, and Go) demonstrate that Aricode places second overall behind hand-optimized NASM assembly, while producing binaries 72{,}000$\times$ smaller than Rust and 12{,}000$\times$ smaller than Go. To our knowledge, no other project combines direct native code generation, zero runtime dependencies, and explicit design for AI agent use. Aricode establishes a new paradigm: instead of AI writing human code for human compilers, AI writes machine-optimal code for a machine-optimal compiler.
 \end{abstract}
 
-\textbf{Keywords:} programming languages, compiler design, error handling, x86\_64 code generation, binary size optimization, tail call optimization, exact decimal arithmetic, SSE2
+\textbf{Keywords:} AI agents, compilation target, code generation, x86\_64, machine code, zero runtime, binary optimization, LLM, autonomous coding
 
 % ============================================================
 \section{Introduction}

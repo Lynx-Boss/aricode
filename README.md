@@ -1,19 +1,18 @@
 # Aricode
 
-**A compiled language where silent errors are impossible.**
+**The first native compilation target for AI agents.**
 
-Aricode generates direct x86_64 machine code with no linker, no libc, no runtime. Hello World compiles to **199 bytes**.
+Every AI coding system today generates Python, C, or JavaScript — languages designed for humans, compiled by heavyweight toolchains. Aricode is different: it's a language designed for **machines to write**, compiled directly to x86_64 machine code in **sub-millisecond**, producing binaries as small as **199 bytes** with **zero runtime dependencies**.
 
 ```
-fn main() -> i32 {
-    print_str("Hello, World!");
-    return 0;
-}
+AI Agent → generates .ari → aric (0.3ms) → 199-byte ELF binary → runs
 ```
+
+No LLVM. No linker. No libc. No runtime. Just raw machine code.
 
 ## Why Aricode?
 
-Every language lets bugs slip through. Aricode doesn't.
+**For AI agents, not humans.** Every feature exists to maximize machine efficiency.
 
 | Problem | C | Go | Rust | **Aricode** |
 |---------|---|-----|------|-------------|

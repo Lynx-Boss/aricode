@@ -96,6 +96,29 @@ static LocalVar *add_local(CodegenState *cg, const char *name) {
  * After emit_expression(), the result is in RAX.
  */
 
+/*
+ * Emit a f64 literal by embedding its 8-byte IEEE 754 representation
+ * in the code, jumping over it, then loading with MOVSD via RIP-relative.
+ * The f64 value lives in xmm0 but we also store the bits in RAX for
+ * compatibility with the stack-based variable system.
+ */
+static void emit_float_literal(CodegenState *cg, const ASTNode *node) {
+    double val = node->float_val;
+    uint64_t bits;
+    memcpy(&bits, &val, 8);
+    int n;
+
+    /* mov rax, imm64 (the IEEE 754 bits) */
+    n = emit_mov_reg_imm64(BUF(cg), REG_RAX, bits);
+    EMIT(cg, n);
+
+    /* Also load into xmm0 for float operations:
+     * push rax; movsd xmm0, [rsp]; pop rax */
+    n = emit_push(BUF(cg), REG_RAX); EMIT(cg, n);
+    n = emit_movsd_xmm_mem(BUF(cg), 0, REG_RSP, 0); EMIT(cg, n);
+    n = emit_pop(BUF(cg), REG_RAX); EMIT(cg, n);
+}
+
 static void emit_int_literal(CodegenState *cg, const ASTNode *node) {
     int64_t val = node->int_val;
     if (val == 0) {
@@ -776,6 +799,15 @@ static void emit_call_expr(CodegenState *cg, const ASTNode *node) {
             emit_builtin_read_int(cg);
             return;
         }
+        /* float_to_int(x): convert f64 bits in RAX/xmm0 to truncated i32 */
+        if (strcmp(callee->string_val, "float_to_int") == 0 && argc == 1) {
+            emit_expression(cg, node->children[1]);
+            /* xmm0 has the f64 value (loaded by emit_float_literal) */
+            /* cvttsd2si rax, xmm0 */
+            int pn = emit_cvttsd2si(BUF(cg), REG_RAX, 0);
+            EMIT(cg, pn);
+            return;
+        }
     }
 
     if (argc > SYS_V_ARG_COUNT) {
@@ -833,6 +865,9 @@ static void emit_expression(CodegenState *cg, const ASTNode *node) {
     switch (node->type) {
     case NODE_INT_LITERAL:
         emit_int_literal(cg, node);
+        break;
+    case NODE_FLOAT_LITERAL:
+        emit_float_literal(cg, node);
         break;
     case NODE_BOOL_LITERAL:
         emit_int_literal(cg, node); /* bool_val stored in int_val=0/1 */

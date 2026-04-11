@@ -810,4 +810,176 @@ static inline int emit_dec_reg(uint8_t *buf, int reg) {
     return off;
 }
 
+/* ------------------------------------------------------------------ */
+/*  SSE2 floating-point instructions (f64 / double precision)         */
+/* ------------------------------------------------------------------ */
+
+/*
+ * XMM register encoding: xmm0-xmm15
+ * SSE instructions use the same register numbering as GPRs.
+ * Prefix 0x66 selects double-precision (f64) variants.
+ */
+
+/*
+ * MOVSD xmm, xmm  (move scalar double)
+ * Opcode: F2 0F 10 /r
+ */
+static inline int emit_movsd_xmm_xmm(uint8_t *buf, int dst, int src) {
+    int off = 0;
+    buf[off++] = 0xF2;
+    if (reg_ext(dst) || reg_ext(src))
+        buf[off++] = rex(0, reg_ext(dst), 0, reg_ext(src));
+    buf[off++] = 0x0F;
+    buf[off++] = 0x10;
+    buf[off++] = modrm(3, dst & 7, src & 7);
+    return off;
+}
+
+/*
+ * MOVSD xmm, [base + disp32]  (load f64 from memory)
+ * Opcode: F2 [REX] 0F 10 /r
+ */
+static inline int emit_movsd_xmm_mem(uint8_t *buf, int dst, int base, int32_t disp) {
+    int off = 0;
+    buf[off++] = 0xF2;
+    if (reg_ext(dst) || reg_ext(base))
+        buf[off++] = rex(0, reg_ext(dst), 0, reg_ext(base));
+    buf[off++] = 0x0F;
+    buf[off++] = 0x10;
+    if (base == REG_RSP || base == REG_R12) {
+        buf[off++] = modrm(2, dst & 7, 4);
+        buf[off++] = 0x24;
+    } else {
+        buf[off++] = modrm(2, dst & 7, base & 7);
+    }
+    memcpy(buf + off, &disp, 4);
+    off += 4;
+    return off;
+}
+
+/*
+ * MOVSD [base + disp32], xmm  (store f64 to memory)
+ * Opcode: F2 [REX] 0F 11 /r
+ */
+static inline int emit_movsd_mem_xmm(uint8_t *buf, int base, int32_t disp, int src) {
+    int off = 0;
+    buf[off++] = 0xF2;
+    if (reg_ext(src) || reg_ext(base))
+        buf[off++] = rex(0, reg_ext(src), 0, reg_ext(base));
+    buf[off++] = 0x0F;
+    buf[off++] = 0x11;
+    if (base == REG_RSP || base == REG_R12) {
+        buf[off++] = modrm(2, src & 7, 4);
+        buf[off++] = 0x24;
+    } else {
+        buf[off++] = modrm(2, src & 7, base & 7);
+    }
+    memcpy(buf + off, &disp, 4);
+    off += 4;
+    return off;
+}
+
+/*
+ * ADDSD xmm, xmm  (add scalar double)
+ * Opcode: F2 0F 58 /r
+ */
+static inline int emit_addsd(uint8_t *buf, int dst, int src) {
+    int off = 0;
+    buf[off++] = 0xF2;
+    if (reg_ext(dst) || reg_ext(src))
+        buf[off++] = rex(0, reg_ext(dst), 0, reg_ext(src));
+    buf[off++] = 0x0F;
+    buf[off++] = 0x58;
+    buf[off++] = modrm(3, dst & 7, src & 7);
+    return off;
+}
+
+/*
+ * SUBSD xmm, xmm  (subtract scalar double)
+ * Opcode: F2 0F 5C /r
+ */
+static inline int emit_subsd(uint8_t *buf, int dst, int src) {
+    int off = 0;
+    buf[off++] = 0xF2;
+    if (reg_ext(dst) || reg_ext(src))
+        buf[off++] = rex(0, reg_ext(dst), 0, reg_ext(src));
+    buf[off++] = 0x0F;
+    buf[off++] = 0x5C;
+    buf[off++] = modrm(3, dst & 7, src & 7);
+    return off;
+}
+
+/*
+ * MULSD xmm, xmm  (multiply scalar double)
+ * Opcode: F2 0F 59 /r
+ */
+static inline int emit_mulsd(uint8_t *buf, int dst, int src) {
+    int off = 0;
+    buf[off++] = 0xF2;
+    if (reg_ext(dst) || reg_ext(src))
+        buf[off++] = rex(0, reg_ext(dst), 0, reg_ext(src));
+    buf[off++] = 0x0F;
+    buf[off++] = 0x59;
+    buf[off++] = modrm(3, dst & 7, src & 7);
+    return off;
+}
+
+/*
+ * DIVSD xmm, xmm  (divide scalar double)
+ * Opcode: F2 0F 5E /r
+ */
+static inline int emit_divsd(uint8_t *buf, int dst, int src) {
+    int off = 0;
+    buf[off++] = 0xF2;
+    if (reg_ext(dst) || reg_ext(src))
+        buf[off++] = rex(0, reg_ext(dst), 0, reg_ext(src));
+    buf[off++] = 0x0F;
+    buf[off++] = 0x5E;
+    buf[off++] = modrm(3, dst & 7, src & 7);
+    return off;
+}
+
+/*
+ * UCOMISD xmm, xmm  (unordered compare scalar double, sets EFLAGS)
+ * Opcode: 66 0F 2E /r
+ */
+static inline int emit_ucomisd(uint8_t *buf, int dst, int src) {
+    int off = 0;
+    buf[off++] = 0x66;
+    if (reg_ext(dst) || reg_ext(src))
+        buf[off++] = rex(0, reg_ext(dst), 0, reg_ext(src));
+    buf[off++] = 0x0F;
+    buf[off++] = 0x2E;
+    buf[off++] = modrm(3, dst & 7, src & 7);
+    return off;
+}
+
+/*
+ * CVTSI2SD xmm, reg  (convert signed i64 to f64)
+ * Opcode: F2 REX.W 0F 2A /r
+ */
+static inline int emit_cvtsi2sd(uint8_t *buf, int xmm_dst, int gpr_src) {
+    int off = 0;
+    buf[off++] = 0xF2;
+    buf[off++] = rex(1, reg_ext(xmm_dst), 0, reg_ext(gpr_src));
+    buf[off++] = 0x0F;
+    buf[off++] = 0x2A;
+    buf[off++] = modrm(3, xmm_dst & 7, gpr_src & 7);
+    return off;
+}
+
+/*
+ * CVTTSD2SI reg, xmm  (convert f64 to signed i64, truncate)
+ * Opcode: F2 REX.W 0F 2C /r
+ */
+static inline int emit_cvttsd2si(uint8_t *buf, int gpr_dst, int xmm_src) {
+    int off = 0;
+    buf[off++] = 0xF2;
+    buf[off++] = rex(1, reg_ext(gpr_dst), 0, reg_ext(xmm_src));
+    buf[off++] = 0x0F;
+    buf[off++] = 0x2C;
+    buf[off++] = modrm(3, gpr_dst & 7, xmm_src & 7);
+    return off;
+}
+
 #endif /* ARICODE_X86_64_H */

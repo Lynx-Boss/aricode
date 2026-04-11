@@ -63,10 +63,10 @@ Repository: \url{https://gitlab.com/ariproyect/aricoderoot} (commit \texttt{3bc7
 
 % ---- Abstract ----
 \begin{abstract}
-We present \textsc{Aricode}, a statically typed, compiled programming language that makes silent runtime errors structurally impossible at both compile time and runtime. Unlike existing approaches that rely on programmer discipline (Go), optional annotations (Python), or complex type systems (Rust), Aricode enforces a five-level error classification where code that can fail silently is \emph{rejected by the compiler}, and runtime errors are caught via cross-function \texttt{try/catch} with zero-overhead register-based unwinding. The language features direct x86\_64 machine code generation without intermediate representations, linkers, or runtime libraries, producing minimal ELF binaries---199 bytes for Hello World, 674 bytes for a prime number generator. We introduce five novel contributions: (1)~a mandatory error hierarchy with five severity levels and distinct compilation semantics, (2)~a compile-time performance rating system (Podium), (3)~native arbitrary-precision decimal arithmetic, (4)~a compiler implementing constant folding, strength reduction, peephole optimization, and tail call optimization, and (5)~cross-function error handling via callee-saved registers (R12--R15) requiring zero runtime library support. The language supports integer and double-precision floating-point arithmetic (SSE2), heap-allocated arrays via \texttt{mmap}, struct patterns, and interactive I/O. Benchmarks across fourteen computational challenges---spanning arithmetic, recursion, number theory (Collatz conjecture, Mersenne prime M31), cryptographic primitives, artificial intelligence (perceptron, minimax), floating-point computation (Leibniz $\pi$), and array operations---demonstrate that Aricode competes with hand-optimized x86\_64 assembly across all categories. In a ranking of 126~binaries across 10~implementations including Rust and Go, Aricode places second (383~points) behind hand-written NASM assembly (392~points), while being 3.8$\times$ ahead of Rust (100~points) and 4.6$\times$ ahead of Go (84~points). Aricode binaries are 72{,}000$\times$ smaller than Rust and 12{,}000$\times$ smaller than Go.
+We present \textsc{Aricode}, a statically typed, compiled programming language that makes silent runtime errors structurally impossible at both compile time and runtime. Unlike existing approaches that rely on programmer discipline (Go), optional annotations (Python), or complex type systems (Rust), Aricode enforces a five-level error classification where code that can fail silently is \emph{rejected by the compiler}, and runtime errors are caught via cross-function \texttt{try/catch} with zero-overhead register-based unwinding. The language features direct x86\_64 machine code generation without intermediate representations, linkers, or runtime libraries, producing minimal ELF binaries---199 bytes for Hello World, 674 bytes for a prime number generator. We introduce five novel contributions: (1)~a mandatory error hierarchy with five severity levels and distinct compilation semantics, (2)~a compile-time performance rating system (Podium), (3)~native arbitrary-precision decimal arithmetic, (4)~a compiler implementing constant folding, strength reduction, peephole optimization, and tail call optimization, and (5)~cross-function error handling via callee-saved registers (R12--R15) requiring zero runtime library support. The language supports three precision levels---integer (i32), IEEE~754 double (f64/SSE2), and \emph{compile-time exact decimal arithmetic} (dec)---where $0.1 + 0.2 = 0.3$ evaluates to \texttt{true} without floating-point error. It also features heap-allocated arrays via \texttt{mmap}, struct patterns, pattern matching (\texttt{match}), and interactive I/O (\texttt{print\_str}, \texttt{print\_int}, \texttt{print\_float}, \texttt{read\_int}). Benchmarks across fourteen computational challenges---spanning arithmetic, recursion, number theory (Collatz conjecture, Mersenne prime M31), cryptographic primitives, artificial intelligence (perceptron, minimax), floating-point computation (Leibniz $\pi$), and array operations---demonstrate that Aricode competes with hand-optimized x86\_64 assembly across all categories. In a ranking of 154~binaries across 12~implementations including Rust, Go, GCC, and Clang, Aricode places second (468~points) behind hand-written NASM assembly (475~points), while being 4.7$\times$ ahead of Rust (100~points) and 5.6$\times$ ahead of Go (84~points). Aricode binaries are 72{,}000$\times$ smaller than Rust and 12{,}000$\times$ smaller than Go.
 \end{abstract}
 
-\textbf{Keywords:} programming languages, compiler design, error handling, x86\_64 code generation, binary size optimization, tail call optimization
+\textbf{Keywords:} programming languages, compiler design, error handling, x86\_64 code generation, binary size optimization, tail call optimization, exact decimal arithmetic, SSE2
 
 % ============================================================
 \section{Introduction}
@@ -149,21 +149,23 @@ Aricode includes a native decimal type that stores numbers as digit arrays with 
 
 \begin{table}[H]
 \centering
-\caption{Decimal precision: Aricode vs. IEEE~754 languages}
+\caption{Decimal precision: Aricode \texttt{dec} type vs. IEEE~754 (\texttt{f64}) in all languages}
 \label{tab:decimal}
-\begin{tabular}{@{}lccccc@{}}
+\begin{tabular}{@{}lcccccc@{}}
 \toprule
-\textbf{Test Case} & \textbf{Aricode} & \textbf{C double} & \textbf{Python float} & \textbf{Go} & \textbf{Rust} \\
+\textbf{Test Case} & \textbf{Aricode dec} & \textbf{Aricode f64} & \textbf{C} & \textbf{Python} & \textbf{Rust} & \textbf{Go} \\
 \midrule
-$0.1 + 0.2 = 0.3$       & \checkmark & $\times$ & $\times$ & $\times$ & $\times$ \\
-$1.0 - 0.9 - 0.1 = 0.0$ & \checkmark & $\times$ & $\times$ & $\times$ & $\times$ \\
-$0.1 \times 0.1 = 0.01$  & \checkmark & $\times$ & $\times$ & $\times$ & $\times$ \\
-$\pi$ to 20 decimals     & \checkmark & $\times$ & $\times$ & $\times$ & $\times$ \\
+$0.1 + 0.2 = 0.3$       & \checkmark & $\times$ & $\times$ & $\times$ & $\times$ & $\times$ \\
+$1.0 - 0.9 = 0.1$       & \checkmark & $\times$ & $\times$ & $\times$ & $\times$ & $\times$ \\
+$0.1 \times 0.1 = 0.01$  & \checkmark & $\times$ & $\times$ & $\times$ & $\times$ & $\times$ \\
+$10 / 3$ to 20 digits    & \checkmark & $\times$ & $\times$ & $\times$ & $\times$ & $\times$ \\
 \midrule
-\textbf{Score}           & \textbf{7/7} & 1/7 & 1/7 & 1/7 & 1/7 \\
+\textbf{Score}           & \textbf{4/4} & 0/4 & 0/4 & 0/4 & 0/4 & 0/4 \\
 \bottomrule
 \end{tabular}
 \end{table}
+
+Aricode's \texttt{dec} type evaluates decimal expressions \emph{at compile time} using the AriDecimal library---digit-by-digit arithmetic with no IEEE~754 representation. The result is embedded as a string constant in the binary with zero runtime overhead. This is the only compiled language that provides exact decimal folding as a compiler pass.
 
 % ============================================================
 \section{Compiler Architecture}
@@ -350,22 +352,24 @@ Aricode achieves execution times within 7\% of hand-optimized assembly across al
 
 \begin{table}[H]
 \centering
-\caption{Overall sparring ranking --- 14 challenges, 126 binaries, 10 implementations}
+\caption{Overall sparring ranking --- 14 challenges, 154 binaries, 12 implementations}
 \label{tab:ranking}
 \begin{tabular}{@{}clrl@{}}
 \toprule
 \textbf{Rank} & \textbf{Implementation} & \textbf{Points} & \textbf{vs.\ Aricode} \\
 \midrule
-1 & NASM x86\_64 assembly & 392 & 1.02$\times$ \\
-\textbf{2} & \textbf{Aricode} & \textbf{383} & \textbf{1.00$\times$} \\
-3 & C (gcc -O2) & 255 & 0.67$\times$ \\
-4 & C (gcc -O3) & 243 & 0.63$\times$ \\
-5 & C (gcc -Os) & 239 & 0.62$\times$ \\
-6 & C (gcc -O0) & 239 & 0.62$\times$ \\
-7 & C (gcc -O2 dynamic) & 212 & 0.55$\times$ \\
-8 & Python 3.12 & 163 & 0.43$\times$ \\
-9 & Rust 1.85 & 100 & 0.26$\times$ \\
-10 & Go 1.24 & 84 & 0.22$\times$ \\
+1 & NASM x86\_64 assembly & 475 & 1.01$\times$ \\
+\textbf{2} & \textbf{Aricode} & \textbf{468} & \textbf{1.00$\times$} \\
+3 & C (gcc -O2) & 315 & 0.67$\times$ \\
+4 & C (gcc -O3) & 296 & 0.63$\times$ \\
+5 & C (gcc -Os) & 281 & 0.60$\times$ \\
+6 & C (gcc -O0) & 308 & 0.66$\times$ \\
+7 & C (clang -O2) & 262 & 0.56$\times$ \\
+8 & C (gcc -O2 dynamic) & 259 & 0.55$\times$ \\
+9 & Python 3.12 & 191 & 0.41$\times$ \\
+10 & C (clang -O2 dynamic) & 237 & 0.51$\times$ \\
+11 & Rust 1.85 & 100 & 0.21$\times$ \\
+12 & Go 1.24 & 84 & 0.18$\times$ \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -416,7 +420,7 @@ IBM's General Decimal Arithmetic specification~\cite{ieee754r} standardizes deci
 \section{Limitations and Future Work}
 \label{sec:future}
 
-Current limitations include: the codegen targets only Linux x86\_64; the type system lacks first-class struct declarations (structs are implemented via array patterns with constructor functions); string operations are limited to literal printing; and there is no module or import system. Tail call optimization applies only to self-recursive calls. The standard library consists of seven builtins: \texttt{print\_str}, \texttt{print\_int}, \texttt{print\_float}, \texttt{read\_int}, \texttt{float\_to\_int}, \texttt{arr\_new}/\texttt{arr\_get}/\texttt{arr\_set}/\texttt{arr\_len}.
+Current limitations include: the codegen targets only Linux x86\_64; the type system lacks first-class struct declarations (structs are implemented via array patterns with constructor functions); string operations are limited to literal printing; and there is no module or import system. Tail call optimization applies only to self-recursive calls. Decimal arithmetic is currently compile-time only (constant folding); runtime decimal operations would require embedding the BCD runtime in the binary. The standard library consists of twelve builtins: \texttt{print\_str}, \texttt{print\_int}, \texttt{print\_float}, \texttt{read\_int}, \texttt{read\_float}, \texttt{int\_to\_float}, \texttt{float\_to\_int}, \texttt{dec}, \texttt{print\_dec}, \texttt{arr\_new}/\texttt{arr\_get}/\texttt{arr\_set}/\texttt{arr\_len}.
 
 Future work includes: ARM64 and WebAssembly backends; struct and enum types; a module system with package manager; SIMD vectorization for numeric workloads; and inter-procedural optimization.
 

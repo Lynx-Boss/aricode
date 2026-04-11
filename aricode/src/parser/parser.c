@@ -198,6 +198,8 @@ static ASTNode *parse_statement(Parser *p);
 static ASTNode *parse_block(Parser *p);
 static ASTNode *parse_expression(Parser *p);
 static ASTNode *parse_type(Parser *p);
+static ASTNode *parse_shift(Parser *p);
+static ASTNode *parse_equality(Parser *p);
 
 /* ================================================================== */
 /*  Type parsing                                                      */
@@ -454,12 +456,12 @@ static ASTNode *parse_addition(Parser *p) {
 }
 
 static ASTNode *parse_comparison(Parser *p) {
-    ASTNode *left = parse_addition(p);
+    ASTNode *left = parse_shift(p);
 
     while (check(p, TOKEN_LT) || check(p, TOKEN_GT) ||
            check(p, TOKEN_LTE) || check(p, TOKEN_GTE)) {
         const ParserToken *op = advance(p);
-        ASTNode *right = parse_addition(p);
+        ASTNode *right = parse_shift(p);
         ASTNode *bin = ast_create_node(NODE_BINARY_OP, op->line, op->col);
         bin->op = str_dup(op->lexeme ? op->lexeme : token_type_names[op->type]);
         ast_add_child(bin, left);
@@ -484,12 +486,74 @@ static ASTNode *parse_equality(Parser *p) {
     return left;
 }
 
-static ASTNode *parse_and(Parser *p) {
+/* --- Bitwise operators (between equality and logical AND) --- */
+
+static ASTNode *parse_shift(Parser *p) {
+    ASTNode *left = parse_addition(p);
+
+    while (check(p, TOKEN_SHL) || check(p, TOKEN_SHR)) {
+        const ParserToken *op = advance(p);
+        ASTNode *right = parse_addition(p);
+        ASTNode *bin = ast_create_node(NODE_BINARY_OP, op->line, op->col);
+        bin->op = str_dup(op->lexeme ? op->lexeme : token_type_names[op->type]);
+        ast_add_child(bin, left);
+        ast_add_child(bin, right);
+        left = bin;
+    }
+    return left;
+}
+
+static ASTNode *parse_bitwise_and(Parser *p) {
     ASTNode *left = parse_equality(p);
+
+    while (check(p, TOKEN_BIT_AND)) {
+        const ParserToken *op = advance(p);
+        ASTNode *right = parse_equality(p);
+        ASTNode *bin = ast_create_node(NODE_BINARY_OP, op->line, op->col);
+        bin->op = str_dup("&");
+        ast_add_child(bin, left);
+        ast_add_child(bin, right);
+        left = bin;
+    }
+    return left;
+}
+
+static ASTNode *parse_bitwise_xor(Parser *p) {
+    ASTNode *left = parse_bitwise_and(p);
+
+    while (check(p, TOKEN_BIT_XOR)) {
+        const ParserToken *op = advance(p);
+        ASTNode *right = parse_bitwise_and(p);
+        ASTNode *bin = ast_create_node(NODE_BINARY_OP, op->line, op->col);
+        bin->op = str_dup("^");
+        ast_add_child(bin, left);
+        ast_add_child(bin, right);
+        left = bin;
+    }
+    return left;
+}
+
+static ASTNode *parse_bitwise_or(Parser *p) {
+    ASTNode *left = parse_bitwise_xor(p);
+
+    while (check(p, TOKEN_BIT_OR)) {
+        const ParserToken *op = advance(p);
+        ASTNode *right = parse_bitwise_xor(p);
+        ASTNode *bin = ast_create_node(NODE_BINARY_OP, op->line, op->col);
+        bin->op = str_dup("|");
+        ast_add_child(bin, left);
+        ast_add_child(bin, right);
+        left = bin;
+    }
+    return left;
+}
+
+static ASTNode *parse_and(Parser *p) {
+    ASTNode *left = parse_bitwise_or(p);
 
     while (check(p, TOKEN_AND)) {
         const ParserToken *op = advance(p);
-        ASTNode *right = parse_equality(p);
+        ASTNode *right = parse_bitwise_or(p);
         ASTNode *bin = ast_create_node(NODE_BINARY_OP, op->line, op->col);
         bin->op = str_dup("&&");
         ast_add_child(bin, left);

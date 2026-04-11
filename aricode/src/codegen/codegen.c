@@ -666,6 +666,58 @@ static void emit_assignment(CodegenState *cg, const ASTNode *node) {
     EMIT(cg, n);
 }
 
+/*
+ * FOR loop codegen.
+ *   child[0] = initializer (var_decl or expr_stmt)
+ *   child[1] = condition expression
+ *   child[2] = update expression
+ *   child[3] = body block
+ *
+ * Emits: init; loop_start: cond; je end; body; update; jmp start; end:
+ */
+static void emit_for(CodegenState *cg, const ASTNode *node) {
+    if (node->child_count < 4) {
+        cg_error(cg, "malformed for at %d:%d", node->line, node->col);
+        return;
+    }
+
+    /* Initializer */
+    emit_statement(cg, node->children[0]);
+
+    /* loop_start label */
+    size_t loop_start = cg->code_size;
+
+    /* Condition */
+    emit_expression(cg, node->children[1]);
+    int n = emit_cmp_reg_imm(BUF(cg), REG_RAX, 0);
+    EMIT(cg, n);
+
+    /* JE to loop_end */
+    size_t je_pos = cg->code_size;
+    n = emit_je(BUF(cg), 0);
+    EMIT(cg, n);
+
+    /* Body */
+    emit_block(cg, node->children[3]);
+
+    /* Update (might be assignment expression) */
+    if (node->children[2]->type == NODE_BINARY_OP &&
+        node->children[2]->op && strcmp(node->children[2]->op, "=") == 0) {
+        emit_assignment(cg, node->children[2]);
+    } else {
+        emit_expression(cg, node->children[2]);
+    }
+
+    /* JMP back to loop_start */
+    int32_t back_rel = (int32_t)((int64_t)loop_start - (int64_t)(cg->code_size + 5));
+    n = emit_jmp(BUF(cg), back_rel);
+    EMIT(cg, n);
+
+    /* Patch JE */
+    int32_t je_off = (int32_t)(cg->code_size - (je_pos + 6));
+    memcpy(cg->code + je_pos + 2, &je_off, 4);
+}
+
 static void emit_statement(CodegenState *cg, const ASTNode *node) {
     if (cg->had_error || !node) return;
 
@@ -682,6 +734,9 @@ static void emit_statement(CodegenState *cg, const ASTNode *node) {
         break;
     case NODE_WHILE:
         emit_while(cg, node);
+        break;
+    case NODE_FOR:
+        emit_for(cg, node);
         break;
     case NODE_EXPR_STMT:
         /* Check for assignment expression (NODE_BINARY_OP with op="=") */

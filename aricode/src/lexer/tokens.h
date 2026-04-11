@@ -69,6 +69,10 @@ typedef enum {
     TOKEN_SLASH,         /* / */
     TOKEN_PERCENT,       /* % */
     TOKEN_ASSIGN,        /* = */
+    TOKEN_PLUS_ASSIGN,   /* += */
+    TOKEN_MINUS_ASSIGN,  /* -= */
+    TOKEN_STAR_ASSIGN,   /* *= */
+    TOKEN_SLASH_ASSIGN,  /* /= */
     TOKEN_EQ,            /* == */
     TOKEN_NEQ,           /* != */
     TOKEN_LT,            /* < */

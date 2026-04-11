@@ -602,13 +602,42 @@ static ASTNode *parse_assignment(Parser *p) {
 
     if (check(p, TOKEN_ASSIGN)) {
         const ParserToken *op = advance(p);
-        ASTNode *right = parse_assignment(p); /* right-associative */
+        ASTNode *right = parse_assignment(p);
         ASTNode *bin = ast_create_node(NODE_BINARY_OP, op->line, op->col);
         bin->op = str_dup("=");
         ast_add_child(bin, left);
         ast_add_child(bin, right);
         return bin;
     }
+
+    /* Compound assignments: x += e → x = x + e */
+    if (check(p, TOKEN_PLUS_ASSIGN) || check(p, TOKEN_MINUS_ASSIGN) ||
+        check(p, TOKEN_STAR_ASSIGN) || check(p, TOKEN_SLASH_ASSIGN)) {
+        const ParserToken *op = advance(p);
+        const char *arith_op = "+";
+        if (op->type == TOKEN_MINUS_ASSIGN) arith_op = "-";
+        else if (op->type == TOKEN_STAR_ASSIGN) arith_op = "*";
+        else if (op->type == TOKEN_SLASH_ASSIGN) arith_op = "/";
+
+        ASTNode *rhs_expr = parse_assignment(p);
+
+        /* Build: x = x <op> rhs */
+        ASTNode *arith = ast_create_node(NODE_BINARY_OP, op->line, op->col);
+        arith->op = str_dup(arith_op);
+        /* Clone left as the read side of x */
+        ASTNode *left_copy = ast_create_node(left->type, left->line, left->col);
+        if (left->string_val) left_copy->string_val = str_dup(left->string_val);
+        left_copy->int_val = left->int_val;
+        ast_add_child(arith, left_copy);
+        ast_add_child(arith, rhs_expr);
+
+        ASTNode *assign = ast_create_node(NODE_BINARY_OP, op->line, op->col);
+        assign->op = str_dup("=");
+        ast_add_child(assign, left);
+        ast_add_child(assign, arith);
+        return assign;
+    }
+
     return left;
 }
 

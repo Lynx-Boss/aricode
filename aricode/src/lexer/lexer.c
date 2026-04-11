@@ -446,6 +446,10 @@ static Token lex_token(Lexer *lex)
     if (c == '>' && next == '>') { advance(lex); advance(lex); return make_token(TOKEN_SHR,       ">>", line, col, lex->filename); }
     if (c == '&' && next == '&') { advance(lex); advance(lex); return make_token(TOKEN_AND,       "&&", line, col, lex->filename); }
     if (c == '|' && next == '|') { advance(lex); advance(lex); return make_token(TOKEN_OR,        "||", line, col, lex->filename); }
+    if (c == '+' && next == '=') { advance(lex); advance(lex); return make_token(TOKEN_PLUS_ASSIGN,  "+=", line, col, lex->filename); }
+    if (c == '-' && next == '=') { advance(lex); advance(lex); return make_token(TOKEN_MINUS_ASSIGN, "-=", line, col, lex->filename); }
+    if (c == '*' && next == '=') { advance(lex); advance(lex); return make_token(TOKEN_STAR_ASSIGN,  "*=", line, col, lex->filename); }
+    if (c == '/' && next == '=') { advance(lex); advance(lex); return make_token(TOKEN_SLASH_ASSIGN, "/=", line, col, lex->filename); }
 
     /* Single-character tokens */
     advance(lex);

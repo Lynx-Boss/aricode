@@ -1,0 +1,29 @@
+// aricode - File I/O Demo
+// Write to a file, read it back, print contents
+// Demonstrates: file_open, file_write, file_read, file_close
+
+fn main() -> i32 {
+    let path: i32 = str_new("/tmp/aricode_test.txt");
+
+    // Write to file (flags: 65 = O_WRONLY | O_CREAT)
+    let fd: i32 = file_open(path, 65);
+    let msg: i32 = str_new("Hello from aricode!");
+    file_write(fd, msg, str_len(msg));
+    file_close(fd);
+    print_str("Written to /tmp/aricode_test.txt");
+
+    // Read back (flags: 0 = O_RDONLY)
+    let buf: i32 = arr_new(128);
+    let fd2: i32 = file_open(path, 0);
+    let n: i32 = file_read(fd2, buf, 100);
+    file_close(fd2);
+
+    print_str("Read back:");
+    file_write(1, buf, n);
+    print_str("");
+
+    print_str("Bytes read:");
+    print_int(n);
+
+    return 0;
+}

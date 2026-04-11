@@ -1453,6 +1453,61 @@ static void emit_call_expr(CodegenState *cg, const ASTNode *node) {
         }
     }
 
+        /*
+         * FILE I/O BUILTINS (direct syscalls, no libc)
+         * file_open(path_str, flags) → fd (flags: 0=read, 1=write, 65=create+write)
+         * file_read(fd, buf_str, max_len) → bytes read
+         * file_write(fd, buf_str, len) → bytes written
+         * file_close(fd) → 0
+         */
+        if (strcmp(callee->string_val, "file_open") == 0 && argc == 2) {
+            /* file_open(path_str, flags): syscall open(2) */
+            emit_expression(cg, node->children[2]); /* flags → RAX */
+            int pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
+            emit_expression(cg, node->children[1]); /* path → RAX (str base) */
+            pn = emit_pop(BUF(cg), REG_RSI); EMIT(cg, pn); /* RSI = flags */
+            pn = emit_mov_reg_reg(BUF(cg), REG_RDI, REG_RAX); EMIT(cg, pn); /* RDI = path */
+            pn = emit_mov_reg_imm32(BUF(cg), REG_RDX, 0644); EMIT(cg, pn); /* mode */
+            pn = emit_mov_reg_imm32(BUF(cg), REG_RAX, 2); EMIT(cg, pn); /* __NR_open */
+            pn = emit_syscall(BUF(cg)); EMIT(cg, pn);
+            return;
+        }
+        if (strcmp(callee->string_val, "file_read") == 0 && argc == 3) {
+            /* file_read(fd, buf, max_len): syscall read(0) */
+            emit_expression(cg, node->children[3]); /* max_len */
+            int pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
+            emit_expression(cg, node->children[2]); /* buf */
+            pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
+            emit_expression(cg, node->children[1]); /* fd */
+            pn = emit_mov_reg_reg(BUF(cg), REG_RDI, REG_RAX); EMIT(cg, pn);
+            pn = emit_pop(BUF(cg), REG_RSI); EMIT(cg, pn); /* buf */
+            pn = emit_pop(BUF(cg), REG_RDX); EMIT(cg, pn); /* max_len */
+            pn = emit_xor_reg_reg(BUF(cg), REG_RAX, REG_RAX); EMIT(cg, pn); /* __NR_read=0 */
+            pn = emit_syscall(BUF(cg)); EMIT(cg, pn);
+            return;
+        }
+        if (strcmp(callee->string_val, "file_write") == 0 && argc == 3) {
+            /* file_write(fd, buf, len): syscall write(1) */
+            emit_expression(cg, node->children[3]);
+            int pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
+            emit_expression(cg, node->children[2]);
+            pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
+            emit_expression(cg, node->children[1]);
+            pn = emit_mov_reg_reg(BUF(cg), REG_RDI, REG_RAX); EMIT(cg, pn);
+            pn = emit_pop(BUF(cg), REG_RSI); EMIT(cg, pn);
+            pn = emit_pop(BUF(cg), REG_RDX); EMIT(cg, pn);
+            pn = emit_mov_reg_imm32(BUF(cg), REG_RAX, 1); EMIT(cg, pn); /* __NR_write=1 */
+            pn = emit_syscall(BUF(cg)); EMIT(cg, pn);
+            return;
+        }
+        if (strcmp(callee->string_val, "file_close") == 0 && argc == 1) {
+            emit_expression(cg, node->children[1]);
+            int pn = emit_mov_reg_reg(BUF(cg), REG_RDI, REG_RAX); EMIT(cg, pn);
+            pn = emit_mov_reg_imm32(BUF(cg), REG_RAX, 3); EMIT(cg, pn); /* __NR_close */
+            pn = emit_syscall(BUF(cg)); EMIT(cg, pn);
+            return;
+        }
+
     if (argc > SYS_V_ARG_COUNT) {
         cg_error(cg, "too many arguments (max %d) at %d:%d",
                  SYS_V_ARG_COUNT, node->line, node->col);

@@ -278,6 +278,7 @@ int compiler_compile_string(Compiler *c, const char *source,
             {"str_new", 1}, {"str_len", 1}, {"str_eq", 2},
             {"str_char_at", 2}, {"str_println", 1}, {"str_concat", 2},
             {"int_to_float", 1}, {"float_to_int", 1}, {"dec", 1},
+            {"file_open", 2}, {"file_read", 3}, {"file_write", 3}, {"file_close", 1},
             {NULL, 0}
         };
         for (int bi = 0; builtins[bi].name; bi++) {

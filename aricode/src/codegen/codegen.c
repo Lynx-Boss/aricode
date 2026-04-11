@@ -1180,13 +1180,260 @@ static void emit_call_expr(CodegenState *cg, const ASTNode *node) {
             return;
         }
 
+        /*
+         * dec("value"): Create a decimal value.
+         * At compile time, the optimizer folds dec("a") + dec("b") into
+         * dec("exact_result"). At runtime, dec("x") just stores the
+         * string for printing via print_dec.
+         * The string pointer is stored in RAX.
+         */
+        if (strcmp(callee->string_val, "dec") == 0 && argc == 1) {
+            /* Just evaluate the string arg - it puts the string in the code */
+            emit_expression(cg, node->children[1]);
+            return;
+        }
+
+        /* print_dec(x): Print a decimal value (stored as string from dec()) */
+        if (strcmp(callee->string_val, "print_dec") == 0 && argc == 1) {
+            /* The argument should be a dec() call which evaluates to a
+             * string literal embedded in the code. We just call print_str
+             * logic on it. */
+            emit_builtin_print_str(cg, node->children[1]->type == NODE_CALL ?
+                node->children[1]->children[1] : node->children[1]);
+            return;
+        }
+
         /* read_float(): read f64 from stdin (reads int, converts to float) */
         if (strcmp(callee->string_val, "read_float") == 0 && argc == 0) {
-            /* Read an integer via read_int, then convert to float */
             emit_builtin_read_int(cg);
-            /* RAX = integer value, convert to f64 */
             int pn = emit_cvtsi2sd(BUF(cg), 0, REG_RAX); EMIT(cg, pn);
             pn = emit_movq_reg_xmm(BUF(cg), REG_RAX, 0); EMIT(cg, pn);
+            return;
+        }
+
+        /*
+         * STRING BUILTINS
+         * Strings are heap-allocated via mmap: [i64 length][char bytes...]
+         * str_new("literal") → copies literal to heap, returns base ptr
+         * str_len(s) → returns length from [s - 8]
+         * str_concat(a, b) → allocates new string = a + b
+         * str_eq(a, b) → 1 if equal, 0 if not
+         * str_char_at(s, i) → returns ASCII value of char at index
+         * str_print(s) → prints heap string to stdout (no newline)
+         * str_println(s) → prints heap string + newline
+         */
+        if (strcmp(callee->string_val, "str_new") == 0 && argc == 1) {
+            /* str_new("literal"): embed string, mmap heap copy */
+            ASTNode *arg = node->children[1];
+            if (!arg || arg->type != NODE_STRING_LITERAL || !arg->string_val) {
+                cg_error(cg, "str_new requires a string literal");
+                return;
+            }
+            const char *str = arg->string_val;
+            size_t slen = strlen(str);
+            int pn; uint8_t *b;
+
+            /* mmap(0, slen+8, 3, 0x22, -1, 0) */
+            pn = emit_xor_reg_reg(BUF(cg), REG_RDI, REG_RDI); EMIT(cg, pn);
+            pn = emit_mov_reg_imm32(BUF(cg), REG_RSI, (uint32_t)(slen + 8 + 1));
+            EMIT(cg, pn);
+            pn = emit_mov_reg_imm32(BUF(cg), REG_RDX, 3); EMIT(cg, pn);
+            b = BUF(cg); b[0]=0x49; b[1]=0xC7; b[2]=0xC2;
+            int32_t v=0x22; memcpy(b+3,&v,4); EMIT(cg,7);
+            b = BUF(cg); b[0]=0x49; b[1]=0xC7; b[2]=0xC0;
+            v=-1; memcpy(b+3,&v,4); EMIT(cg,7);
+            b = BUF(cg); b[0]=0x4D; b[1]=0x31; b[2]=0xC9; EMIT(cg,3);
+            pn = emit_mov_reg_imm32(BUF(cg), REG_RAX, 9); EMIT(cg, pn);
+            pn = emit_syscall(BUF(cg)); EMIT(cg, pn);
+
+            /* Store length at [rax] */
+            pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn); /* save ptr */
+            pn = emit_mov_reg_imm32(BUF(cg), REG_RCX, (uint32_t)slen); EMIT(cg, pn);
+            b = BUF(cg);
+            b[0]=rex(1,reg_ext(REG_RCX),0,reg_ext(REG_RAX));
+            b[1]=0x89; b[2]=modrm(0,REG_RCX,REG_RAX); EMIT(cg,3);
+
+            /* Copy string bytes: embed them inline, use rep movsb */
+            /* rax+8 = start of char data */
+            pn = emit_add_reg_imm(BUF(cg), REG_RAX, 8); EMIT(cg, pn);
+            pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn); /* save base */
+
+            /* JMP over string data */
+            size_t jmp_pos = cg->code_size;
+            pn = emit_jmp(BUF(cg), 0); EMIT(cg, pn);
+
+            /* Embed string bytes */
+            size_t str_data = cg->code_size;
+            memcpy(BUF(cg), str, slen);
+            cg->code_size += slen;
+
+            /* Patch JMP */
+            int32_t jmp_off = (int32_t)(cg->code_size - (jmp_pos + 5));
+            memcpy(cg->code + jmp_pos + 1, &jmp_off, 4);
+
+            /* LEA RSI, [rip - offset] (source = embedded string) */
+            int32_t rip_off = (int32_t)((int64_t)str_data - (int64_t)(cg->code_size + 7));
+            b = BUF(cg);
+            b[0]=rex(1,reg_ext(REG_RSI),0,0);
+            b[1]=0x8D; b[2]=modrm(0,REG_RSI,5);
+            memcpy(b+3,&rip_off,4); EMIT(cg,7);
+
+            /* RDI = dest (base = rax+8, saved on stack) */
+            pn = emit_pop(BUF(cg), REG_RDI); EMIT(cg, pn);
+            /* RCX = length */
+            pn = emit_mov_reg_imm32(BUF(cg), REG_RCX, (uint32_t)slen); EMIT(cg, pn);
+            /* rep movsb */
+            b = BUF(cg); b[0]=0xF3; b[1]=0xA4; EMIT(cg,2);
+
+            /* Return base ptr (rax = mmap_ptr + 8) */
+            pn = emit_pop(BUF(cg), REG_RAX); EMIT(cg, pn);
+            pn = emit_add_reg_imm(BUF(cg), REG_RAX, 8); EMIT(cg, pn);
+            return;
+        }
+
+        if (strcmp(callee->string_val, "str_len") == 0 && argc == 1) {
+            emit_expression(cg, node->children[1]); /* base -> RAX */
+            /* length at [rax - 8] */
+            int pn = emit_mov_reg_mem(BUF(cg), REG_RAX, REG_RAX, -8);
+            EMIT(cg, pn);
+            return;
+        }
+
+        if (strcmp(callee->string_val, "str_concat") == 0 && argc == 2) {
+            /* Evaluate b, push; evaluate a, pop b */
+            emit_expression(cg, node->children[2]);
+            int pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
+            emit_expression(cg, node->children[1]);
+            pn = emit_pop(BUF(cg), REG_RCX); EMIT(cg, pn);
+            /* RAX=a, RCX=b. Save both. */
+            pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn); /* save a */
+            pn = emit_push(BUF(cg), REG_RCX); EMIT(cg, pn); /* save b */
+
+            /* len_a = [rax-8], len_b = [rcx-8] */
+            uint8_t *b;
+            pn = emit_mov_reg_mem(BUF(cg), REG_R10, REG_RAX, -8); EMIT(cg, pn);
+            pn = emit_mov_reg_mem(BUF(cg), REG_R11, REG_RCX, -8); EMIT(cg, pn);
+
+            /* total = len_a + len_b + 8 (header) + 1 (safety) */
+            pn = emit_mov_reg_reg(BUF(cg), REG_RSI, REG_R10); EMIT(cg, pn);
+            pn = emit_add_reg_reg(BUF(cg), REG_RSI, REG_R11); EMIT(cg, pn);
+            pn = emit_add_reg_imm(BUF(cg), REG_RSI, 9); EMIT(cg, pn);
+
+            /* mmap */
+            pn = emit_xor_reg_reg(BUF(cg), REG_RDI, REG_RDI); EMIT(cg, pn);
+            pn = emit_mov_reg_imm32(BUF(cg), REG_RDX, 3); EMIT(cg, pn);
+            b = BUF(cg); b[0]=0x49; b[1]=0xC7; b[2]=0xC2;
+            int32_t v2=0x22; memcpy(b+3,&v2,4); EMIT(cg,7);
+            b = BUF(cg); b[0]=0x49; b[1]=0xC7; b[2]=0xC0;
+            v2=-1; memcpy(b+3,&v2,4); EMIT(cg,7);
+            b = BUF(cg); b[0]=0x4D; b[1]=0x31; b[2]=0xC9; EMIT(cg,3);
+            pn = emit_mov_reg_imm32(BUF(cg), REG_RAX, 9); EMIT(cg, pn);
+            /* Save r10, r11 (mmap clobbers) */
+            pn = emit_push(BUF(cg), REG_R10); EMIT(cg, pn);
+            pn = emit_push(BUF(cg), REG_R11); EMIT(cg, pn);
+            pn = emit_syscall(BUF(cg)); EMIT(cg, pn);
+            pn = emit_pop(BUF(cg), REG_R11); EMIT(cg, pn);
+            pn = emit_pop(BUF(cg), REG_R10); EMIT(cg, pn);
+
+            /* RAX = new buffer. Store total length. */
+            pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn); /* save new_ptr */
+            pn = emit_mov_reg_reg(BUF(cg), REG_RCX, REG_R10); EMIT(cg, pn);
+            pn = emit_add_reg_reg(BUF(cg), REG_RCX, REG_R11); EMIT(cg, pn);
+            b = BUF(cg);
+            b[0]=rex(1,reg_ext(REG_RCX),0,reg_ext(REG_RAX));
+            b[1]=0x89; b[2]=modrm(0,REG_RCX,REG_RAX); EMIT(cg,3);
+
+            /* Copy a: RDI=rax+8, RSI=a_base, RCX=len_a */
+            pn = emit_add_reg_imm(BUF(cg), REG_RAX, 8); EMIT(cg, pn);
+            pn = emit_mov_reg_reg(BUF(cg), REG_RDI, REG_RAX); EMIT(cg, pn);
+            /* Load a from stack [rsp+24] (new_ptr, b, a on stack) */
+            pn = emit_mov_reg_mem(BUF(cg), REG_RSI, REG_RSP, 16); EMIT(cg, pn);
+            pn = emit_mov_reg_reg(BUF(cg), REG_RCX, REG_R10); EMIT(cg, pn);
+            b = BUF(cg); b[0]=0xF3; b[1]=0xA4; EMIT(cg,2); /* rep movsb */
+
+            /* Copy b: RDI already advanced, RSI=b_base, RCX=len_b */
+            pn = emit_mov_reg_mem(BUF(cg), REG_RSI, REG_RSP, 8); EMIT(cg, pn);
+            pn = emit_mov_reg_reg(BUF(cg), REG_RCX, REG_R11); EMIT(cg, pn);
+            b = BUF(cg); b[0]=0xF3; b[1]=0xA4; EMIT(cg,2); /* rep movsb */
+
+            /* Clean up stack: pop new_ptr, b, a */
+            pn = emit_pop(BUF(cg), REG_RAX); EMIT(cg, pn); /* new_ptr */
+            pn = emit_add_reg_imm(BUF(cg), REG_RSP, 16); EMIT(cg, pn); /* discard a,b */
+            pn = emit_add_reg_imm(BUF(cg), REG_RAX, 8); EMIT(cg, pn); /* return base */
+            return;
+        }
+
+        if (strcmp(callee->string_val, "str_eq") == 0 && argc == 2) {
+            /* Compare two heap strings byte by byte */
+            emit_expression(cg, node->children[2]);
+            int pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
+            emit_expression(cg, node->children[1]);
+            pn = emit_pop(BUF(cg), REG_RCX); EMIT(cg, pn);
+            /* RAX=a, RCX=b. Compare lengths first. */
+            uint8_t *b;
+            pn = emit_mov_reg_mem(BUF(cg), REG_R10, REG_RAX, -8); EMIT(cg, pn);
+            pn = emit_mov_reg_mem(BUF(cg), REG_R11, REG_RCX, -8); EMIT(cg, pn);
+            /* cmp r10, r11 */
+            b = BUF(cg); b[0]=0x4D; b[1]=0x39; b[2]=0xDA; EMIT(cg,3);
+            size_t jne_len = cg->code_size;
+            b = BUF(cg); b[0]=0x75; b[1]=0x00; EMIT(cg,2); /* jne not_equal */
+
+            /* Same length: repe cmpsb */
+            pn = emit_mov_reg_reg(BUF(cg), REG_RSI, REG_RAX); EMIT(cg, pn);
+            pn = emit_mov_reg_reg(BUF(cg), REG_RDI, REG_RCX); EMIT(cg, pn);
+            pn = emit_mov_reg_reg(BUF(cg), REG_RCX, REG_R10); EMIT(cg, pn);
+            b = BUF(cg); b[0]=0xF3; b[1]=0xA6; EMIT(cg,2); /* repe cmpsb */
+            pn = emit_sete(BUF(cg), REG_RAX); EMIT(cg, pn);
+            pn = emit_movzx_reg_reg8(BUF(cg), REG_RAX, REG_RAX); EMIT(cg, pn);
+            size_t jmp_end = cg->code_size;
+            b = BUF(cg); b[0]=0xEB; b[1]=0x00; EMIT(cg,2); /* jmp end */
+
+            /* not_equal: return 0 */
+            cg->code[jne_len+1] = (uint8_t)(cg->code_size-(jne_len+2));
+            pn = emit_xor_reg_reg(BUF(cg), REG_RAX, REG_RAX); EMIT(cg, pn);
+
+            cg->code[jmp_end+1] = (uint8_t)(cg->code_size-(jmp_end+2));
+            return;
+        }
+
+        if (strcmp(callee->string_val, "str_char_at") == 0 && argc == 2) {
+            /* str_char_at(s, i) → ASCII value */
+            emit_expression(cg, node->children[2]);
+            int pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
+            emit_expression(cg, node->children[1]);
+            pn = emit_pop(BUF(cg), REG_RCX); EMIT(cg, pn);
+            /* movzx rax, byte [rax + rcx] */
+            uint8_t *b = BUF(cg);
+            b[0]=rex(1,reg_ext(REG_RAX),reg_ext(REG_RCX),reg_ext(REG_RAX));
+            b[1]=0x0F; b[2]=0xB6;
+            b[3]=modrm(0,REG_RAX&7,4);
+            b[4]=(uint8_t)((0<<6)|((REG_RCX&7)<<3)|(REG_RAX&7));
+            EMIT(cg,5);
+            return;
+        }
+
+        if (strcmp(callee->string_val, "str_println") == 0 && argc == 1) {
+            /* Print heap string + newline */
+            emit_expression(cg, node->children[1]); /* base -> RAX */
+            int pn;
+            /* Save base */
+            pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
+            /* write(1, base, len) */
+            pn = emit_mov_reg_reg(BUF(cg), REG_RSI, REG_RAX); EMIT(cg, pn);
+            pn = emit_mov_reg_mem(BUF(cg), REG_RDX, REG_RAX, -8); EMIT(cg, pn);
+            pn = emit_mov_reg_imm32(BUF(cg), REG_RDI, 1); EMIT(cg, pn);
+            pn = emit_mov_reg_imm32(BUF(cg), REG_RAX, 1); EMIT(cg, pn);
+            pn = emit_syscall(BUF(cg)); EMIT(cg, pn);
+            /* Write newline */
+            uint8_t *b = BUF(cg); b[0]=0x6A; b[1]=0x0A; EMIT(cg,2);
+            pn = emit_mov_reg_imm32(BUF(cg), REG_RAX, 1); EMIT(cg, pn);
+            pn = emit_mov_reg_imm32(BUF(cg), REG_RDI, 1); EMIT(cg, pn);
+            pn = emit_mov_reg_reg(BUF(cg), REG_RSI, REG_RSP); EMIT(cg, pn);
+            pn = emit_mov_reg_imm32(BUF(cg), REG_RDX, 1); EMIT(cg, pn);
+            pn = emit_syscall(BUF(cg)); EMIT(cg, pn);
+            pn = emit_add_reg_imm(BUF(cg), REG_RSP, 8); EMIT(cg, pn);
+            pn = emit_pop(BUF(cg), REG_RAX); EMIT(cg, pn);
+            pn = emit_xor_reg_reg(BUF(cg), REG_RAX, REG_RAX); EMIT(cg, pn);
             return;
         }
     }

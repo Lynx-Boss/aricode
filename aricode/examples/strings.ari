@@ -1,0 +1,36 @@
+// aricode - String Operations
+// Heap-allocated strings with length, equality, char access
+
+fn main() -> i32 {
+    let hello: i32 = str_new("Hello, World!");
+    let name: i32 = str_new("aricode");
+
+    print_str("--- String basics ---");
+    str_println(hello);
+    str_println(name);
+
+    print_str("Length of hello:");
+    print_int(str_len(hello));
+    print_str("Length of name:");
+    print_int(str_len(name));
+
+    print_str("--- Equality ---");
+    let a: i32 = str_new("aricode");
+    let b: i32 = str_new("aricode");
+    let c: i32 = str_new("rust");
+
+    print_str("aricode == aricode?");
+    print_int(str_eq(a, b));
+    print_str("aricode == rust?");
+    print_int(str_eq(a, c));
+
+    print_str("--- Char access ---");
+    print_str("hello[0] = H (72):");
+    print_int(str_char_at(hello, 0));
+    print_str("hello[7] = W (87):");
+    print_int(str_char_at(hello, 7));
+    print_str("name[3] = c (99):");
+    print_int(str_char_at(name, 3));
+
+    return 0;
+}

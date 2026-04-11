@@ -173,6 +173,28 @@ static int is_commutative(const char *op) {
            strcmp(op, "==") == 0 || strcmp(op, "!=") == 0;
 }
 
+/*
+ * Recursively check if an expression tree evaluates to a float.
+ * This is needed because nested expressions like (2.0 * g) produce
+ * a BINARY_OP node that doesn't directly contain a FLOAT_LITERAL.
+ */
+static int expr_is_float(CodegenState *cg, const ASTNode *node) {
+    if (!node) return 0;
+    if (node->type == NODE_FLOAT_LITERAL) return 1;
+    if (node->type == NODE_IDENTIFIER && node->string_val) {
+        LocalVar *v = find_local(cg, node->string_val);
+        return v ? v->is_float : 0;
+    }
+    if (node->type == NODE_BINARY_OP && node->child_count >= 2) {
+        return expr_is_float(cg, node->children[0]) ||
+               expr_is_float(cg, node->children[1]);
+    }
+    if (node->type == NODE_UNARY_OP && node->child_count >= 1) {
+        return expr_is_float(cg, node->children[0]);
+    }
+    return 0;
+}
+
 static void emit_binary_op(CodegenState *cg, const ASTNode *node) {
     const char *op = node->op;
     if (!op || node->child_count < 2) {
@@ -186,15 +208,10 @@ static void emit_binary_op(CodegenState *cg, const ASTNode *node) {
 
     /*
      * FLOAT PATH: If either operand is float, use SSE instructions.
-     * Convention: left in xmm0, right in xmm1, result in xmm0.
-     * Bits also stored in RAX for stack variable compatibility.
+     * Recursively check the entire expression tree for float types.
      */
-    int left_is_float = (left->type == NODE_FLOAT_LITERAL) ||
-        (left->type == NODE_IDENTIFIER && find_local(cg, left->string_val) &&
-         find_local(cg, left->string_val)->is_float);
-    int right_is_float = (right->type == NODE_FLOAT_LITERAL) ||
-        (right->type == NODE_IDENTIFIER && find_local(cg, right->string_val) &&
-         find_local(cg, right->string_val)->is_float);
+    int left_is_float = expr_is_float(cg, left);
+    int right_is_float = expr_is_float(cg, right);
 
     if (left_is_float || right_is_float) {
         /* Evaluate left -> xmm0 */
@@ -976,6 +993,174 @@ static void emit_call_expr(CodegenState *cg, const ASTNode *node) {
             /* mov rax, [rax - 8] */
             int pn = emit_mov_reg_mem(BUF(cg), REG_RAX, REG_RAX, -8);
             EMIT(cg, pn);
+            return;
+        }
+
+        /*
+         * print_float(x): Print f64 with 6 decimal places.
+         * Strategy: print integer part, ".", then fractional part.
+         * Uses the integer print_int mechanism for each part.
+         */
+        if (strcmp(callee->string_val, "print_float") == 0 && argc == 1) {
+            emit_expression(cg, node->children[1]); /* x -> xmm0 + RAX */
+            int pn; uint8_t *b;
+
+            /* Save xmm0 bits on stack */
+            pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
+
+            /* Handle negative: if xmm0 < 0, print '-' and negate */
+            /* pxor xmm1, xmm1  (zero) */
+            b = BUF(cg); b[0]=0x66; b[1]=0x0F; b[2]=0xEF; b[3]=0xC9; EMIT(cg,4);
+            /* ucomisd xmm0, xmm1 */
+            pn = emit_ucomisd(BUF(cg), 0, 1); EMIT(cg, pn);
+            /* jae .not_neg (not below = not negative) */
+            size_t jae_pos = cg->code_size;
+            b = BUF(cg); b[0]=0x73; b[1]=0x00; EMIT(cg,2);
+
+            /* Print '-': push '-' byte, write(1, rsp, 1) */
+            b = BUF(cg); b[0]=0x6A; b[1]='-'; EMIT(cg,2); /* push '-' */
+            pn = emit_mov_reg_imm32(BUF(cg), REG_RAX, 1); EMIT(cg, pn);
+            pn = emit_mov_reg_imm32(BUF(cg), REG_RDI, 1); EMIT(cg, pn);
+            pn = emit_mov_reg_reg(BUF(cg), REG_RSI, REG_RSP); EMIT(cg, pn);
+            pn = emit_mov_reg_imm32(BUF(cg), REG_RDX, 1); EMIT(cg, pn);
+            pn = emit_syscall(BUF(cg)); EMIT(cg, pn);
+            pn = emit_add_reg_imm(BUF(cg), REG_RSP, 8); EMIT(cg, pn);
+
+            /* Reload xmm0 from saved bits, negate it */
+            pn = emit_mov_reg_mem(BUF(cg), REG_RAX, REG_RSP, 0); EMIT(cg, pn);
+            pn = emit_movq_xmm_reg(BUF(cg), 0, REG_RAX); EMIT(cg, pn);
+            /* Negate: xorpd with sign bit mask. Simpler: subsd 0 - xmm0 */
+            /* pxor xmm1, xmm1; subsd xmm1, xmm0; movsd xmm0, xmm1 */
+            b = BUF(cg); b[0]=0x66; b[1]=0x0F; b[2]=0xEF; b[3]=0xC9; EMIT(cg,4);
+            pn = emit_subsd(BUF(cg), 1, 0); EMIT(cg, pn);
+            pn = emit_movsd_xmm_xmm(BUF(cg), 0, 1); EMIT(cg, pn);
+            /* Update saved bits */
+            pn = emit_movq_reg_xmm(BUF(cg), REG_RAX, 0); EMIT(cg, pn);
+            pn = emit_mov_mem_reg(BUF(cg), REG_RSP, 0, REG_RAX); EMIT(cg, pn);
+
+            /* patch jae */
+            cg->code[jae_pos+1] = (uint8_t)(cg->code_size - (jae_pos+2));
+
+            /* Reload xmm0 */
+            pn = emit_mov_reg_mem(BUF(cg), REG_RAX, REG_RSP, 0); EMIT(cg, pn);
+            pn = emit_movq_xmm_reg(BUF(cg), 0, REG_RAX); EMIT(cg, pn);
+
+            /* cvttsd2si rax, xmm0 (integer part) */
+            pn = emit_cvttsd2si(BUF(cg), REG_RAX, 0); EMIT(cg, pn);
+
+            /* Save integer part and xmm0 */
+            pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
+
+            /* Print integer part using print_int's inline write mechanism */
+            /* We need to call the print_int logic. Simplest: emit a sub rsp,24
+             * and the digit loop inline. Actually, let's use a helper approach:
+             * save to a local, create a fake call. Too complex.
+             * Instead: convert int to ASCII inline (same as print_int). */
+
+            /* --- Inline integer print (same algorithm as print_int) --- */
+            pn = emit_sub_reg_imm(BUF(cg), REG_RSP, 24); EMIT(cg, pn);
+
+            /* r10 = write pos at end of buffer */
+            b = BUF(cg);
+            b[0]=0x4C; b[1]=0x8D; b[2]=modrm(1, REG_R10&7, REG_RSP);
+            b[3]=0x24; b[4]=23; EMIT(cg,5);
+
+            /* r11 = 0 (length) */
+            b = BUF(cg); b[0]=0x4D; b[1]=0x31; b[2]=0xDB; EMIT(cg,3);
+
+            /* Digit loop */
+            size_t dloop = cg->code_size;
+            pn = emit_mov_reg_imm32(BUF(cg), REG_RCX, 10); EMIT(cg, pn);
+            pn = emit_xor_reg_reg(BUF(cg), REG_RDX, REG_RDX); EMIT(cg, pn);
+            b = BUF(cg); b[0]=rex(1,0,0,0); b[1]=0xF7; b[2]=modrm(3,6,REG_RCX);
+            EMIT(cg,3); /* div rcx */
+            b = BUF(cg); b[0]=0x80; b[1]=0xC2; b[2]='0'; EMIT(cg,3); /* add dl,'0' */
+            pn = emit_dec_reg(BUF(cg), REG_R10); EMIT(cg, pn);
+            b = BUF(cg); b[0]=0x41; b[1]=0x88; b[2]=0x12; EMIT(cg,3); /* mov [r10],dl */
+            pn = emit_inc_reg(BUF(cg), REG_R11); EMIT(cg, pn);
+            pn = emit_test_reg_reg(BUF(cg), REG_RAX, REG_RAX); EMIT(cg, pn);
+            int8_t lb = (int8_t)((int64_t)dloop - (int64_t)(cg->code_size+2));
+            b = BUF(cg); b[0]=0x75; b[1]=(uint8_t)lb; EMIT(cg,2);
+
+            /* Handle zero case */
+            b = BUF(cg); b[0]=0x4D; b[1]=0x85; b[2]=0xDB; EMIT(cg,3); /* test r11,r11 */
+            size_t jnz_nz = cg->code_size;
+            b = BUF(cg); b[0]=0x75; b[1]=0x00; EMIT(cg,2);
+            pn = emit_dec_reg(BUF(cg), REG_R10); EMIT(cg, pn);
+            b = BUF(cg); b[0]=0x41; b[1]=0xC6; b[2]=0x02; b[3]='0'; EMIT(cg,4);
+            pn = emit_inc_reg(BUF(cg), REG_R11); EMIT(cg, pn);
+            cg->code[jnz_nz+1] = (uint8_t)(cg->code_size-(jnz_nz+2));
+
+            /* Write integer part */
+            pn = emit_mov_reg_imm32(BUF(cg), REG_RAX, 1); EMIT(cg, pn);
+            pn = emit_mov_reg_imm32(BUF(cg), REG_RDI, 1); EMIT(cg, pn);
+            pn = emit_mov_reg_reg(BUF(cg), REG_RSI, REG_R10); EMIT(cg, pn);
+            pn = emit_mov_reg_reg(BUF(cg), REG_RDX, REG_R11); EMIT(cg, pn);
+            pn = emit_syscall(BUF(cg)); EMIT(cg, pn);
+            pn = emit_add_reg_imm(BUF(cg), REG_RSP, 24); EMIT(cg, pn);
+
+            /* Print '.' */
+            b = BUF(cg); b[0]=0x6A; b[1]='.'; EMIT(cg,2);
+            pn = emit_mov_reg_imm32(BUF(cg), REG_RAX, 1); EMIT(cg, pn);
+            pn = emit_mov_reg_imm32(BUF(cg), REG_RDI, 1); EMIT(cg, pn);
+            pn = emit_mov_reg_reg(BUF(cg), REG_RSI, REG_RSP); EMIT(cg, pn);
+            pn = emit_mov_reg_imm32(BUF(cg), REG_RDX, 1); EMIT(cg, pn);
+            pn = emit_syscall(BUF(cg)); EMIT(cg, pn);
+            pn = emit_add_reg_imm(BUF(cg), REG_RSP, 8); EMIT(cg, pn);
+
+            /* Fractional part: (x - int(x)) * 1000000 -> int -> print with leading zeros */
+            /* Pop saved int part into RCX */
+            pn = emit_pop(BUF(cg), REG_RCX); EMIT(cg, pn);
+            /* Reload xmm0 from saved bits */
+            pn = emit_mov_reg_mem(BUF(cg), REG_RAX, REG_RSP, 0); EMIT(cg, pn);
+            pn = emit_movq_xmm_reg(BUF(cg), 0, REG_RAX); EMIT(cg, pn);
+            /* cvtsi2sd xmm1, rcx (convert int part back to float) */
+            pn = emit_cvtsi2sd(BUF(cg), 1, REG_RCX); EMIT(cg, pn);
+            /* subsd xmm0, xmm1 (fractional part) */
+            pn = emit_subsd(BUF(cg), 0, 1); EMIT(cg, pn);
+            /* Load 1000000.0 into xmm1 */
+            pn = emit_mov_reg_imm32(BUF(cg), REG_RAX, 1000000); EMIT(cg, pn);
+            pn = emit_cvtsi2sd(BUF(cg), 1, REG_RAX); EMIT(cg, pn);
+            /* mulsd xmm0, xmm1 */
+            pn = emit_mulsd(BUF(cg), 0, 1); EMIT(cg, pn);
+            /* cvttsd2si rax, xmm0 */
+            pn = emit_cvttsd2si(BUF(cg), REG_RAX, 0); EMIT(cg, pn);
+
+            /* Print 6 digits with leading zeros */
+            pn = emit_sub_reg_imm(BUF(cg), REG_RSP, 8); EMIT(cg, pn);
+
+            /* Generate 6 digits right-to-left */
+            /* We'll store them at rsp[0..5] then write all 6 + newline */
+            pn = emit_sub_reg_imm(BUF(cg), REG_RSP, 8); EMIT(cg, pn);
+            int di;
+            for (di = 5; di >= 0; di--) {
+                pn = emit_mov_reg_imm32(BUF(cg), REG_RCX, 10); EMIT(cg, pn);
+                pn = emit_xor_reg_reg(BUF(cg), REG_RDX, REG_RDX); EMIT(cg, pn);
+                b = BUF(cg); b[0]=rex(1,0,0,0); b[1]=0xF7; b[2]=modrm(3,6,REG_RCX);
+                EMIT(cg,3);
+                b = BUF(cg); b[0]=0x80; b[1]=0xC2; b[2]='0'; EMIT(cg,3);
+                /* mov [rsp+di], dl */
+                b = BUF(cg); b[0]=0x88; b[1]=modrm(1,REG_RDX,REG_RSP);
+                b[2]=0x24; b[3]=(uint8_t)di; EMIT(cg,4);
+            }
+            /* Put newline at [rsp+6] */
+            b = BUF(cg); b[0]=0xC6; b[1]=modrm(1,0,REG_RSP);
+            b[2]=0x24; b[3]=6; b[4]=0x0A; EMIT(cg,5);
+
+            /* write(1, rsp, 7) -- 6 digits + newline */
+            pn = emit_mov_reg_imm32(BUF(cg), REG_RAX, 1); EMIT(cg, pn);
+            pn = emit_mov_reg_imm32(BUF(cg), REG_RDI, 1); EMIT(cg, pn);
+            pn = emit_mov_reg_reg(BUF(cg), REG_RSI, REG_RSP); EMIT(cg, pn);
+            pn = emit_mov_reg_imm32(BUF(cg), REG_RDX, 7); EMIT(cg, pn);
+            pn = emit_syscall(BUF(cg)); EMIT(cg, pn);
+
+            pn = emit_add_reg_imm(BUF(cg), REG_RSP, 16); EMIT(cg, pn);
+
+            /* Pop saved xmm0 bits */
+            pn = emit_pop(BUF(cg), REG_RAX); EMIT(cg, pn);
+
+            /* Return 0 */
+            pn = emit_xor_reg_reg(BUF(cg), REG_RAX, REG_RAX); EMIT(cg, pn);
             return;
         }
 

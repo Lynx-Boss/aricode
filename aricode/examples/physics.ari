@@ -1,0 +1,40 @@
+// aricode - Physics Simulation
+// Projectile motion with f64 floating-point arithmetic
+// v0 = 20 m/s, angle = 45 deg, g = 9.81 m/s^2
+// Demonstrates: f64 math, while loops, print_float, print_str
+
+fn main() -> i32 {
+    print_str("=== Projectile Motion ===");
+
+    let g: f64 = 9.81;
+    let v0: f64 = 20.0;
+
+    // sin(45) = cos(45) = 0.7071
+    let sin45: f64 = 0.7071;
+    let vx: f64 = v0 * sin45;
+    let vy: f64 = v0 * sin45;
+
+    print_str("Initial velocity (m/s):");
+    print_float(v0);
+    print_str("Vx:");
+    print_float(vx);
+    print_str("Vy:");
+    print_float(vy);
+
+    // Time of flight = 2 * vy / g
+    let t_flight: f64 = 2.0 * vy / g;
+    print_str("Time of flight (s):");
+    print_float(t_flight);
+
+    // Max height = vy^2 / (2*g)
+    let h_max: f64 = vy * vy / (2.0 * g);
+    print_str("Max height (m):");
+    print_float(h_max);
+
+    // Range = vx * t_flight
+    let range: f64 = vx * t_flight;
+    print_str("Range (m):");
+    print_float(range);
+
+    return 0;
+}

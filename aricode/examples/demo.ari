@@ -1,0 +1,45 @@
+// aricode - Full Language Demo
+// Shows all features: functions, loops, recursion, print, bitwise
+
+fn fib(n: i32) -> i32 {
+    if (n < 2) { return n; }
+    return fib(n - 1) + fib(n - 2);
+}
+
+fn is_prime(n: i32) -> i32 {
+    if (n < 2) { return 0; }
+    if (n % 2 == 0) { return n == 2; }
+    let d: i32 = 3;
+    while (d * d <= n) {
+        if (n % d == 0) { return 0; }
+        d = d + 2;
+    }
+    return 1;
+}
+
+fn main() -> i32 {
+    print_str("=== ARICODE DEMO ===");
+    print_str("Zero Silent Errors");
+
+    print_str("--- Fibonacci ---");
+    for (let i: i32 = 0; i < 10; i = i + 1) {
+        print_int(fib(i));
+    }
+
+    print_str("--- Primes below 50 ---");
+    let count: i32 = 0;
+    for (let n: i32 = 2; n < 50; n = n + 1) {
+        if (is_prime(n) == 1) {
+            print_int(n);
+            count = count + 1;
+        }
+    }
+
+    print_str("--- Total primes ---");
+    print_int(count);
+
+    print_str("--- Mersenne M31 ---");
+    print_int(2147483647);
+
+    return 0;
+}

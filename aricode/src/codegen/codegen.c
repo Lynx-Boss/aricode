@@ -351,6 +351,77 @@ static void emit_unary_op(CodegenState *cg, const ASTNode *node) {
 }
 
 /*
+ * BUILTIN: print_str("text")
+ * Prints a string literal to stdout followed by a newline.
+ * Embeds the string directly in the code segment:
+ *   jmp over_string    ; skip the data
+ *   .data: "text\n"    ; string bytes
+ *   over_string:
+ *   lea rsi, [rip - offset]  ; point back to the string
+ *   mov rdx, len
+ *   mov rdi, 1         ; stdout
+ *   mov rax, 1         ; __NR_write
+ *   syscall
+ */
+static void emit_builtin_print_str(CodegenState *cg, const ASTNode *arg) {
+    if (!arg || arg->type != NODE_STRING_LITERAL || !arg->string_val) {
+        cg_error(cg, "print_str requires a string literal argument");
+        return;
+    }
+
+    const char *str = arg->string_val;
+    size_t slen = strlen(str);
+    size_t total_len = slen + 1;  /* string + newline */
+    int n;
+
+    /* JMP over the string data */
+    size_t jmp_pos = cg->code_size;
+    n = emit_jmp(BUF(cg), 0);  /* placeholder */
+    EMIT(cg, n);
+
+    /* Embed string bytes + newline */
+    size_t str_pos = cg->code_size;
+    memcpy(BUF(cg), str, slen);
+    cg->code_size += slen;
+    BUF(cg)[0] = '\n';
+    cg->code_size += 1;
+
+    /* Patch JMP to land here */
+    int32_t jmp_off = (int32_t)(cg->code_size - (jmp_pos + 5));
+    memcpy(cg->code + jmp_pos + 1, &jmp_off, 4);
+
+    /* lea rsi, [rip - offset]  -- point back to str_pos */
+    /* RIP-relative: offset = current_pos + 7 (size of lea) - str_pos, negated */
+    int32_t rip_off = (int32_t)((int64_t)str_pos - (int64_t)(cg->code_size + 7));
+    uint8_t *b = BUF(cg);
+    b[0] = rex(1, reg_ext(REG_RSI), 0, 0);
+    b[1] = 0x8D;
+    b[2] = modrm(0, REG_RSI, 5);  /* mod=00, rm=101 = RIP-relative */
+    memcpy(b + 3, &rip_off, 4);
+    EMIT(cg, 7);
+
+    /* mov rdx, total_len */
+    n = emit_mov_reg_imm32(BUF(cg), REG_RDX, (uint32_t)total_len);
+    EMIT(cg, n);
+
+    /* mov rdi, 1 (stdout) */
+    n = emit_mov_reg_imm32(BUF(cg), REG_RDI, 1);
+    EMIT(cg, n);
+
+    /* mov rax, 1 (__NR_write) */
+    n = emit_mov_reg_imm32(BUF(cg), REG_RAX, 1);
+    EMIT(cg, n);
+
+    /* syscall */
+    n = emit_syscall(BUF(cg));
+    EMIT(cg, n);
+
+    /* Return 0 */
+    n = emit_xor_reg_reg(BUF(cg), REG_RAX, REG_RAX);
+    EMIT(cg, n);
+}
+
+/*
  * BUILTIN: print_int(n)
  * Prints an integer to stdout followed by a newline.
  * Uses a 24-byte stack buffer, fills digits right-to-left,
@@ -541,6 +612,10 @@ static void emit_call_expr(CodegenState *cg, const ASTNode *node) {
     if (callee->type == NODE_IDENTIFIER && callee->string_val) {
         if (strcmp(callee->string_val, "print_int") == 0 && argc == 1) {
             emit_builtin_print_int(cg, node->children[1]);
+            return;
+        }
+        if (strcmp(callee->string_val, "print_str") == 0 && argc == 1) {
+            emit_builtin_print_str(cg, node->children[1]);
             return;
         }
     }

@@ -1,0 +1,7 @@
+// aricode - Hello World
+// The universal first program.
+
+fn main() -> i32 {
+    print_str("Hello, World!");
+    return 0;
+}

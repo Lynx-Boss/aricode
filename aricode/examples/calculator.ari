@@ -1,0 +1,28 @@
+// aricode - Interactive Calculator
+// Reads two numbers and shows their arithmetic
+
+fn main() -> i32 {
+    print_str("Enter first number:");
+    let a: i32 = read_int();
+
+    print_str("Enter second number:");
+    let b: i32 = read_int();
+
+    print_str("Sum:");
+    print_int(a + b);
+
+    print_str("Difference:");
+    print_int(a - b);
+
+    print_str("Product:");
+    print_int(a * b);
+
+    if (b > 0) {
+        print_str("Quotient:");
+        print_int(a / b);
+        print_str("Remainder:");
+        print_int(a % b);
+    }
+
+    return 0;
+}

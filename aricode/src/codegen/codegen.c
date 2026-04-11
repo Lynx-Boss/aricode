@@ -594,6 +594,160 @@ static void emit_builtin_print_int(CodegenState *cg, const ASTNode *arg) {
     EMIT(cg, n);
 }
 
+/*
+ * BUILTIN: read_int()
+ * Reads an integer from stdin. Parses ASCII digits, handles optional
+ * leading '-' for negative numbers. Uses sys_read(0, stack_buf, 20).
+ * Result in RAX.
+ */
+static void emit_builtin_read_int(CodegenState *cg) {
+    int n;
+    uint8_t *b;
+
+    /* sub rsp, 24 -- stack buffer */
+    n = emit_sub_reg_imm(BUF(cg), REG_RSP, 24);
+    EMIT(cg, n);
+
+    /* r10 = byte count (index into buffer) */
+    b = BUF(cg);
+    b[0] = 0x4D; b[1] = 0x31; b[2] = 0xD2; EMIT(cg, 3); /* xor r10, r10 */
+
+    /* Read loop: read 1 byte at a time until '\n' or EOF */
+    size_t read_loop = cg->code_size;
+
+    /* sys_read(0, rsp+r10, 1) */
+    n = emit_xor_reg_reg(BUF(cg), REG_RAX, REG_RAX); EMIT(cg, n); /* __NR_read */
+    n = emit_xor_reg_reg(BUF(cg), REG_RDI, REG_RDI); EMIT(cg, n); /* stdin */
+    /* lea rsi, [rsp + r10] */
+    b = BUF(cg);
+    b[0] = 0x4A; b[1] = 0x8D;
+    b[2] = modrm(0, REG_RSI, 4);
+    b[3] = (uint8_t)((0 << 6) | ((REG_R10 & 7) << 3) | (REG_RSP & 7));
+    EMIT(cg, 4);
+    n = emit_mov_reg_imm32(BUF(cg), REG_RDX, 1); EMIT(cg, n); /* 1 byte */
+    n = emit_syscall(BUF(cg)); EMIT(cg, n);
+
+    /* if rax <= 0, done (EOF) */
+    n = emit_test_reg_reg(BUF(cg), REG_RAX, REG_RAX); EMIT(cg, n);
+    size_t jle_pos = cg->code_size;
+    b = BUF(cg); b[0] = 0x7E; b[1] = 0x00; EMIT(cg, 2); /* jle done */
+
+    /* Check if byte is '\n' */
+    /* movzx ecx, byte [rsp + r10] */
+    b = BUF(cg);
+    b[0] = 0x42; b[1] = 0x0F; b[2] = 0xB6;
+    b[3] = modrm(0, REG_RCX, 4);
+    b[4] = (uint8_t)((0 << 6) | ((REG_R10 & 7) << 3) | (REG_RSP & 7));
+    EMIT(cg, 5);
+
+    /* cmp cl, '\n' */
+    b = BUF(cg);
+    b[0] = 0x80; b[1] = 0xF9; b[2] = 0x0A; EMIT(cg, 3);
+
+    /* je done_read */
+    size_t je_done = cg->code_size;
+    b = BUF(cg); b[0] = 0x74; b[1] = 0x00; EMIT(cg, 2);
+
+    /* inc r10 */
+    n = emit_inc_reg(BUF(cg), REG_R10); EMIT(cg, n);
+
+    /* jmp read_loop */
+    int8_t rl_back = (int8_t)((int64_t)read_loop - (int64_t)(cg->code_size + 2));
+    b = BUF(cg); b[0] = 0xEB; b[1] = (uint8_t)rl_back; EMIT(cg, 2);
+
+    /* done_read: patch jumps */
+    cg->code[jle_pos + 1] = (uint8_t)(cg->code_size - (jle_pos + 2));
+    cg->code[je_done + 1] = (uint8_t)(cg->code_size - (je_done + 2));
+
+    /* Now parse: r10 = number of digit bytes in buffer at rsp */
+    /* r11 = result = 0, r9 = sign, rcx = parse index */
+    b = BUF(cg);
+    b[0] = 0x4D; b[1] = 0x31; b[2] = 0xDB; EMIT(cg, 3); /* xor r11, r11 */
+    b = BUF(cg);
+    b[0] = 0x4D; b[1] = 0x31; b[2] = 0xC9; EMIT(cg, 3); /* xor r9, r9 (sign) */
+
+    /* Use rbx as parse index (save it) */
+    n = emit_push(BUF(cg), REG_RBX); EMIT(cg, n);
+    n = emit_xor_reg_reg(BUF(cg), REG_RBX, REG_RBX); EMIT(cg, n); /* rbx = 0 */
+
+    /* Check '-' at buf[0] */
+    b = BUF(cg);
+    b[0] = 0x0F; b[1] = 0xB6; b[2] = modrm(1, REG_RCX, REG_RSP);
+    b[3] = 0x24; b[4] = 8; /* disp8 = 8 (because we pushed rbx) */
+    EMIT(cg, 5);
+    b = BUF(cg);
+    b[0] = 0x80; b[1] = 0xF9; b[2] = '-'; EMIT(cg, 3);
+    size_t jne2 = cg->code_size;
+    b = BUF(cg); b[0] = 0x75; b[1] = 0x00; EMIT(cg, 2);
+    /* negative: r9=1, rbx=1 */
+    b = BUF(cg);
+    b[0] = 0x49; b[1] = 0xC7; b[2] = 0xC1;
+    int32_t one = 1; memcpy(b+3, &one, 4); EMIT(cg, 7);
+    n = emit_mov_reg_imm32(BUF(cg), REG_RBX, 1); EMIT(cg, n);
+    cg->code[jne2 + 1] = (uint8_t)(cg->code_size - (jne2 + 2));
+
+    /* Parse digit loop */
+    size_t ploop = cg->code_size;
+
+    /* cmp rbx, r10 (index >= length?) */
+    b = BUF(cg);
+    b[0] = 0x4C; b[1] = 0x39; b[2] = 0xD3; EMIT(cg, 3); /* cmp rbx, r10 */
+    size_t jge_end = cg->code_size;
+    b = BUF(cg); b[0] = 0x7D; b[1] = 0x00; EMIT(cg, 2);
+
+    /* movzx ecx, byte [rsp + rbx + 8] (8 for pushed rbx) */
+    b = BUF(cg);
+    b[0] = 0x0F; b[1] = 0xB6;
+    b[2] = modrm(1, REG_RCX, 4); /* SIB, disp8 */
+    b[3] = (uint8_t)((0 << 6) | ((REG_RBX & 7) << 3) | (REG_RSP & 7));
+    b[4] = 8;
+    EMIT(cg, 5);
+
+    /* sub cl, '0' */
+    b = BUF(cg); b[0] = 0x80; b[1] = 0xE9; b[2] = '0'; EMIT(cg, 3);
+    /* cmp cl, 9 */
+    b = BUF(cg); b[0] = 0x80; b[1] = 0xF9; b[2] = 9; EMIT(cg, 3);
+    size_t ja2 = cg->code_size;
+    b = BUF(cg); b[0] = 0x77; b[1] = 0x00; EMIT(cg, 2); /* ja done */
+
+    /* r11 = r11 * 10 + digit */
+    b = BUF(cg);
+    b[0] = 0x4D; b[1] = 0x6B; b[2] = 0xDB; b[3] = 10; EMIT(cg, 4); /* imul r11,r11,10 */
+    b = BUF(cg);
+    b[0] = 0x48; b[1] = 0x0F; b[2] = 0xB6; b[3] = 0xC9; EMIT(cg, 4); /* movzx rcx,cl */
+    b = BUF(cg);
+    b[0] = 0x49; b[1] = 0x01; b[2] = 0xCB; EMIT(cg, 3); /* add r11, rcx */
+
+    /* inc rbx */
+    n = emit_inc_reg(BUF(cg), REG_RBX); EMIT(cg, n);
+    int8_t pb = (int8_t)((int64_t)ploop - (int64_t)(cg->code_size + 2));
+    b = BUF(cg); b[0] = 0xEB; b[1] = (uint8_t)pb; EMIT(cg, 2);
+
+    /* patch exits */
+    cg->code[jge_end + 1] = (uint8_t)(cg->code_size - (jge_end + 2));
+    cg->code[ja2 + 1] = (uint8_t)(cg->code_size - (ja2 + 2));
+
+    /* Restore rbx */
+    n = emit_pop(BUF(cg), REG_RBX); EMIT(cg, n);
+
+    /* Negate if sign */
+    b = BUF(cg);
+    b[0] = 0x4D; b[1] = 0x85; b[2] = 0xC9; EMIT(cg, 3); /* test r9, r9 */
+    size_t jz2 = cg->code_size;
+    b = BUF(cg); b[0] = 0x74; b[1] = 0x00; EMIT(cg, 2);
+    b = BUF(cg);
+    b[0] = 0x49; b[1] = 0xF7; b[2] = 0xDB; EMIT(cg, 3); /* neg r11 */
+    cg->code[jz2 + 1] = (uint8_t)(cg->code_size - (jz2 + 2));
+
+    /* mov rax, r11 */
+    b = BUF(cg);
+    b[0] = 0x4C; b[1] = 0x89; b[2] = 0xD8; EMIT(cg, 3);
+
+    /* add rsp, 24 */
+    n = emit_add_reg_imm(BUF(cg), REG_RSP, 24);
+    EMIT(cg, n);
+}
+
 static void emit_call_expr(CodegenState *cg, const ASTNode *node) {
     /*
      * NODE_CALL layout:
@@ -616,6 +770,10 @@ static void emit_call_expr(CodegenState *cg, const ASTNode *node) {
         }
         if (strcmp(callee->string_val, "print_str") == 0 && argc == 1) {
             emit_builtin_print_str(cg, node->children[1]);
+            return;
+        }
+        if (strcmp(callee->string_val, "read_int") == 0 && argc == 0) {
+            emit_builtin_read_int(cg);
             return;
         }
     }

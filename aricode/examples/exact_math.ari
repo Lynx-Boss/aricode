@@ -1,0 +1,31 @@
+// aricode - Exact Decimal Arithmetic
+// The compiler evaluates decimal operations at compile time
+// using AriDecimal (digit-by-digit, no IEEE 754).
+// 0.1 + 0.2 = 0.3 EXACTLY. Not 0.30000000000000004.
+
+fn main() -> i32 {
+    print_str("=== IEEE 754 (f64) ===");
+    let a: f64 = 0.1;
+    let b: f64 = 0.2;
+    print_str("f64: 0.1 + 0.2 =");
+    print_float(a + b);
+
+    print_str("");
+    print_str("=== AriDecimal (exact) ===");
+    print_str("dec: 0.1 + 0.2 =");
+    print_dec(dec("0.1") + dec("0.2"));
+
+    print_str("dec: 1.0 - 0.9 =");
+    print_dec(dec("1.0") - dec("0.9"));
+
+    print_str("dec: 0.1 * 0.1 =");
+    print_dec(dec("0.1") * dec("0.1"));
+
+    print_str("dec: 10.0 / 3.0 =");
+    print_dec(dec("10.0") / dec("3.0"));
+
+    print_str("dec: (10.0 / 3.0) * 3.0 =");
+    print_dec((dec("10.0") / dec("3.0")) * dec("3.0"));
+
+    return 0;
+}

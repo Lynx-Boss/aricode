@@ -7,6 +7,8 @@
  */
 
 #include "optimizer.h"
+#include "../decimal/decimal.h"
+#include "../decimal/decimal_ops.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -344,6 +346,113 @@ static int optimizer_strength_reduce(ASTNode *root) {
 }
 
 /* ================================================================== */
+/*  Decimal Constant Folding                                          */
+/* ================================================================== */
+
+/*
+ * Fold decimal operations at compile time using AriDecimal.
+ * Detects patterns like: dec_add(dec("0.1"), dec("0.2"))
+ * and evaluates them to dec("0.3") at compile time.
+ *
+ * This is what makes aricode unique: 0.1 + 0.2 = 0.3 EXACTLY.
+ * No IEEE 754 error. The computation happens in the compiler.
+ */
+
+/* Check if a node is a call to dec("...") with a string literal arg */
+static int is_dec_literal_call(const ASTNode *node) {
+    if (!node || node->type != NODE_CALL) return 0;
+    if (node->child_count < 2) return 0;
+    ASTNode *callee = node->children[0];
+    if (callee->type != NODE_IDENTIFIER || !callee->string_val) return 0;
+    if (strcmp(callee->string_val, "dec") != 0) return 0;
+    ASTNode *arg = node->children[1];
+    return arg->type == NODE_STRING_LITERAL && arg->string_val != NULL;
+}
+
+static const char *get_dec_value(const ASTNode *node) {
+    return node->children[1]->string_val;
+}
+
+/*
+ * Try to fold a binary op where both operands are dec("...") calls.
+ * Evaluates at compile time and replaces with a new dec("result") call.
+ */
+static int try_fold_decimal(ASTNode *node) {
+    if (node->type != NODE_BINARY_OP || !node->op) return 0;
+    if (node->child_count < 2) return 0;
+
+    ASTNode *left = node->children[0];
+    ASTNode *right = node->children[1];
+
+    if (!is_dec_literal_call(left) || !is_dec_literal_call(right)) return 0;
+
+    const char *lval = get_dec_value(left);
+    const char *rval = get_dec_value(right);
+    const char *op = node->op;
+
+    /* Parse decimals */
+    AriDecimal a = ari_dec_from_string(lval);
+    AriDecimal b = ari_dec_from_string(rval);
+    AriDecimal result;
+
+    if (strcmp(op, "+") == 0) {
+        result = ari_dec_add(&a, &b);
+    } else if (strcmp(op, "-") == 0) {
+        result = ari_dec_sub(&a, &b);
+    } else if (strcmp(op, "*") == 0) {
+        result = ari_dec_mul(&a, &b);
+    } else if (strcmp(op, "/") == 0) {
+        result = ari_dec_div(&a, &b, 20);
+    } else {
+        ari_dec_free(&a);
+        ari_dec_free(&b);
+        return 0;
+    }
+
+    /* Convert result to string */
+    char buf[128];
+    ari_dec_to_string(&result, buf, sizeof(buf));
+
+    /* Replace this BINARY_OP node with a CALL to dec("result") */
+    /* Reuse the node structure: make it a CALL to dec with the result string */
+    for (size_t i = 0; i < node->child_count; i++)
+        ast_free(node->children[i]);
+    free(node->children);
+    free(node->op);
+
+    node->type = NODE_CALL;
+    node->op = NULL;
+    node->children = NULL;
+    node->child_count = 0;
+    node->child_cap = 0;
+
+    /* Add callee: identifier "dec" */
+    ASTNode *callee = ast_create_node(NODE_IDENTIFIER, node->line, node->col);
+    callee->string_val = strdup("dec");
+    ast_add_child(node, callee);
+
+    /* Add arg: string literal with result */
+    ASTNode *arg = ast_create_node(NODE_STRING_LITERAL, node->line, node->col);
+    arg->string_val = strdup(buf);
+    ast_add_child(node, arg);
+
+    ari_dec_free(&a);
+    ari_dec_free(&b);
+    ari_dec_free(&result);
+
+    return 1;
+}
+
+static int fold_decimals(ASTNode *node) {
+    if (!node) return 0;
+    int count = 0;
+    for (size_t i = 0; i < node->child_count; i++)
+        count += fold_decimals(node->children[i]);
+    count += try_fold_decimal(node);
+    return count;
+}
+
+/* ================================================================== */
 /*  Main optimizer entry point                                        */
 /* ================================================================== */
 
@@ -364,6 +473,9 @@ int optimizer_run(ASTNode *root) {
 
     /* Dead code elimination */
     total += optimizer_dead_code_elim(root);
+
+    /* Decimal constant folding - evaluate exact arithmetic at compile time */
+    total += fold_decimals(root);
 
     return total;
 }

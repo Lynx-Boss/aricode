@@ -11,6 +11,7 @@ LEXER_DIR   = ../lexer
 PARSER_DIR  = ../parser
 ERRORS_DIR  = ../errors
 CODEGEN_DIR = ../codegen
+DECIMAL_DIR = ../decimal
 COMPILER_DIR = .
 
 # Source files
@@ -25,10 +26,12 @@ SRCS = \
 	$(ERRORS_DIR)/podium.c \
 	$(CODEGEN_DIR)/codegen.c \
 	$(CODEGEN_DIR)/optimizer.c \
-	$(CODEGEN_DIR)/elf.c
+	$(CODEGEN_DIR)/elf.c \
+	$(DECIMAL_DIR)/decimal.c \
+	$(DECIMAL_DIR)/decimal_ops.c
 
 # Include paths
-INCLUDES = -I$(COMPILER_DIR) -I$(LEXER_DIR) -I$(PARSER_DIR) -I$(ERRORS_DIR) -I$(CODEGEN_DIR)
+INCLUDES = -I$(COMPILER_DIR) -I$(LEXER_DIR) -I$(PARSER_DIR) -I$(ERRORS_DIR) -I$(CODEGEN_DIR) -I$(DECIMAL_DIR)
 
 # Output binary
 TARGET = aric

@@ -1,0 +1,78 @@
+// aricode - Challenge 12: Perceptron Neural Network
+// Train a single neuron to learn the AND gate
+// Fixed-point arithmetic (scale=1000): no floats needed
+// 1000 training epochs x 4 samples = 4000 weight updates
+// Return: number of correct predictions after training (expect 4)
+//
+// This is the fundamental building block of all neural networks.
+// Frank Rosenblatt, 1957.
+
+fn train_and_predict() -> i32 {
+    // Weights and bias (fixed-point, scale 1000)
+    let w1: i32 = 0;
+    let w2: i32 = 0;
+    let bias: i32 = 0;
+    let lr: i32 = 100;
+
+    // Train for 1000 epochs
+    let epoch: i32 = 0;
+    while (epoch < 1000) {
+        // Sample 0: (0,0) -> 0
+        let out: i32 = bias;
+        let pred: i32 = 0;
+        if (out > 500) { pred = 1000; }
+        let err: i32 = 0 - pred;
+        bias = bias + lr * err / 1000;
+
+        // Sample 1: (0,1) -> 0
+        out = w2 * 1000 / 1000 + bias;
+        pred = 0;
+        if (out > 500) { pred = 1000; }
+        err = 0 - pred;
+        w2 = w2 + lr * err * 1000 / 1000 / 1000;
+        bias = bias + lr * err / 1000;
+
+        // Sample 2: (1,0) -> 0
+        out = w1 * 1000 / 1000 + bias;
+        pred = 0;
+        if (out > 500) { pred = 1000; }
+        err = 0 - pred;
+        w1 = w1 + lr * err * 1000 / 1000 / 1000;
+        bias = bias + lr * err / 1000;
+
+        // Sample 3: (1,1) -> 1
+        out = w1 * 1000 / 1000 + w2 * 1000 / 1000 + bias;
+        pred = 0;
+        if (out > 500) { pred = 1000; }
+        err = 1000 - pred;
+        w1 = w1 + lr * err * 1000 / 1000 / 1000;
+        w2 = w2 + lr * err * 1000 / 1000 / 1000;
+        bias = bias + lr * err / 1000;
+
+        epoch = epoch + 1;
+    }
+
+    // Test: count correct predictions
+    let correct: i32 = 0;
+
+    // (0,0) -> expect 0
+    if (bias <= 500) { correct = correct + 1; }
+
+    // (0,1) -> expect 0
+    let t: i32 = w2 + bias;
+    if (t <= 500) { correct = correct + 1; }
+
+    // (1,0) -> expect 0
+    t = w1 + bias;
+    if (t <= 500) { correct = correct + 1; }
+
+    // (1,1) -> expect 1
+    t = w1 + w2 + bias;
+    if (t > 500) { correct = correct + 1; }
+
+    return correct;
+}
+
+fn main() -> i32 {
+    return train_and_predict();
+}

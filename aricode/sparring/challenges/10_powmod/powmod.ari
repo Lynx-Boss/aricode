@@ -1,0 +1,22 @@
+// aricode - Challenge 10: Modular Exponentiation
+// Compute 7^19 mod 211 = 85 (RSA cryptographic primitive)
+// Binary exponentiation by squaring: O(log n) multiplications
+// The optimizer converts: % 2 -> & 1, / 2 -> >> 1 (strength reduction)
+
+fn powmod(base: i32, exp: i32, m: i32) -> i32 {
+    let result: i32 = 1;
+    let b: i32 = base % m;
+    let e: i32 = exp;
+    while (e > 0) {
+        if (e % 2 == 1) {
+            result = result * b % m;
+        }
+        e = e / 2;
+        b = b * b % m;
+    }
+    return result;
+}
+
+fn main() -> i32 {
+    return powmod(7, 19, 211);
+}

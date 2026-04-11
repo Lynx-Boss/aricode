@@ -1,0 +1,27 @@
+// aricode - Challenge 09: Prime Counting
+// Count primes below 100 = 25
+// Nested loop: outer iterates candidates, inner tests divisibility
+// Tests: nested while, modular arithmetic, early exit, counter
+
+fn is_prime(n: i32) -> i32 {
+    if (n < 2) { return 0; }
+    if (n % 2 == 0) { return n == 2; }
+    let d: i32 = 3;
+    while (d * d <= n) {
+        if (n % d == 0) { return 0; }
+        d = d + 2;
+    }
+    return 1;
+}
+
+fn main() -> i32 {
+    let count: i32 = 0;
+    let n: i32 = 2;
+    while (n < 100) {
+        if (is_prime(n) == 1) {
+            count = count + 1;
+        }
+        n = n + 1;
+    }
+    return count;
+}

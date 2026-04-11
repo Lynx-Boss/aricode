@@ -1,0 +1,19 @@
+// aricode - Challenge 11: Integer Square Root (Newton's Method)
+// Compute isqrt(16129) = 127  (127^2 = 16129)
+// Newton-Raphson convergence: x_{n+1} = (x_n + n/x_n) / 2
+// Tests: while loop, division, convergence detection
+
+fn isqrt(n: i32) -> i32 {
+    if (n < 2) { return n; }
+    let x: i32 = n;
+    let y: i32 = (x + 1) / 2;
+    while (y < x) {
+        x = y;
+        y = (x + n / x) / 2;
+    }
+    return x;
+}
+
+fn main() -> i32 {
+    return isqrt(16129);
+}

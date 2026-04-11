@@ -1,0 +1,16 @@
+// aricode - Challenge 08: Euclidean GCD
+// Compute GCD(462, 1071) = 21
+// Euclid's algorithm (~300 BC) - oldest known non-trivial algorithm
+
+fn gcd(a: i32, b: i32) -> i32 {
+    while (b > 0) {
+        let t: i32 = b;
+        b = a % b;
+        a = t;
+    }
+    return a;
+}
+
+fn main() -> i32 {
+    return gcd(462, 1071);
+}

@@ -1,9 +1,9 @@
 label,binary_name,binary_size,text_size,instructions,exec_time_ns,startup_time_ns
-Python3,python3,212,N/A,N/A,7668421,7654918
-aricode,fib_aricode,268,148,49,280807,277075
-NASM asm,fib_asm,408,69,24,283468,289944
-C (gcc -O0),fib_gcc_O0,754256,640407,120065,400823,405793
-C (gcc -O2),fib_gcc_O2,758352,641343,120332,397928,407741
-C (gcc -O2 dyn),fib_gcc_O2_dyn,15856,2244,368,539237,538796
-C (gcc -O3),fib_gcc_O3,758352,641375,120344,399779,418516
-C (gcc -Os),fib_gcc_Os,754256,640343,120049,400342,411765
+Python3,python3,212,N/A,N/A,7728592,7710774
+aricode,fib_aricode,268,148,49,292294,299646
+NASM asm,fib_asm,408,69,24,289387,299037
+C (gcc -O0),fib_gcc_O0,754256,640407,120065,414655,419336
+C (gcc -O2),fib_gcc_O2,758352,641343,120332,409206,417033
+C (gcc -O2 dyn),fib_gcc_O2_dyn,15856,2244,368,540695,534260
+C (gcc -O3),fib_gcc_O3,758352,641375,120344,399325,417980
+C (gcc -Os),fib_gcc_Os,754256,640343,120049,403994,405852

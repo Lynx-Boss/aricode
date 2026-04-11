@@ -1,9 +1,9 @@
 label,binary_name,binary_size,text_size,instructions,exec_time_ns,startup_time_ns
-Python3,python3,404,N/A,N/A,7766810,7716523
-aricode,collatz_aricode,330,210,70,275365,275566
-NASM asm,collatz_asm,408,71,24,279403,289368
-C (gcc -O0),collatz_gcc_O0,754272,640407,120069,397807,405217
-C (gcc -O2),collatz_gcc_O2,754272,640383,120062,397045,414665
-C (gcc -O2 dyn),collatz_gcc_O2_dyn,15872,1318,106,533272,532626
-C (gcc -O3),collatz_gcc_O3,754272,640511,120098,397624,391788
-C (gcc -Os),collatz_gcc_Os,754272,640319,120048,395435,400473
+Python3,python3,404,N/A,N/A,7778754,7788970
+aricode,collatz_aricode,330,210,70,289028,301847
+NASM asm,collatz_asm,408,71,24,288322,296947
+C (gcc -O0),collatz_gcc_O0,754272,640407,120069,410181,413438
+C (gcc -O2),collatz_gcc_O2,754272,640383,120062,406154,417168
+C (gcc -O2 dyn),collatz_gcc_O2_dyn,15872,1318,106,539149,549652
+C (gcc -O3),collatz_gcc_O3,754272,640511,120098,396467,399665
+C (gcc -Os),collatz_gcc_Os,754272,640319,120048,402826,408926

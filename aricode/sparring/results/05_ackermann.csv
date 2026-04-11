@@ -1,9 +1,9 @@
 label,binary_name,binary_size,text_size,instructions,exec_time_ns,startup_time_ns
-Python3,python3,363,N/A,N/A,8228746,7689661
-aricode,ack_aricode,345,225,75,305343,317675
-NASM asm,ack_asm,416,75,27,283473,300956
-C (gcc -O0),ack_gcc_O0,754256,640471,120082,417556,419435
-C (gcc -O2),ack_gcc_O2,754256,640775,120173,395626,404968
-C (gcc -O2 dyn),ack_gcc_O2_dyn,15856,1676,209,534229,501704
-C (gcc -O3),ack_gcc_O3,758352,640847,120191,398571,397576
-C (gcc -Os),ack_gcc_Os,754256,640327,120050,406655,408138
+Python3,python3,363,N/A,N/A,8256848,7828923
+aricode,ack_aricode,345,225,75,312850,313152
+NASM asm,ack_asm,416,75,27,296494,311664
+C (gcc -O0),ack_gcc_O0,754256,640471,120082,426327,430421
+C (gcc -O2),ack_gcc_O2,754256,640775,120173,412321,416288
+C (gcc -O2 dyn),ack_gcc_O2_dyn,15856,1676,209,548103,547201
+C (gcc -O3),ack_gcc_O3,758352,640847,120191,410794,421365
+C (gcc -Os),ack_gcc_Os,754256,640327,120050,415743,415404

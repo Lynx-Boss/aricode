@@ -35,7 +35,13 @@ CHALLENGES["03_factorial"]="fact:120:Factorial (5!=120)"
 CHALLENGES["05_ackermann"]="ack:125:Ackermann A(3,4)=125 [>10K recursive calls]"
 CHALLENGES["06_collatz"]="collatz:178:Collatz(871)=178 [UNSOLVED conjecture, peaks at 190996]"
 CHALLENGES["07_mersenne"]="mersenne:1:Mersenne M31=2^31-1 prime verification [23K divisors, 10-digit number]"
-CHALLENGE_ORDER=("01_add" "02_fib" "03_factorial" "05_ackermann" "06_collatz" "07_mersenne")
+CHALLENGES["08_gcd"]="gcd:21:Euclidean GCD(462,1071)=21 [oldest algorithm, ~300 BC]"
+CHALLENGES["09_primecount"]="primecount:25:Count primes below 100 [nested loops, trial division]"
+CHALLENGES["10_powmod"]="powmod:85:Modular exponentiation 7^19 mod 211 [crypto primitive]"
+CHALLENGES["11_isqrt"]="isqrt:127:Integer sqrt(16129)=127 [Newton-Raphson convergence]"
+CHALLENGES["12_perceptron"]="perceptron:4:Perceptron AND gate [1000 epochs, neural network]"
+CHALLENGES["13_minimax"]="minimax:3:Minimax Nim(15) [game AI, 500K+ tree nodes]"
+CHALLENGE_ORDER=("01_add" "02_fib" "03_factorial" "05_ackermann" "06_collatz" "07_mersenne" "08_gcd" "09_primecount" "10_powmod" "11_isqrt" "12_perceptron" "13_minimax")
 
 # ── Setup ───────────────────────────────────────────────────────────────────
 

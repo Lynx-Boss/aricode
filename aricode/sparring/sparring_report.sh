@@ -39,7 +39,13 @@ CHALLENGE_NAMES["03_factorial"]="Factorial (5!=120)"
 CHALLENGE_NAMES["05_ackermann"]="Ackermann A(3,4)=125 [HEAVY RECURSION]"
 CHALLENGE_NAMES["06_collatz"]="Collatz(871)=178 [UNSOLVED CONJECTURE]"
 CHALLENGE_NAMES["07_mersenne"]="Mersenne M31=2^31-1 PRIME [23K divisors, 10 digits]"
-CHALLENGE_ORDER=("01_add" "02_fib" "03_factorial" "05_ackermann" "06_collatz" "07_mersenne")
+CHALLENGE_NAMES["08_gcd"]="Euclidean GCD(462,1071)=21 [oldest algorithm]"
+CHALLENGE_NAMES["09_primecount"]="Prime count < 100 = 25 [nested loops]"
+CHALLENGE_NAMES["10_powmod"]="Powmod 7^19 mod 211 = 85 [crypto primitive]"
+CHALLENGE_NAMES["11_isqrt"]="Integer sqrt(16129) = 127 [Newton-Raphson]"
+CHALLENGE_NAMES["12_perceptron"]="Perceptron AND gate [NEURAL NETWORK]"
+CHALLENGE_NAMES["13_minimax"]="Minimax Nim(15) [GAME AI]"
+CHALLENGE_ORDER=("01_add" "02_fib" "03_factorial" "05_ackermann" "06_collatz" "07_mersenne" "08_gcd" "09_primecount" "10_powmod" "11_isqrt" "12_perceptron" "13_minimax")
 
 # ── Formatting helpers ──────────────────────────────────────────────────────
 

@@ -1,0 +1,9 @@
+label,binary_name,binary_size,text_size,instructions,exec_time_ns,startup_time_ns
+Python3,python3,799,N/A,N/A,8436369,7621918
+aricode,perceptron_aricode,1576,0,0,313734,325502
+NASM asm,perceptron_asm,4808,289,92,292220,301160
+C (gcc -O0),perceptron_gcc_O0,758376,640919,120216,419620,418117
+C (gcc -O2),perceptron_gcc_O2,754280,640447,120084,402195,407908
+C (gcc -O2 dyn),perceptron_gcc_O2_dyn,15880,1401,130,531022,531189
+C (gcc -O3),perceptron_gcc_O3,754280,640447,120084,396430,409949
+C (gcc -Os),perceptron_gcc_Os,754280,640511,120104,408443,405715

@@ -72,9 +72,15 @@ CHALLENGES["03_factorial"]="fact:120"
 CHALLENGES["05_ackermann"]="ack:125"
 CHALLENGES["06_collatz"]="collatz:178"
 CHALLENGES["07_mersenne"]="mersenne:1"
+CHALLENGES["08_gcd"]="gcd:21"
+CHALLENGES["09_primecount"]="primecount:25"
+CHALLENGES["10_powmod"]="powmod:85"
+CHALLENGES["11_isqrt"]="isqrt:127"
+CHALLENGES["12_perceptron"]="perceptron:4"
+CHALLENGES["13_minimax"]="minimax:3"
 
 # Sorted keys
-CHALLENGE_ORDER=("01_add" "02_fib" "03_factorial" "05_ackermann" "06_collatz" "07_mersenne")
+CHALLENGE_ORDER=("01_add" "02_fib" "03_factorial" "05_ackermann" "06_collatz" "07_mersenne" "08_gcd" "09_primecount" "10_powmod" "11_isqrt" "12_perceptron" "13_minimax")
 
 # ── Build functions ─────────────────────────────────────────────────────────
 

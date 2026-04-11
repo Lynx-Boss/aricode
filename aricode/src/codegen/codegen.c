@@ -57,9 +57,13 @@ static void emit_block(CodegenState *cg, const ASTNode *node);
 /* ------------------------------------------------------------------ */
 
 static LocalVar *find_local(CodegenState *cg, const char *name) {
-    for (size_t i = 0; i < cg->local_count; i++) {
-        if (strcmp(cg->locals[i].name, name) == 0)
-            return &cg->locals[i];
+    /* Search from the END to find the most recently declared variable.
+     * This is critical for variables declared inside while loops --
+     * each iteration creates a new stack slot, and we must always
+     * reference the latest one. */
+    for (size_t i = cg->local_count; i > 0; i--) {
+        if (strcmp(cg->locals[i - 1].name, name) == 0)
+            return &cg->locals[i - 1];
     }
     return NULL;
 }

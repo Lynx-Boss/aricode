@@ -1,0 +1,65 @@
+// aricode - Challenge 13: Minimax Game AI
+// Nim game: 15 stones, take 1-3 per turn, last take wins
+// Full game tree search (~500K+ nodes) to find optimal first move
+// Return: optimal move (3) - take 3 stones, leaving 12 (losing for opponent)
+//
+// Minimax is the foundation of chess engines, Go AI, and game theory.
+// John von Neumann, 1928.
+
+fn minimax(stones: i32, maximizing: i32) -> i32 {
+    if (stones == 0) {
+        if (maximizing == 1) {
+            return 0 - 1;
+        }
+        return 1;
+    }
+
+    if (maximizing == 1) {
+        let best: i32 = 0 - 100;
+        let take: i32 = 1;
+        while (take <= 3) {
+            if (take <= stones) {
+                let score: i32 = minimax(stones - take, 0);
+                if (score > best) {
+                    best = score;
+                }
+            }
+            take = take + 1;
+        }
+        return best;
+    }
+
+    let best: i32 = 100;
+    let take: i32 = 1;
+    while (take <= 3) {
+        if (take <= stones) {
+            let score: i32 = minimax(stones - take, 1);
+            if (score < best) {
+                best = score;
+            }
+        }
+        take = take + 1;
+    }
+    return best;
+}
+
+fn find_best_move(stones: i32) -> i32 {
+    let best_move: i32 = 1;
+    let best_score: i32 = 0 - 100;
+    let take: i32 = 1;
+    while (take <= 3) {
+        if (take <= stones) {
+            let score: i32 = minimax(stones - take, 0);
+            if (score > best_score) {
+                best_score = score;
+                best_move = take;
+            }
+        }
+        take = take + 1;
+    }
+    return best_move;
+}
+
+fn main() -> i32 {
+    return find_best_move(15);
+}

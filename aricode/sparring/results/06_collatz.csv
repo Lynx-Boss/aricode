@@ -1,9 +1,11 @@
 label,binary_name,binary_size,text_size,instructions,exec_time_ns,startup_time_ns
-Python3,python3,404,N/A,N/A,7778754,7788970
-aricode,collatz_aricode,330,210,70,289028,301847
-NASM asm,collatz_asm,408,71,24,288322,296947
-C (gcc -O0),collatz_gcc_O0,754272,640407,120069,410181,413438
-C (gcc -O2),collatz_gcc_O2,754272,640383,120062,406154,417168
-C (gcc -O2 dyn),collatz_gcc_O2_dyn,15872,1318,106,539149,549652
-C (gcc -O3),collatz_gcc_O3,754272,640511,120098,396467,399665
-C (gcc -Os),collatz_gcc_Os,754272,640319,120048,402826,408926
+Python3,python3,404,N/A,N/A,7745019,7618266
+aricode,collatz_aricode,330,210,70,276448,278472
+NASM asm,collatz_asm,408,71,24,274355,283195
+C (gcc -O0),collatz_gcc_O0,754272,640407,120069,389100,394356
+C (gcc -O2),collatz_gcc_O2,754272,640383,120062,387083,397480
+C (gcc -O2 dyn),collatz_gcc_O2_dyn,15872,1318,106,516990,519738
+C (gcc -O3),collatz_gcc_O3,754272,640511,120098,385126,390470
+C (gcc -Os),collatz_gcc_Os,754272,640319,120048,385710,396705
+Go,collatz_go,1874261,1171602,142436,964514,956904
+Rust,collatz_rust,11382368,361559,71716,702611,710161

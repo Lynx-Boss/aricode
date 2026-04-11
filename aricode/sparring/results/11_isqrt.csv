@@ -1,9 +1,11 @@
 label,binary_name,binary_size,text_size,instructions,exec_time_ns,startup_time_ns
-Python3,python3,293,N/A,N/A,7680846,7706657
-aricode,isqrt_aricode,373,253,84,289186,295029
-NASM asm,isqrt_asm,416,73,27,285367,290983
-C (gcc -O0),isqrt_gcc_O0,754264,640407,120073,404823,411615
-C (gcc -O2),isqrt_gcc_O2,754264,640447,120082,405270,419209
-C (gcc -O2 dyn),isqrt_gcc_O2_dyn,15856,1365,124,537845,540097
-C (gcc -O3),isqrt_gcc_O3,754264,640447,120082,408407,409085
-C (gcc -Os),isqrt_gcc_Os,754264,640319,120050,402572,419028
+Python3,python3,293,N/A,N/A,7802590,7747072
+aricode,isqrt_aricode,373,253,84,272177,281489
+NASM asm,isqrt_asm,416,73,27,278411,281375
+C (gcc -O0),isqrt_gcc_O0,754264,640407,120073,386913,391946
+C (gcc -O2),isqrt_gcc_O2,754264,640447,120082,391388,397869
+C (gcc -O2 dyn),isqrt_gcc_O2_dyn,15856,1365,124,520464,528491
+C (gcc -O3),isqrt_gcc_O3,754264,640447,120082,383486,386725
+C (gcc -Os),isqrt_gcc_Os,754264,640319,120050,384176,401353
+Go,isqrt_go,1873339,1171418,142404,948190,954349
+Rust,isqrt_rust,11382360,361527,71703,698072,705422

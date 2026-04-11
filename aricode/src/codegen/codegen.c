@@ -1179,6 +1179,16 @@ static void emit_call_expr(CodegenState *cg, const ASTNode *node) {
             EMIT(cg, pn);
             return;
         }
+
+        /* read_float(): read f64 from stdin (reads int, converts to float) */
+        if (strcmp(callee->string_val, "read_float") == 0 && argc == 0) {
+            /* Read an integer via read_int, then convert to float */
+            emit_builtin_read_int(cg);
+            /* RAX = integer value, convert to f64 */
+            int pn = emit_cvtsi2sd(BUF(cg), 0, REG_RAX); EMIT(cg, pn);
+            pn = emit_movq_reg_xmm(BUF(cg), REG_RAX, 0); EMIT(cg, pn);
+            return;
+        }
     }
 
     if (argc > SYS_V_ARG_COUNT) {

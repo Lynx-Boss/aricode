@@ -1,0 +1,37 @@
+// aricode - Number Guessing Game
+// Guess the number between 1 and 100!
+// Demonstrates: while loops, read_int, if/else, counters
+
+fn main() -> i32 {
+    print_str("=== ARICODE GUESSING GAME ===");
+    print_str("I'm thinking of a number between 1 and 100.");
+
+    let target: i32 = 42;
+    let attempts: i32 = 0;
+    let found: i32 = 0;
+
+    while (found == 0) {
+        print_str("Your guess:");
+        let guess: i32 = read_int();
+        attempts = attempts + 1;
+
+        if (guess == target) {
+            found = 1;
+            print_str("CORRECT!");
+        }
+        if (guess < target) {
+            if (found == 0) {
+                print_str("Too low!");
+            }
+        }
+        if (guess > target) {
+            if (found == 0) {
+                print_str("Too high!");
+            }
+        }
+    }
+
+    print_str("Attempts:");
+    print_int(attempts);
+    return 0;
+}

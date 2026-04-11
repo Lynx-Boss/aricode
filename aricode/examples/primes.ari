@@ -1,0 +1,24 @@
+// aricode - Print all prime numbers below 100
+// Demonstrates: for loops, while loops, functions, print_int
+
+fn is_prime(n: i32) -> i32 {
+    if (n < 2) { return 0; }
+    if (n % 2 == 0) { return n == 2; }
+    let d: i32 = 3;
+    while (d * d <= n) {
+        if (n % d == 0) { return 0; }
+        d = d + 2;
+    }
+    return 1;
+}
+
+fn main() -> i32 {
+    let count: i32 = 0;
+    for (let n: i32 = 2; n < 100; n = n + 1) {
+        if (is_prime(n) == 1) {
+            print_int(n);
+            count = count + 1;
+        }
+    }
+    return count;
+}

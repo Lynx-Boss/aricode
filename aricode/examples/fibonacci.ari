@@ -1,0 +1,16 @@
+// aricode - Print Fibonacci sequence
+// Demonstrates: while loops, print_int, variable swap
+
+fn main() -> i32 {
+    let a: i32 = 0;
+    let b: i32 = 1;
+    let count: i32 = 0;
+    while (count < 20) {
+        print_int(a);
+        let next: i32 = a + b;
+        a = b;
+        b = next;
+        count = count + 1;
+    }
+    return 0;
+}

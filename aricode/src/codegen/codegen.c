@@ -350,6 +350,179 @@ static void emit_unary_op(CodegenState *cg, const ASTNode *node) {
     }
 }
 
+/*
+ * BUILTIN: print_int(n)
+ * Prints an integer to stdout followed by a newline.
+ * Uses a 24-byte stack buffer, fills digits right-to-left,
+ * then calls sys_write(1, buf, len).
+ *
+ * This makes aricode a REAL language - it can produce output.
+ */
+static void emit_builtin_print_int(CodegenState *cg, const ASTNode *arg) {
+    int n;
+    uint8_t *b;
+
+    /* Evaluate argument -> RAX */
+    emit_expression(cg, arg);
+
+    /* sub rsp, 24  -- allocate stack buffer */
+    n = emit_sub_reg_imm(BUF(cg), REG_RSP, 24);
+    EMIT(cg, n);
+
+    /* r10 = write position (starts at end: rsp+22 for newline) */
+    /* lea r10, [rsp+23] */
+    b = BUF(cg);
+    b[0] = rex(1, 1, 0, 0);  /* REX.WR */
+    b[1] = 0x8D;
+    b[2] = modrm(1, REG_R10 & 7, REG_RSP);  /* mod=01, disp8 */
+    b[3] = 0x24;  /* SIB: base=RSP */
+    b[4] = 23;    /* disp8 */
+    EMIT(cg, 5);
+
+    /* mov byte [r10], 0x0A  -- newline at end */
+    b = BUF(cg);
+    b[0] = 0x41; b[1] = 0xC6; b[2] = 0x02; b[3] = 0x0A;
+    EMIT(cg, 4);
+
+    /* r11 = 1 (length starts at 1 for newline) */
+    b = BUF(cg);
+    b[0] = rex(1, 0, 0, 1); /* REX.WB */
+    b[1] = 0xC7;
+    b[2] = modrm(3, 0, REG_R11 & 7);
+    int32_t one = 1;
+    memcpy(b + 3, &one, 4);
+    EMIT(cg, 7);
+
+    /* Check if negative: test rax, rax */
+    n = emit_test_reg_reg(BUF(cg), REG_RAX, REG_RAX);
+    EMIT(cg, n);
+
+    /* Save sign flag in r9 (0 = positive, 1 = negative) */
+    /* setns would be complex, just use jns to skip neg */
+    /* mov r9d, 0 */
+    b = BUF(cg);
+    b[0] = 0x41; b[1] = 0xB9; memset(b+2, 0, 4);
+    EMIT(cg, 6);
+
+    /* jns .positive */
+    size_t jns_pos = cg->code_size;
+    b = BUF(cg); b[0] = 0x79; b[1] = 0x00;
+    EMIT(cg, 2);
+
+    /* neg rax */
+    n = emit_neg_reg(BUF(cg), REG_RAX);
+    EMIT(cg, n);
+
+    /* mov r9d, 1 (flag: was negative) */
+    b = BUF(cg);
+    b[0] = 0x41; b[1] = 0xB9;
+    int32_t ione = 1; memcpy(b+2, &ione, 4);
+    EMIT(cg, 6);
+
+    /* patch jns */
+    cg->code[jns_pos + 1] = (uint8_t)(cg->code_size - (jns_pos + 2));
+
+    /* Handle zero specially */
+    n = emit_test_reg_reg(BUF(cg), REG_RAX, REG_RAX);
+    EMIT(cg, n);
+    size_t jnz_pos = cg->code_size;
+    b = BUF(cg); b[0] = 0x75; b[1] = 0x00;
+    EMIT(cg, 2);
+
+    /* Zero case: put '0' before newline */
+    /* dec r10 */
+    n = emit_dec_reg(BUF(cg), REG_R10);
+    EMIT(cg, n);
+    /* mov byte [r10], '0' */
+    b = BUF(cg);
+    b[0] = 0x41; b[1] = 0xC6; b[2] = 0x02; b[3] = '0';
+    EMIT(cg, 4);
+    /* inc r11 */
+    n = emit_inc_reg(BUF(cg), REG_R11);
+    EMIT(cg, n);
+    /* jmp to write */
+    size_t jmp_write_pos = cg->code_size;
+    b = BUF(cg); b[0] = 0xEB; b[1] = 0x00;
+    EMIT(cg, 2);
+
+    /* patch jnz (skip zero case) */
+    cg->code[jnz_pos + 1] = (uint8_t)(cg->code_size - (jnz_pos + 2));
+
+    /* Digit extraction loop: rax / 10, remainder + '0' -> buffer */
+    size_t digit_loop = cg->code_size;
+
+    /* mov rcx, 10 */
+    n = emit_mov_reg_imm32(BUF(cg), REG_RCX, 10);
+    EMIT(cg, n);
+    /* xor edx, edx */
+    n = emit_xor_reg_reg(BUF(cg), REG_RDX, REG_RDX);
+    EMIT(cg, n);
+    /* div rcx (unsigned: rax = quotient, rdx = remainder) */
+    b = BUF(cg);
+    b[0] = rex(1, 0, 0, 0); b[1] = 0xF7; b[2] = modrm(3, 6, REG_RCX);
+    EMIT(cg, 3);
+    /* add dl, '0' */
+    b = BUF(cg);
+    b[0] = 0x80; b[1] = 0xC2; b[2] = '0';
+    EMIT(cg, 3);
+    /* dec r10 */
+    n = emit_dec_reg(BUF(cg), REG_R10);
+    EMIT(cg, n);
+    /* mov [r10], dl */
+    b = BUF(cg);
+    b[0] = 0x41; b[1] = 0x88; b[2] = 0x12;
+    EMIT(cg, 3);
+    /* inc r11 */
+    n = emit_inc_reg(BUF(cg), REG_R11);
+    EMIT(cg, n);
+    /* test rax, rax */
+    n = emit_test_reg_reg(BUF(cg), REG_RAX, REG_RAX);
+    EMIT(cg, n);
+    /* jnz digit_loop */
+    int8_t loop_back = (int8_t)((int64_t)digit_loop - (int64_t)(cg->code_size + 2));
+    b = BUF(cg); b[0] = 0x75; b[1] = (uint8_t)loop_back;
+    EMIT(cg, 2);
+
+    /* If negative: prepend '-' */
+    /* test r9d, r9d */
+    b = BUF(cg);
+    b[0] = 0x45; b[1] = 0x85; b[2] = 0xC9;
+    EMIT(cg, 3);
+    /* jz .write */
+    size_t jz_write = cg->code_size;
+    b = BUF(cg); b[0] = 0x74; b[1] = 0x00;
+    EMIT(cg, 2);
+    /* dec r10 */
+    n = emit_dec_reg(BUF(cg), REG_R10);
+    EMIT(cg, n);
+    /* mov byte [r10], '-' */
+    b = BUF(cg);
+    b[0] = 0x41; b[1] = 0xC6; b[2] = 0x02; b[3] = '-';
+    EMIT(cg, 4);
+    /* inc r11 */
+    n = emit_inc_reg(BUF(cg), REG_R11);
+    EMIT(cg, n);
+
+    /* patch jz and jmp_write */
+    cg->code[jz_write + 1] = (uint8_t)(cg->code_size - (jz_write + 2));
+    cg->code[jmp_write_pos + 1] = (uint8_t)(cg->code_size - (jmp_write_pos + 2));
+
+    /* sys_write(1, r10, r11) */
+    n = emit_mov_reg_imm32(BUF(cg), REG_RAX, 1); EMIT(cg, n);  /* __NR_write */
+    n = emit_mov_reg_imm32(BUF(cg), REG_RDI, 1); EMIT(cg, n);  /* fd = stdout */
+    n = emit_mov_reg_reg(BUF(cg), REG_RSI, REG_R10); EMIT(cg, n); /* buf */
+    n = emit_mov_reg_reg(BUF(cg), REG_RDX, REG_R11); EMIT(cg, n); /* len */
+    n = emit_syscall(BUF(cg)); EMIT(cg, n);
+
+    /* Restore stack: add rsp, 24 */
+    n = emit_add_reg_imm(BUF(cg), REG_RSP, 24);
+    EMIT(cg, n);
+
+    /* Return 0 in RAX (print_int returns nothing meaningful) */
+    n = emit_xor_reg_reg(BUF(cg), REG_RAX, REG_RAX);
+    EMIT(cg, n);
+}
+
 static void emit_call_expr(CodegenState *cg, const ASTNode *node) {
     /*
      * NODE_CALL layout:
@@ -363,6 +536,14 @@ static void emit_call_expr(CodegenState *cg, const ASTNode *node) {
 
     const ASTNode *callee = node->children[0];
     size_t argc = node->child_count - 1;
+
+    /* Check for built-in functions */
+    if (callee->type == NODE_IDENTIFIER && callee->string_val) {
+        if (strcmp(callee->string_val, "print_int") == 0 && argc == 1) {
+            emit_builtin_print_int(cg, node->children[1]);
+            return;
+        }
+    }
 
     if (argc > SYS_V_ARG_COUNT) {
         cg_error(cg, "too many arguments (max %d) at %d:%d",

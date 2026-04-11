@@ -887,37 +887,42 @@ static void emit_call_expr(CodegenState *cg, const ASTNode *node) {
          * arr_len(base): return stored length
          */
         if (strcmp(callee->string_val, "arr_new") == 0 && argc == 1) {
-            /* Evaluate size -> RAX */
-            emit_expression(cg, node->children[1]);
-            int pn;
-            /* r10 = n (save size) */
-            pn = emit_mov_reg_reg(BUF(cg), REG_R10, REG_RAX); EMIT(cg, pn);
-            /* Allocate (n+1)*8 bytes: n elements + 1 for length header */
-            /* lea rcx, [rax + 1] */
-            uint8_t *b = BUF(cg);
+            /* arr_new(n): HEAP allocate via mmap. Persists across returns.
+             * Layout: [length][elem0][elem1]...[elemN-1]
+             * Returns pointer to elem0 (base = mmap_ptr + 8) */
+            emit_expression(cg, node->children[1]); /* n -> RAX */
+            int pn; uint8_t *b;
+
+            /* Push n (mmap will trash all regs) */
+            pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
+
+            /* rsi = (n+1)*8 */
+            pn = emit_add_reg_imm(BUF(cg), REG_RAX, 1); EMIT(cg, pn);
+            pn = emit_shl_reg_imm(BUF(cg), REG_RAX, 3); EMIT(cg, pn);
+            pn = emit_mov_reg_reg(BUF(cg), REG_RSI, REG_RAX); EMIT(cg, pn);
+
+            /* mmap(0, rsi, 3, 0x22, -1, 0) = syscall 9 */
+            pn = emit_xor_reg_reg(BUF(cg), REG_RDI, REG_RDI); EMIT(cg, pn);
+            pn = emit_mov_reg_imm32(BUF(cg), REG_RDX, 3); EMIT(cg, pn);
+            b = BUF(cg); b[0]=0x49; b[1]=0xC7; b[2]=0xC2;
+            int32_t v=0x22; memcpy(b+3,&v,4); EMIT(cg,7);
+            b = BUF(cg); b[0]=0x49; b[1]=0xC7; b[2]=0xC0;
+            v=-1; memcpy(b+3,&v,4); EMIT(cg,7);
+            b = BUF(cg); b[0]=0x4D; b[1]=0x31; b[2]=0xC9; EMIT(cg,3);
+            pn = emit_mov_reg_imm32(BUF(cg), REG_RAX, 9); EMIT(cg, pn);
+            pn = emit_syscall(BUF(cg)); EMIT(cg, pn);
+
+            /* RAX = heap ptr. Pop n into RCX */
+            pn = emit_pop(BUF(cg), REG_RCX); EMIT(cg, pn);
+
+            /* mov [rax], rcx  -- store length */
+            b = BUF(cg);
             b[0] = rex(1, reg_ext(REG_RCX), 0, reg_ext(REG_RAX));
-            b[1] = 0x8D; b[2] = modrm(1, REG_RCX, REG_RAX); b[3] = 1;
-            EMIT(cg, 4);
-            /* shl rcx, 3 (multiply by 8) */
-            pn = emit_shl_reg_imm(BUF(cg), REG_RCX, 3); EMIT(cg, pn);
-            /* sub rsp, rcx */
-            b = BUF(cg);
-            b[0] = rex(1, reg_ext(REG_RCX), 0, reg_ext(REG_RSP));
-            b[1] = 0x29; b[2] = modrm(3, REG_RCX, REG_RSP);
+            b[1] = 0x89; b[2] = modrm(0, REG_RCX, REG_RAX);
             EMIT(cg, 3);
-            /* Store length at [rsp]: mov [rsp], r10 */
-            b = BUF(cg);
-            b[0] = rex(1, reg_ext(REG_R10), 0, 0);
-            b[1] = 0x89; b[2] = modrm(0, REG_R10 & 7, REG_RSP);
-            b[3] = 0x24; /* SIB for RSP */
-            EMIT(cg, 4);
-            /* Return base = rsp + 8 (skip length header) */
-            /* lea rax, [rsp + 8] */
-            b = BUF(cg);
-            b[0] = rex(1, reg_ext(REG_RAX), 0, 0);
-            b[1] = 0x8D; b[2] = modrm(1, REG_RAX, REG_RSP);
-            b[3] = 0x24; b[4] = 8; /* SIB + disp8 */
-            EMIT(cg, 5);
+
+            /* rax += 8  -- return base (skip length header) */
+            pn = emit_add_reg_imm(BUF(cg), REG_RAX, 8); EMIT(cg, pn);
             return;
         }
         if (strcmp(callee->string_val, "arr_get") == 0 && argc == 2) {

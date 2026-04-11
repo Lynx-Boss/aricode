@@ -1,0 +1,83 @@
+// aricode - Struct Pattern via Arrays
+// Demonstrates data structures using arr_new/arr_get/arr_set
+// This is how structs work at the machine level.
+
+// ---- Point struct: { x: i32, y: i32 } ----
+
+fn point_new(x: i32, y: i32) -> i32 {
+    let p: i32 = arr_new(2);
+    arr_set(p, 0, x);
+    arr_set(p, 1, y);
+    return p;
+}
+
+fn point_x(p: i32) -> i32 { return arr_get(p, 0); }
+fn point_y(p: i32) -> i32 { return arr_get(p, 1); }
+
+fn point_add(a: i32, b: i32) -> i32 {
+    return point_new(
+        point_x(a) + point_x(b),
+        point_y(a) + point_y(b)
+    );
+}
+
+fn point_dist_sq(a: i32, b: i32) -> i32 {
+    let dx: i32 = point_x(a) - point_x(b);
+    let dy: i32 = point_y(a) - point_y(b);
+    return dx * dx + dy * dy;
+}
+
+fn point_print(p: i32) -> i32 {
+    print_int(point_x(p));
+    print_int(point_y(p));
+    return 0;
+}
+
+// ---- Rect struct: { x, y, w, h } ----
+
+fn rect_new(x: i32, y: i32, w: i32, h: i32) -> i32 {
+    let r: i32 = arr_new(4);
+    arr_set(r, 0, x);
+    arr_set(r, 1, y);
+    arr_set(r, 2, w);
+    arr_set(r, 3, h);
+    return r;
+}
+
+fn rect_area(r: i32) -> i32 {
+    return arr_get(r, 2) * arr_get(r, 3);
+}
+
+fn rect_perimeter(r: i32) -> i32 {
+    return 2 * (arr_get(r, 2) + arr_get(r, 3));
+}
+
+// ---- Main ----
+
+fn main() -> i32 {
+    print_str("=== Points ===");
+    let a: i32 = point_new(3, 4);
+    let b: i32 = point_new(6, 8);
+
+    print_str("Point A:");
+    point_print(a);
+
+    print_str("Point B:");
+    point_print(b);
+
+    print_str("A + B:");
+    let c: i32 = point_add(a, b);
+    point_print(c);
+
+    print_str("Distance^2 A->B:");
+    print_int(point_dist_sq(a, b));
+
+    print_str("=== Rectangle ===");
+    let r: i32 = rect_new(10, 20, 30, 40);
+    print_str("Area:");
+    print_int(rect_area(r));
+    print_str("Perimeter:");
+    print_int(rect_perimeter(r));
+
+    return 0;
+}

@@ -1,0 +1,22 @@
+// aricode - Challenge 07: Mersenne Prime Verification
+// Verify M31 = 2^31 - 1 = 2,147,483,647 is prime
+// Return 1 if prime, 0 if not (exit code)
+//
+// M31 is the largest Mersenne prime that fits in a 32-bit integer.
+// Euler proved it prime in 1772. We verify it via recursive trial
+// division against ~23,170 odd divisors up to sqrt(M31) = 46,340.
+// Each divisor check requires a modular division of a 10-digit number.
+
+fn is_prime_rec(n: i32, d: i32) -> i32 {
+    if (n / d < d) {
+        return 1;
+    }
+    if (n % d == 0) {
+        return 0;
+    }
+    return is_prime_rec(n, d + 2);
+}
+
+fn main() -> i32 {
+    return is_prime_rec(2147483647, 3);
+}

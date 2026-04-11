@@ -36,7 +36,10 @@ declare -A CHALLENGE_NAMES
 CHALLENGE_NAMES["01_add"]="Simple Addition (37+5=42)"
 CHALLENGE_NAMES["02_fib"]="Fibonacci (fib(10)=55)"
 CHALLENGE_NAMES["03_factorial"]="Factorial (5!=120)"
-CHALLENGE_ORDER=("01_add" "02_fib" "03_factorial")
+CHALLENGE_NAMES["05_ackermann"]="Ackermann A(3,4)=125 [HEAVY RECURSION]"
+CHALLENGE_NAMES["06_collatz"]="Collatz(871)=178 [UNSOLVED CONJECTURE]"
+CHALLENGE_NAMES["07_mersenne"]="Mersenne M31=2^31-1 PRIME [23K divisors, 10 digits]"
+CHALLENGE_ORDER=("01_add" "02_fib" "03_factorial" "05_ackermann" "06_collatz" "07_mersenne")
 
 # ── Formatting helpers ──────────────────────────────────────────────────────
 

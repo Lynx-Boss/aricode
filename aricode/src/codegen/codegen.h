@@ -69,6 +69,10 @@ typedef struct {
     /* Entry point offset (set when _start is emitted) */
     size_t      entry_offset;
 
+    /* Current function info (for tail call optimization) */
+    const char *current_fn_name;   /* name of function being compiled   */
+    size_t      current_fn_entry;  /* code offset of function entry     */
+
     /* Error tracking */
     int         had_error;
     char        error_msg[512];

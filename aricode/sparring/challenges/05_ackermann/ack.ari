@@ -1,0 +1,18 @@
+// aricode - Challenge 05: Ackermann Function
+// Compute A(3,4) = 125, return as exit code
+// The Ackermann function grows faster than any primitive recursive function.
+// A(3,4) requires ~10,000+ recursive calls to resolve.
+
+fn ack(m: i32, n: i32) -> i32 {
+    if (m == 0) {
+        return n + 1;
+    }
+    if (n == 0) {
+        return ack(m - 1, 1);
+    }
+    return ack(m - 1, ack(m, n - 1));
+}
+
+fn main() -> i32 {
+    return ack(3, 4);
+}

@@ -69,9 +69,12 @@ declare -A CHALLENGES
 CHALLENGES["01_add"]="add:42"
 CHALLENGES["02_fib"]="fib:55"
 CHALLENGES["03_factorial"]="fact:120"
+CHALLENGES["05_ackermann"]="ack:125"
+CHALLENGES["06_collatz"]="collatz:178"
+CHALLENGES["07_mersenne"]="mersenne:1"
 
 # Sorted keys
-CHALLENGE_ORDER=("01_add" "02_fib" "03_factorial")
+CHALLENGE_ORDER=("01_add" "02_fib" "03_factorial" "05_ackermann" "06_collatz" "07_mersenne")
 
 # ── Build functions ─────────────────────────────────────────────────────────
 

@@ -24,6 +24,7 @@ SRCS = \
 	$(ERRORS_DIR)/error_registry.c \
 	$(ERRORS_DIR)/podium.c \
 	$(CODEGEN_DIR)/codegen.c \
+	$(CODEGEN_DIR)/optimizer.c \
 	$(CODEGEN_DIR)/elf.c
 
 # Include paths

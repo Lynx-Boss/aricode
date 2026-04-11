@@ -32,7 +32,10 @@ declare -A CHALLENGES
 CHALLENGES["01_add"]="add:42:Simple Addition (37+5=42)"
 CHALLENGES["02_fib"]="fib:55:Fibonacci (fib(10)=55)"
 CHALLENGES["03_factorial"]="fact:120:Factorial (5!=120)"
-CHALLENGE_ORDER=("01_add" "02_fib" "03_factorial")
+CHALLENGES["05_ackermann"]="ack:125:Ackermann A(3,4)=125 [>10K recursive calls]"
+CHALLENGES["06_collatz"]="collatz:178:Collatz(871)=178 [UNSOLVED conjecture, peaks at 190996]"
+CHALLENGES["07_mersenne"]="mersenne:1:Mersenne M31=2^31-1 prime verification [23K divisors, 10-digit number]"
+CHALLENGE_ORDER=("01_add" "02_fib" "03_factorial" "05_ackermann" "06_collatz" "07_mersenne")
 
 # ── Setup ───────────────────────────────────────────────────────────────────
 

@@ -1,0 +1,9 @@
+label,binary_name,binary_size,text_size,instructions,exec_time_ns,startup_time_ns
+Python3,python3,404,N/A,N/A,7725763,7817044
+aricode,collatz_aricode,322,202,67,276410,280067
+NASM asm,collatz_asm,408,71,24,275058,288100
+C (gcc -O0),collatz_gcc_O0,754272,640407,120069,390408,389329
+C (gcc -O2),collatz_gcc_O2,754272,640383,120062,385833,384805
+C (gcc -O2 dyn),collatz_gcc_O2_dyn,15872,1318,106,525004,533099
+C (gcc -O3),collatz_gcc_O3,754272,640511,120098,390727,400307
+C (gcc -Os),collatz_gcc_Os,754272,640319,120048,387647,390607

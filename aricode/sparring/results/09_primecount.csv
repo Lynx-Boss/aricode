@@ -1,11 +1,11 @@
 label,binary_name,binary_size,text_size,instructions,exec_time_ns,startup_time_ns
-Python3,python3,337,N/A,N/A,7827312,7757717
-aricode,primecount_aricode,544,424,141,271621,281541
-NASM asm,primecount_asm,440,101,33,271986,283134
-C (gcc -O0),primecount_gcc_O0,754272,640471,120085,384637,386054
-C (gcc -O2),primecount_gcc_O2,754272,640575,120124,384764,391905
-C (gcc -O2 dyn),primecount_gcc_O2_dyn,15864,1448,156,513015,534360
-C (gcc -O3),primecount_gcc_O3,754272,640511,120106,386807,401146
-C (gcc -Os),primecount_gcc_Os,754272,640383,120069,386361,406887
-Go,primecount_go,1873539,1171450,142410,949307,962237
-Rust,primecount_rust,11382376,361759,71739,703251,690074
+Python3,python3,337,N/A,N/A,7804740,7636217
+aricode,primecount_aricode,544,424,141,282786,292738
+NASM asm,primecount_asm,440,101,33,279108,296213
+C (gcc -O0),primecount_gcc_O0,754272,640471,120085,400951,393380
+C (gcc -O2),primecount_gcc_O2,754272,640575,120124,396333,417017
+C (gcc -O2 dyn),primecount_gcc_O2_dyn,15864,1448,156,524010,540182
+C (gcc -O3),primecount_gcc_O3,754272,640511,120106,402694,416076
+C (gcc -Os),primecount_gcc_Os,754272,640383,120069,396020,400976
+Go,primecount_go,1873539,1171450,142410,953307,957207
+Rust,primecount_rust,11382376,361759,71739,704695,721654

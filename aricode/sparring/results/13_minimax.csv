@@ -1,11 +1,11 @@
 label,binary_name,binary_size,text_size,instructions,exec_time_ns,startup_time_ns
-Python3,python3,767,N/A,N/A,8813436,7690335
-aricode,minimax_aricode,1006,0,0,353059,357025
-NASM asm,minimax_asm,552,214,79,309717,317556
-C (gcc -O0),minimax_gcc_O0,754264,640599,120118,439904,442211
-C (gcc -O2),minimax_gcc_O2,758360,642071,120482,405305,409315
-C (gcc -O2 dyn),minimax_gcc_O2_dyn,15864,2968,517,532276,520153
-C (gcc -O3),minimax_gcc_O3,758400,641935,120448,392140,406052
-C (gcc -Os),minimax_gcc_Os,754264,640551,120110,417106,421512
-Go,minimax_go,1873944,1171923,142501,982016,988421
-Rust,minimax_rust,11382432,361943,71799,728122,743986
+Python3,python3,767,N/A,N/A,8949166,7799128
+aricode,minimax_aricode,1006,0,0,354692,369371
+NASM asm,minimax_asm,552,214,79,315010,321605
+C (gcc -O0),minimax_gcc_O0,754264,640599,120118,447823,457138
+C (gcc -O2),minimax_gcc_O2,758360,642071,120482,411096,425107
+C (gcc -O2 dyn),minimax_gcc_O2_dyn,15864,2968,517,554377,554580
+C (gcc -O3),minimax_gcc_O3,758400,641935,120448,402719,403529
+C (gcc -Os),minimax_gcc_Os,754264,640551,120110,421939,430334
+Go,minimax_go,1873944,1171923,142501,987948,992973
+Rust,minimax_rust,11382432,361943,71799,740054,755123

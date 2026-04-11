@@ -41,7 +41,9 @@ CHALLENGES["10_powmod"]="powmod:85:Modular exponentiation 7^19 mod 211 [crypto p
 CHALLENGES["11_isqrt"]="isqrt:127:Integer sqrt(16129)=127 [Newton-Raphson convergence]"
 CHALLENGES["12_perceptron"]="perceptron:4:Perceptron AND gate [1000 epochs, neural network]"
 CHALLENGES["13_minimax"]="minimax:3:Minimax Nim(15) [game AI, 500K+ tree nodes]"
-CHALLENGE_ORDER=("01_add" "02_fib" "03_factorial" "05_ackermann" "06_collatz" "07_mersenne" "08_gcd" "09_primecount" "10_powmod" "11_isqrt" "12_perceptron" "13_minimax")
+CHALLENGES["14_leibniz"]="leibniz:157:Leibniz Pi 10K terms [f64 float loop, SSE2]"
+CHALLENGES["15_arraysum"]="arraysum:158:Array sum 100 elements [heap arrays, mmap]"
+CHALLENGE_ORDER=("01_add" "02_fib" "03_factorial" "05_ackermann" "06_collatz" "07_mersenne" "08_gcd" "09_primecount" "10_powmod" "11_isqrt" "12_perceptron" "13_minimax" "14_leibniz" "15_arraysum")
 
 # ── Setup ───────────────────────────────────────────────────────────────────
 

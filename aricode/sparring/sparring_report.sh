@@ -45,7 +45,9 @@ CHALLENGE_NAMES["10_powmod"]="Powmod 7^19 mod 211 = 85 [crypto primitive]"
 CHALLENGE_NAMES["11_isqrt"]="Integer sqrt(16129) = 127 [Newton-Raphson]"
 CHALLENGE_NAMES["12_perceptron"]="Perceptron AND gate [NEURAL NETWORK]"
 CHALLENGE_NAMES["13_minimax"]="Minimax Nim(15) [GAME AI]"
-CHALLENGE_ORDER=("01_add" "02_fib" "03_factorial" "05_ackermann" "06_collatz" "07_mersenne" "08_gcd" "09_primecount" "10_powmod" "11_isqrt" "12_perceptron" "13_minimax")
+CHALLENGE_NAMES["14_leibniz"]="Leibniz Pi 10K [FLOAT SSE2]"
+CHALLENGE_NAMES["15_arraysum"]="Array Sum 100 [HEAP ARRAYS]"
+CHALLENGE_ORDER=("01_add" "02_fib" "03_factorial" "05_ackermann" "06_collatz" "07_mersenne" "08_gcd" "09_primecount" "10_powmod" "11_isqrt" "12_perceptron" "13_minimax" "14_leibniz" "15_arraysum")
 
 # ── Formatting helpers ──────────────────────────────────────────────────────
 

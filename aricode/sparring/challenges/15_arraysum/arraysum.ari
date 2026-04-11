@@ -1,0 +1,19 @@
+// aricode - Challenge 15: Array Sum
+// Fill array[100] with i*i, sum all elements, return sum % 256 = 158
+// Tests: heap arrays (mmap), loops, arithmetic
+
+fn main() -> i32 {
+    let data: i32 = arr_new(100);
+    let i: i32 = 0;
+    while (i < 100) {
+        arr_set(data, i, i * i);
+        i = i + 1;
+    }
+    let sum: i32 = 0;
+    i = 0;
+    while (i < 100) {
+        sum = sum + arr_get(data, i);
+        i = i + 1;
+    }
+    return sum % 256;
+}

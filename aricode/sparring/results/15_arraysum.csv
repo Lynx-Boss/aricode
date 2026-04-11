@@ -1,0 +1,11 @@
+label,binary_name,binary_size,text_size,instructions,exec_time_ns,startup_time_ns
+Python3,python3,93,N/A,N/A,7768376,7803396
+aricode,arraysum_aricode,453,333,111,291095,293910
+NASM asm,arraysum_asm,408,68,22,279528,295181
+C (gcc -O0),arraysum_gcc_O0,754232,640439,120076,398430,413931
+C (gcc -O2),arraysum_gcc_O2,754232,640567,120104,402681,399616
+C (gcc -O2 dyn),arraysum_gcc_O2_dyn,15832,1469,137,532851,542229
+C (gcc -O3),arraysum_gcc_O3,754232,640567,120104,396381,404214
+C (gcc -Os),arraysum_gcc_Os,754232,640367,120061,398573,405093
+Go,arraysum_go,1873307,1171378,142394,961089,938720
+Rust,arraysum_rust,11382368,362199,71822,715618,726851

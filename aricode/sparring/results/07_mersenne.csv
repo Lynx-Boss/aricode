@@ -1,11 +1,11 @@
 label,binary_name,binary_size,text_size,instructions,exec_time_ns,startup_time_ns
-Python3,python3,478,N/A,N/A,9001465,7670182
-aricode,mersenne_aricode,374,254,84,355560,362369
-NASM asm,mersenne_asm,400,58,19,310330,315643
-C (gcc -O0),mersenne_gcc_O0,754272,640407,120068,904784,926430
-C (gcc -O2),mersenne_gcc_O2,754272,640447,120084,423790,431066
-C (gcc -O2 dyn),mersenne_gcc_O2_dyn,15872,1380,128,553982,560344
-C (gcc -O3),mersenne_gcc_O3,754272,640447,120084,422370,431012
-C (gcc -Os),mersenne_gcc_Os,754272,640319,120046,422030,436896
-Go,mersenne_go,1873547,1171771,142464,1811257,1822534
-Rust,mersenne_rust,11382368,361695,71718,724491,747108
+Python3,python3,478,N/A,N/A,9106949,7781778
+aricode,mersenne_aricode,374,254,84,364842,363522
+NASM asm,mersenne_asm,400,58,19,314306,317511
+C (gcc -O0),mersenne_gcc_O0,754272,640407,120068,915267,927328
+C (gcc -O2),mersenne_gcc_O2,754272,640447,120084,431051,433304
+C (gcc -O2 dyn),mersenne_gcc_O2_dyn,15872,1380,128,563511,575299
+C (gcc -O3),mersenne_gcc_O3,754272,640447,120084,430174,443478
+C (gcc -Os),mersenne_gcc_Os,754272,640319,120046,426312,423112
+Go,mersenne_go,1873547,1171771,142464,1829148,1837570
+Rust,mersenne_rust,11382368,361695,71718,751485,761089

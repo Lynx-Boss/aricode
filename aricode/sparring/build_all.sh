@@ -78,9 +78,11 @@ CHALLENGES["10_powmod"]="powmod:85"
 CHALLENGES["11_isqrt"]="isqrt:127"
 CHALLENGES["12_perceptron"]="perceptron:4"
 CHALLENGES["13_minimax"]="minimax:3"
+CHALLENGES["14_leibniz"]="leibniz:157"
+CHALLENGES["15_arraysum"]="arraysum:158"
 
 # Sorted keys
-CHALLENGE_ORDER=("01_add" "02_fib" "03_factorial" "05_ackermann" "06_collatz" "07_mersenne" "08_gcd" "09_primecount" "10_powmod" "11_isqrt" "12_perceptron" "13_minimax")
+CHALLENGE_ORDER=("01_add" "02_fib" "03_factorial" "05_ackermann" "06_collatz" "07_mersenne" "08_gcd" "09_primecount" "10_powmod" "11_isqrt" "12_perceptron" "13_minimax" "14_leibniz" "15_arraysum")
 
 # ── Build functions ─────────────────────────────────────────────────────────
 

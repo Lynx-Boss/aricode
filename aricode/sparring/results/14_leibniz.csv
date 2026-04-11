@@ -1,0 +1,11 @@
+label,binary_name,binary_size,text_size,instructions,exec_time_ns,startup_time_ns
+Python3,python3,223,N/A,N/A,8740350,7807696
+aricode,leibniz_aricode,671,551,183,350879,356187
+NASM asm,leibniz_asm,4632,93,24,293160,311245
+C (gcc -O0),leibniz_gcc_O0,754232,640503,120071,431836,437733
+C (gcc -O2),leibniz_gcc_O2,754232,640463,120071,409792,417752
+C (gcc -O2 dyn),leibniz_gcc_O2_dyn,15832,1365,104,537553,560663
+C (gcc -O3),leibniz_gcc_O3,754232,640463,120071,405099,410756
+C (gcc -Os),leibniz_gcc_Os,754232,640399,120059,409303,413540
+Go,leibniz_go,1873447,1171378,142406,966927,982542
+Rust,leibniz_rust,11382368,361743,71746,721736,715920

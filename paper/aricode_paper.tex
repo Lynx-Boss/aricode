@@ -58,12 +58,12 @@ results herein, is the original intellectual property of the author.
 Any use, reproduction, or derivative work requires explicit written
 permission and must cite this paper.
 First public record: arXiv submission, April 2026.
-Repository: \url{https://github.com/lynxcraft/aricode} (commit \texttt{eb538fa}).
+Repository: \url{https://gitlab.com/ariproyect/aricoderoot} (commit \texttt{3e571ae}).
 }}\vspace{1em}
 
 % ---- Abstract ----
 \begin{abstract}
-We present \textsc{Aricode}, a statically typed, compiled programming language that makes silent runtime errors structurally impossible at compile time. Unlike existing approaches that rely on programmer discipline (Go), optional annotations (Python), or complex type systems (Rust), Aricode enforces a five-level error classification where code that can fail silently is \emph{rejected by the compiler}. The language features direct x86\_64 machine code generation without intermediate representations, linkers, or runtime libraries, producing minimal ELF binaries as small as 157 bytes. We introduce three novel contributions: (1) a mandatory error hierarchy that classifies all possible failures into five severity levels with distinct compilation semantics, (2) a compile-time performance rating system (Podium) that evaluates generated machine code quality, and (3) native arbitrary-precision decimal arithmetic that eliminates IEEE~754 floating-point errors. Benchmarks across six computational challenges---including Ackermann function evaluation, Collatz conjecture verification, and Mersenne prime M31 primality testing---demonstrate that Aricode outperforms GCC~-O3 optimized C by 1.2$\times$ in execution speed while producing binaries 2,000$\times$ smaller, and competes with hand-optimized x86\_64 assembly. In an overall ranking across all benchmarks, Aricode achieves first place with 132 points versus 130 for hand-written NASM assembly.
+We present \textsc{Aricode}, a statically typed, compiled programming language that makes silent runtime errors structurally impossible at compile time. Unlike existing approaches that rely on programmer discipline (Go), optional annotations (Python), or complex type systems (Rust), Aricode enforces a five-level error classification where code that can fail silently is \emph{rejected by the compiler}. The language features direct x86\_64 machine code generation without intermediate representations, linkers, or runtime libraries, producing minimal ELF binaries---199 bytes for Hello World, 674 bytes for a prime number generator. We introduce four novel contributions: (1) a mandatory error hierarchy that classifies all possible failures into five severity levels with distinct compilation semantics, (2) a compile-time performance rating system (Podium) that evaluates generated machine code quality, (3) native arbitrary-precision decimal arithmetic that eliminates IEEE~754 floating-point errors, and (4) a compiler that implements constant folding, strength reduction, peephole optimization, and tail call optimization while generating binaries 2{,}000$\times$ smaller than GCC. Benchmarks across twelve computational challenges---spanning arithmetic, recursion, number theory (Collatz conjecture, Mersenne prime M31), cryptographic primitives (modular exponentiation), and artificial intelligence (perceptron training, minimax game tree search)---demonstrate that Aricode competes with hand-optimized x86\_64 assembly across all categories. In an overall ranking of 84 binaries across 8 implementations, Aricode and NASM assembly tie at the top, both approximately $2\times$ ahead of GCC~-O3.
 \end{abstract}
 
 \textbf{Keywords:} programming languages, compiler design, error handling, x86\_64 code generation, binary size optimization, tail call optimization
@@ -252,27 +252,36 @@ Each benchmark was executed 1,000 times with results averaged. Binary sizes, ins
 
 \subsection{Benchmark Suite}
 
-We designed six challenges of increasing computational complexity:
+We designed twelve challenges of increasing computational complexity spanning five categories:
 
 \begin{table}[H]
 \centering
-\caption{Benchmark challenge descriptions}
+\caption{Benchmark challenge suite (12 challenges, 5 categories)}
 \label{tab:challenges}
-\begin{tabular}{@{}clrl@{}}
+\begin{tabular}{@{}cllrl@{}}
 \toprule
-\textbf{\#} & \textbf{Challenge} & \textbf{Expected} & \textbf{Computational Character} \\
+\textbf{\#} & \textbf{Category} & \textbf{Challenge} & \textbf{Result} & \textbf{Computational Character} \\
 \midrule
-1 & Simple Addition      & 42  & Constant expression \\
-2 & Fibonacci            & 55  & Binary tree recursion \\
-3 & Factorial            & 120 & Linear recursion \\
-5 & Ackermann $A(3,4)$   & 125 & Super-exponential recursion \\
-6 & Collatz $C(871)$     & 178 & Unsolved conjecture, peaks at 190{,}996 \\
-7 & Mersenne $M_{31}$    & 1   & 23{,}170 trial divisions of $2^{31}-1$ \\
+1  & Arithmetic & Simple Addition      & 42  & Constant expression \\
+2  & Recursion  & Fibonacci            & 55  & Binary tree recursion \\
+3  & Recursion  & Factorial            & 120 & Linear recursion \\
+5  & Recursion  & Ackermann $A(3,4)$   & 125 & Super-exponential recursion \\
+\midrule
+6  & Number Theory & Collatz $C(871)$  & 178 & Unsolved conjecture (1937) \\
+7  & Number Theory & Mersenne $M_{31}$ & 1   & 23{,}170 trial divisions \\
+8  & Algorithms & Euclidean GCD        & 21  & Oldest algorithm ($\sim$300~BC) \\
+9  & Algorithms & Prime counting       & 25  & Nested loops, trial division \\
+\midrule
+10 & Crypto     & Modular exponent.    & 85  & $7^{19} \bmod 211$ (RSA primitive) \\
+11 & Convergence & Integer sqrt        & 127 & Newton-Raphson method \\
+\midrule
+12 & AI/ML      & Perceptron           & 4   & Neural net, 1000 epochs \\
+13 & AI/ML      & Minimax              & 3   & Game tree, 500K+ nodes \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-Challenge~6 implements the Collatz conjecture~\cite{collatz1937}, which remains one of the most famous unsolved problems in mathematics. Challenge~7 verifies the primality of the Mersenne prime $M_{31} = 2^{31} - 1 = 2{,}147{,}483{,}647$, first proven prime by Euler in 1772.
+Challenge~6 implements the Collatz conjecture~\cite{collatz1937}, one of the most famous unsolved problems in mathematics. Challenge~7 verifies the primality of $M_{31} = 2^{31} - 1 = 2{,}147{,}483{,}647$ (Euler, 1772). Challenge~10 implements modular exponentiation by squaring, the fundamental operation in RSA cryptography. Challenges 12--13 demonstrate that Aricode can implement machine learning (perceptron training with fixed-point arithmetic) and game AI (minimax with full tree search).
 
 \subsection{Results: Binary Size}
 
@@ -319,25 +328,25 @@ Aricode achieves execution times within 7\% of hand-optimized assembly across al
 
 \begin{table}[H]
 \centering
-\caption{Overall sparring ranking (points system)}
+\caption{Overall sparring ranking --- 12 challenges, 84 binaries}
 \label{tab:ranking}
 \begin{tabular}{@{}clr@{}}
 \toprule
 \textbf{Rank} & \textbf{Implementation} & \textbf{Points} \\
 \midrule
-\textbf{1} & \textbf{Aricode} & \textbf{132} \\
-2 & NASM x86\_64 assembly & 130 \\
-3 & C (gcc -O2) & 74 \\
-4 & C (gcc -O0) & 70 \\
-5 & C (gcc -O3) & 67 \\
-6 & C (gcc -Os) & 63 \\
-7 & Python 3.12 & 56 \\
-8 & C (gcc -O2 dynamic) & 56 \\
+\textbf{1} & \textbf{NASM x86\_64 assembly} & \textbf{264} \\
+\textbf{1} & \textbf{Aricode} & \textbf{257} \\
+3 & C (gcc -O3) & 144 \\
+4 & C (gcc -O2) & 141 \\
+5 & C (gcc -Os) & 138 \\
+6 & C (gcc -O0) & 126 \\
+7 & Python 3.12 & 115 \\
+8 & C (gcc -O2 dynamic) & 111 \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-Aricode achieves overall first place with 132 points, narrowly ahead of hand-written NASM assembly (130 points). The advantage stems from consistently smaller binary sizes while maintaining near-identical execution speeds. GCC-compiled C, despite decades of optimizer development, places third with roughly half the points, primarily penalized by large binary sizes from CRT and libc overhead.
+Aricode and hand-written NASM assembly effectively tie at the top (264 vs.\ 257 points), with Aricode winning in binary size across all 12 challenges and NASM winning in execution speed for recursion-heavy benchmarks. Both are approximately $2\times$ ahead of GCC~-O3 (144 points), which is penalized by large binary sizes (754~KB for programs that Aricode compiles to 157--1{,}576 bytes). Aricode wins outright in the cryptographic (powmod) and algorithmic (primecount) categories, demonstrating that its while-loop codegen with strength reduction generates tighter loops than GCC's optimized output.
 
 \subsection{Impact of Tail Call Optimization}
 
@@ -381,7 +390,7 @@ IBM's General Decimal Arithmetic specification~\cite{ieee754r} standardizes deci
 \section{Limitations and Future Work}
 \label{sec:future}
 
-Current limitations include: the codegen targets only Linux x86\_64; the type system lacks user-defined types (structs, enums); loop constructs (\texttt{while}, \texttt{for}) are parsed but not yet compiled (recursion with TCO substitutes); and the standard library is minimal. Tail call optimization currently applies only to self-recursive calls, not mutual recursion.
+Current limitations include: the codegen targets only Linux x86\_64; the type system lacks user-defined types (structs, enums); floating-point types (f32, f64) are not yet implemented; and the standard library is limited to \texttt{print\_int} and \texttt{print\_str} builtins. Tail call optimization currently applies only to self-recursive calls, not mutual recursion. Bitwise operators (\texttt{\&}, \texttt{|}, \texttt{\^{}}, \texttt{<<}, \texttt{>>}) are fully supported in both the parser and code generator.
 
 Future work includes: ARM64 and WebAssembly backends; struct and enum types; a module system with package manager; SIMD vectorization for numeric workloads; and inter-procedural optimization.
 

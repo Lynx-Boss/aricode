@@ -149,6 +149,99 @@ void compiler_init(Compiler *c, CompilerOptions options) {
     c->options = options;
 }
 
+/*
+ * Resolve imports: scan source for `import "file.ari";` lines,
+ * read those files, and prepend their content. Handles nested imports.
+ * Returns a new malloc'd string with all imports resolved.
+ */
+static char *resolve_imports(const char *source, const char *base_path) {
+    /* Extract directory from base_path */
+    char dir[512] = ".";
+    if (base_path) {
+        strncpy(dir, base_path, sizeof(dir) - 1);
+        char *last_slash = strrchr(dir, '/');
+        if (last_slash) *last_slash = '\0';
+        else strcpy(dir, ".");
+    }
+
+    /* Scan for import lines */
+    size_t result_cap = strlen(source) + 1;
+    char *result = malloc(result_cap);
+    result[0] = '\0';
+    size_t result_len = 0;
+
+    const char *p = source;
+    while (*p) {
+        /* Check for import "filename"; */
+        if (strncmp(p, "import", 6) == 0 && (p[6] == ' ' || p[6] == '\t')) {
+            const char *q = p + 6;
+            while (*q == ' ' || *q == '\t') q++;
+            if (*q == '"') {
+                q++;
+                const char *end = strchr(q, '"');
+                if (end) {
+                    /* Extract filename */
+                    char import_name[256];
+                    size_t name_len = (size_t)(end - q);
+                    if (name_len >= sizeof(import_name)) name_len = sizeof(import_name) - 1;
+                    memcpy(import_name, q, name_len);
+                    import_name[name_len] = '\0';
+
+                    /* Build full path */
+                    char full_path[768];
+                    snprintf(full_path, sizeof(full_path), "%s/%s", dir, import_name);
+
+                    /* Read the imported file */
+                    FILE *f = fopen(full_path, "r");
+                    if (!f) {
+                        fprintf(stderr, "\033[31mImport error:\033[0m cannot open '%s'\n", full_path);
+                    } else {
+                        fseek(f, 0, SEEK_END);
+                        size_t sz = (size_t)ftell(f);
+                        fseek(f, 0, SEEK_SET);
+                        char *content = malloc(sz + 2);
+                        fread(content, 1, sz, f);
+                        content[sz] = '\n';
+                        content[sz + 1] = '\0';
+                        fclose(f);
+
+                        /* Recursively resolve imports in the imported file */
+                        char *resolved = resolve_imports(content, full_path);
+                        free(content);
+
+                        /* Append imported content */
+                        size_t imp_len = strlen(resolved);
+                        while (result_len + imp_len + 2 >= result_cap) {
+                            result_cap *= 2;
+                            result = realloc(result, result_cap);
+                        }
+                        memcpy(result + result_len, resolved, imp_len);
+                        result_len += imp_len;
+                        result[result_len++] = '\n';
+                        result[result_len] = '\0';
+                        free(resolved);
+                    }
+
+                    /* Skip past the import line */
+                    p = end + 1;
+                    if (*p == ';') p++;
+                    if (*p == '\n') p++;
+                    continue;
+                }
+            }
+        }
+
+        /* Copy regular character */
+        if (result_len + 2 >= result_cap) {
+            result_cap *= 2;
+            result = realloc(result, result_cap);
+        }
+        result[result_len++] = *p++;
+    }
+    result[result_len] = '\0';
+    return result;
+}
+
 int compiler_compile_string(Compiler *c, const char *source,
                             const char *filename) {
     clock_t start_time = clock();
@@ -156,6 +249,12 @@ int compiler_compile_string(Compiler *c, const char *source,
     if (c->options.verbose) {
         printf("%s[verbose]%s Compiling: %s\n", CLR_DIM, CLR_RESET, filename);
     }
+
+    /* ── Resolve imports ───────────────────────────────────────────── */
+    char *resolved_source = resolve_imports(source, filename);
+
+    /* Use resolved source from here on (swap pointer) */
+    source = resolved_source;
 
     /* ── Initialize error registry ──────────────────────────────────── */
     ari_registry_init(".aricode/errors.log");

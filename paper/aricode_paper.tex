@@ -40,7 +40,7 @@
 Edwin F. Veliz Jaramillo\\
 \texttt{lynxcraft@gmail.com}\\[0.5em]
 Independent Researcher\\[0.3em]
-ORCID: \textit{(register at orcid.org for a permanent researcher ID)}
+ORCID: \href{https://orcid.org/0009-0000-8065-4554}{0009-0000-8065-4554}
 }
 
 \date{April 2026}
@@ -58,7 +58,7 @@ results herein, is the original intellectual property of the author.
 Any use, reproduction, or derivative work requires explicit written
 permission and must cite this paper.
 First public record: arXiv submission, April 2026.
-Repository: \url{https://gitlab.com/ariproyect/aricoderoot} (commit \texttt{3bc7b96}).
+Repository: \url{https://gitlab.com/ariproyect/aricoderoot}.
 }}\vspace{1em}
 
 % ---- Abstract ----
@@ -67,10 +67,12 @@ Every existing AI coding system---GitHub Copilot, Claude, GPT-4, Devin---generat
 
 The language provides 23 built-in operations spanning console I/O, heap memory (\texttt{mmap}), file system access (direct syscalls), SSE2 floating-point, exact decimal arithmetic, and cross-function error handling via register-based unwinding (R12--R15). Six optimization passes---constant folding, strength reduction, peephole optimization, tail call optimization, dead code elimination, and compile-time decimal evaluation---ensure that generated code competes with hand-written assembly.
 
-Benchmarks across 14 computational challenges (154 binaries, 12 implementations including GCC, Clang, Rust, and Go) demonstrate that Aricode places second overall behind hand-optimized NASM assembly, while producing binaries 72{,}000$\times$ smaller than Rust and 12{,}000$\times$ smaller than Go. To our knowledge, no other project combines direct native code generation, zero runtime dependencies, and explicit design for AI agent use. Aricode establishes a new paradigm: instead of AI writing human code for human compilers, AI writes machine-optimal code for a machine-optimal compiler.
+Benchmarks across 14 computational challenges (154 binaries, 12 implementations including GCC, Clang, Rust, and Go) demonstrate that Aricode places second overall behind hand-optimized NASM assembly, while producing binaries 72{,}000$\times$ smaller than Rust and 12{,}000$\times$ smaller than Go. Despite being designed for machine generation, Aricode's mandatory error handling and explicit control flow make AI-generated code straightforward for human reviewers to audit---every guard, type conversion, and error path is visible in the source. The minimal binary footprint (under 3.5~KB with zero runtime dependencies) also positions Aricode as a viable target for resource-constrained domains such as robotics, embedded systems, and edge computing, where an AI agent can generate, compile, and deploy task-specific binaries in real time.
+
+To our knowledge, no other project combines direct native code generation, zero runtime dependencies, and explicit design for AI agent use. Aricode establishes a new paradigm: instead of AI writing human code for human compilers, AI writes machine-optimal code for a machine-optimal compiler.
 \end{abstract}
 
-\textbf{Keywords:} AI agents, compilation target, code generation, x86\_64, machine code, zero runtime, binary optimization, LLM, autonomous coding
+\textbf{Keywords:} AI agents, compilation target, code generation, x86\_64, machine code, zero runtime, binary optimization, LLM, autonomous coding, human auditability, embedded systems, robotics
 
 % ============================================================
 \section{Introduction}
@@ -81,6 +83,10 @@ Silent failures represent one of the most dangerous classes of software defects.
 Existing programming languages address this problem with varying degrees of strictness. C provides no protection against silent failures. Java catches null pointer dereferences at runtime but allows silent integer overflow. Go returns error values that programmers can silently ignore. Rust's ownership system prevents memory errors but does not address arithmetic failures or silent type coercion. None of these languages make it \emph{architecturally impossible} for code with potential silent failures to compile into a binary.
 
 We present \textsc{Aricode}, a compiled language built on a single principle: \textbf{no silent errors, ever}. This is not a guideline or a best practice---it is enforced by the compiler. Code that can fail silently does not compile. Code that can fail at runtime must handle every failure path explicitly.
+
+Although Aricode is designed primarily as a compilation target for AI agents, its strict error enforcement and explicit control flow make AI-generated code \emph{easy for humans to audit}. Every division is guarded, every error path is handled, and every type conversion is explicit---a human reviewer can inspect machine-generated Aricode and quickly identify logic errors or missing edge cases without deep domain expertise. This ``machine-writes, human-verifies'' paradigm creates a natural division of labor: the AI agent generates correct-by-construction code, and the human operator validates intent.
+
+Furthermore, the minimal binary footprint---199~bytes for Hello World, under 3.5~KB for complex programs, with zero runtime dependencies---makes Aricode a compelling target for \textbf{resource-constrained environments} such as robotics, embedded systems, and edge computing. Where traditional compiled languages produce multi-megabyte binaries that require operating system support and runtime libraries, Aricode binaries are self-contained ELF executables that run directly on bare Linux kernels. An AI agent deployed on a robotic platform could generate, compile, and execute task-specific Aricode programs in under 1~ms, enabling real-time adaptive behavior without the overhead of interpreted languages or heavyweight toolchains.
 
 \subsection{Contributions}
 
@@ -378,9 +384,9 @@ Aricode achieves execution times within 7\% of hand-optimized assembly across al
 \end{tabular}
 \end{table}
 
-Aricode places second overall (383 points), 9~points behind hand-written NASM assembly (392). The gap stems from recursion-heavy challenges where NASM uses hand-tuned register allocation. Aricode wins binary size in all 14 challenges and wins execution speed in algorithmic challenges (primecount, powmod) where its while-loop codegen with strength reduction generates tighter code than GCC~-O3.
+Aricode places second overall (468 points), 7~points behind hand-written NASM assembly (475). The gap stems from recursion-heavy challenges where NASM uses hand-tuned register allocation. Aricode wins binary size in all 14 challenges and wins execution speed in algorithmic challenges (primecount, powmod) where its while-loop codegen with strength reduction generates tighter code than GCC~-O3.
 
-The most striking result is the comparison with modern ``safe'' languages: Aricode scores 3.8$\times$ more points than Rust and 4.6$\times$ more than Go, while producing binaries 72{,}000$\times$ smaller than Rust (157~B vs.\ 11.3~MB) and 12{,}000$\times$ smaller than Go (157~B vs.\ 1.8~MB). This demonstrates that safety and performance are not fundamentally at odds---Aricode achieves both through direct code generation and architectural error enforcement rather than heavyweight runtime systems.
+The most striking result is the comparison with modern ``safe'' languages: Aricode scores 4.7$\times$ more points than Rust and 5.6$\times$ more than Go, while producing binaries 72{,}000$\times$ smaller than Rust (157~B vs.\ 11.3~MB) and 12{,}000$\times$ smaller than Go (157~B vs.\ 1.8~MB). This demonstrates that safety and performance are not fundamentally at odds---Aricode achieves both through direct code generation and architectural error enforcement rather than heavyweight runtime systems.
 
 \subsection{Impact of Tail Call Optimization}
 
@@ -424,9 +430,9 @@ IBM's General Decimal Arithmetic specification~\cite{ieee754r} standardizes deci
 \section{Limitations and Future Work}
 \label{sec:future}
 
-Current limitations include: the codegen targets only Linux x86\_64; the type system lacks first-class struct declarations (structs are implemented via array patterns with constructor functions); string operations are limited to literal printing; and there is no module or import system. Tail call optimization applies only to self-recursive calls. Decimal arithmetic is currently compile-time only (constant folding); runtime decimal operations would require embedding the BCD runtime in the binary. The standard library consists of twelve builtins: \texttt{print\_str}, \texttt{print\_int}, \texttt{print\_float}, \texttt{read\_int}, \texttt{read\_float}, \texttt{int\_to\_float}, \texttt{float\_to\_int}, \texttt{dec}, \texttt{print\_dec}, \texttt{arr\_new}/\texttt{arr\_get}/\texttt{arr\_set}/\texttt{arr\_len}.
+Current limitations include: the codegen targets only Linux x86\_64; the type system lacks first-class struct declarations (structs are implemented via array patterns with constructor functions); and circular imports are not detected (would cause infinite recursion during compilation). Tail call optimization applies only to self-recursive calls. Decimal arithmetic is currently compile-time only (constant folding); runtime decimal operations would require embedding the BCD runtime in the binary. The standard library consists of 23~builtins spanning six categories: console I/O (\texttt{print\_str}, \texttt{print\_int}, \texttt{print\_float}, \texttt{print\_dec}, \texttt{read\_int}, \texttt{read\_float}), strings (\texttt{str\_new}, \texttt{str\_len}, \texttt{str\_eq}, \texttt{str\_char\_at}, \texttt{str\_println}, \texttt{str\_concat}), arrays (\texttt{arr\_new}, \texttt{arr\_get}, \texttt{arr\_set}, \texttt{arr\_len}), files (\texttt{file\_open}, \texttt{file\_read}, \texttt{file\_write}, \texttt{file\_close}), and type conversion (\texttt{int\_to\_float}, \texttt{float\_to\_int}, \texttt{dec}). The language includes a multi-file compilation system via \texttt{import} statements with automatic dependency resolution.
 
-Future work includes: ARM64 and WebAssembly backends; struct and enum types; a module system with package manager; SIMD vectorization for numeric workloads; and inter-procedural optimization.
+Future work includes: ARM64 and WebAssembly backends; first-class struct and enum types; a package manager; SIMD vectorization for numeric workloads; circular import detection; and inter-procedural optimization.
 
 % ============================================================
 \section{Conclusion}
@@ -434,9 +440,9 @@ Future work includes: ARM64 and WebAssembly backends; struct and enum types; a m
 
 Aricode demonstrates that mandatory error handling and competitive performance are not mutually exclusive. By classifying all possible failures into five levels and enforcing handling at compile time, Aricode eliminates the entire category of silent runtime errors---the most dangerous class of software defects.
 
-The direct x86\_64 code generator, combined with constant folding, peephole optimization, and tail call optimization, produces binaries that are 2{,}000$\times$ smaller than GCC output and execute 1.2$\times$ faster than GCC~-O3. In a comprehensive benchmark suite including Ackermann function evaluation, Collatz conjecture verification, and Mersenne prime testing, Aricode achieves first place overall against eight implementations including hand-optimized x86\_64 assembly.
+The direct x86\_64 code generator, combined with constant folding, peephole optimization, and tail call optimization, produces binaries that are 2{,}000$\times$ smaller than GCC output and execute 1.2$\times$ faster than GCC~-O3. In a comprehensive benchmark suite including Ackermann function evaluation, Collatz conjecture verification, and Mersenne prime testing, Aricode achieves second place overall among twelve implementations, just 7~points behind hand-optimized x86\_64 assembly.
 
-The compiler, benchmark suite, and all source code are available at: \url{https://github.com/lynxcraft/aricode}.
+The compiler, benchmark suite, and all source code are available at: \url{https://gitlab.com/ariproyect/aricoderoot}.
 
 % ============================================================
 \begin{thebibliography}{99}

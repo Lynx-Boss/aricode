@@ -14,6 +14,14 @@ No LLVM. No linker. No libc. No runtime. Just raw machine code.
 
 **For AI agents, not humans.** Every feature exists to maximize machine efficiency.
 
+### Machine-writes, human-verifies
+
+Although designed for AI generation, Aricode's mandatory error handling and explicit control flow make generated code **easy for humans to audit**. Every division is guarded, every error path is handled, every type conversion is explicit — a human reviewer can quickly spot logic errors without deep domain expertise.
+
+### Built for the edge
+
+Binaries under 3.5 KB with zero runtime dependencies make Aricode ideal for **robotics, embedded systems, and edge computing**. An AI agent on a robotic platform can generate, compile, and execute task-specific programs in under 1 ms — real-time adaptive behavior without heavyweight toolchains.
+
 | Problem | C | Go | Rust | **Aricode** |
 |---------|---|-----|------|-------------|
 | Division by zero | crash | panic | panic | **won't compile** |

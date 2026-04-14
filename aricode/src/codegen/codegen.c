@@ -389,6 +389,79 @@ static void emit_binary_op(CodegenState *cg, const ASTNode *node) {
         EMIT(cg, n);
     } else if (strcmp(op, "/") == 0 || strcmp(op, "%") == 0) {
 do_div_mod:
+        /* ── Runtime zero-check guard ──────────────────────────
+         * test rcx, rcx       ; is divisor zero?
+         * jne  .div_ok        ; if not zero, skip to division
+         * [print error msg]   ; "Runtime error: division by zero\n"
+         * mov rdi, 1          ; exit code 1
+         * mov rax, 60         ; __NR_exit
+         * syscall
+         * .div_ok:
+         * cqo; idiv rcx
+         * ────────────────────────────────────────────────────── */
+        n = emit_test_reg_reg(BUF(cg), REG_RCX, REG_RCX);
+        EMIT(cg, n);
+        /* jne .div_ok (placeholder — patch after error block) */
+        size_t jne_pos = cg->code_size;
+        n = emit_jne(BUF(cg), 0);
+        EMIT(cg, n);
+
+        /* Emit error message: stderr write + exit */
+        {
+            const char *errmsg = "Runtime error: division by zero\n";
+            size_t errmsg_len = 32;
+
+            /* jmp over the embedded string data */
+            size_t jmp_str_pos = cg->code_size;
+            n = emit_jmp(BUF(cg), 0);
+            EMIT(cg, n);
+
+            /* Embed error string */
+            size_t str_data_pos = cg->code_size;
+            memcpy(BUF(cg), errmsg, errmsg_len);
+            cg->code_size += errmsg_len;
+
+            /* Patch jmp to land after string */
+            int32_t jmp_str_off = (int32_t)(cg->code_size - (jmp_str_pos + 5));
+            memcpy(cg->code + jmp_str_pos + 1, &jmp_str_off, 4);
+
+            /* lea rsi, [rip - offset_to_string] */
+            int32_t rip_off = (int32_t)((int64_t)str_data_pos - (int64_t)(cg->code_size + 7));
+            uint8_t *b = BUF(cg);
+            b[0] = rex(1, reg_ext(REG_RSI), 0, 0);
+            b[1] = 0x8D;
+            b[2] = modrm(0, REG_RSI, 5);
+            memcpy(b + 3, &rip_off, 4);
+            EMIT(cg, 7);
+
+            /* mov rdx, errmsg_len */
+            n = emit_mov_reg_imm32(BUF(cg), REG_RDX, (uint32_t)errmsg_len);
+            EMIT(cg, n);
+            /* mov rdi, 2 (stderr) */
+            n = emit_mov_reg_imm32(BUF(cg), REG_RDI, 2);
+            EMIT(cg, n);
+            /* mov rax, 1 (__NR_write) */
+            n = emit_mov_reg_imm32(BUF(cg), REG_RAX, 1);
+            EMIT(cg, n);
+            /* syscall (write to stderr) */
+            n = emit_syscall(BUF(cg));
+            EMIT(cg, n);
+
+            /* mov rdi, 1 (exit code) */
+            n = emit_mov_reg_imm32(BUF(cg), REG_RDI, 1);
+            EMIT(cg, n);
+            /* mov rax, 60 (__NR_exit) */
+            n = emit_mov_reg_imm32(BUF(cg), REG_RAX, 60);
+            EMIT(cg, n);
+            /* syscall (exit) */
+            n = emit_syscall(BUF(cg));
+            EMIT(cg, n);
+        }
+
+        /* .div_ok: patch the jne to jump here */
+        int32_t jne_off = (int32_t)(cg->code_size - (jne_pos + 6));
+        memcpy(cg->code + jne_pos + 2, &jne_off, 4);
+
         n = emit_cqo(BUF(cg));
         EMIT(cg, n);
         n = emit_idiv_reg(BUF(cg), REG_RCX);

@@ -19,6 +19,7 @@ COMPILER_DIR = .
 SRCS = \
 	$(COMPILER_DIR)/main.c \
 	$(COMPILER_DIR)/compiler.c \
+	$(COMPILER_DIR)/imports.c \
 	$(LEXER_DIR)/lexer.c \
 	$(PARSER_DIR)/parser.c \
 	$(PARSER_DIR)/ast.c \

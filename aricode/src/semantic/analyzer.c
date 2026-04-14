@@ -247,57 +247,73 @@ static AriType *analyze_unary_op(Analyzer *a, ASTNode *node) {
  * or NULL if the function is not a builtin.
  */
 static AriType *builtin_return_type(const char *name) {
-    /* i32 return builtins */
-    if (strcmp(name, "arr_new") == 0 ||
-        strcmp(name, "arr_get") == 0 ||
-        strcmp(name, "arr_set") == 0 ||
-        strcmp(name, "arr_len") == 0 ||
-        strcmp(name, "str_new") == 0 ||
-        strcmp(name, "str_len") == 0 ||
-        strcmp(name, "str_eq") == 0 ||
-        strcmp(name, "str_char_at") == 0 ||
-        strcmp(name, "str_concat") == 0 ||
-        strcmp(name, "read_int") == 0 ||
-        strcmp(name, "float_to_int") == 0 ||
-        strcmp(name, "ip4") == 0 ||
-        strcmp(name, "socket_create") == 0 ||
-        strcmp(name, "socket_connect") == 0 ||
-        strcmp(name, "socket_send") == 0 ||
-        strcmp(name, "socket_recv") == 0 ||
-        strcmp(name, "socket_close") == 0 ||
-        strcmp(name, "socket_bind") == 0 ||
-        strcmp(name, "socket_listen") == 0 ||
-        strcmp(name, "socket_accept") == 0 ||
-        strcmp(name, "mem_free") == 0 ||
-        strcmp(name, "file_open") == 0 ||
-        strcmp(name, "file_read") == 0 ||
-        strcmp(name, "file_write") == 0 ||
-        strcmp(name, "file_close") == 0 ||
-        strcmp(name, "socket_opt") == 0 ||
-        strcmp(name, "buf_stack") == 0 ||
-        strcmp(name, "epoll_create") == 0 ||
-        strcmp(name, "epoll_add") == 0 ||
-        strcmp(name, "epoll_del") == 0 ||
-        strcmp(name, "epoll_wait") == 0 ||
-        strcmp(name, "arr_sum") == 0 ||
-        strcmp(name, "arr_fill") == 0 ||
-        strcmp(name, "arr_scale") == 0 ||
-        strcmp(name, "arr_dot") == 0)
-        return type_create(TYPE_I32);
-    /* f64 return builtins */
-    if (strcmp(name, "read_float") == 0 ||
-        strcmp(name, "int_to_float") == 0)
-        return type_create(TYPE_F64);
-    /* void return builtins (side-effect only) */
-    if (strcmp(name, "print_str") == 0 ||
-        strcmp(name, "print_int") == 0 ||
-        strcmp(name, "print_float") == 0 ||
-        strcmp(name, "print_dec") == 0 ||
-        strcmp(name, "str_println") == 0)
-        return type_create(TYPE_VOID);
-    /* dec() returns a decimal compile-time type — treat as i32 for type checking */
-    if (strcmp(name, "dec") == 0)
-        return type_create(TYPE_I32);
+    /* Lookup table: {builtin_name, return TypeKind}.
+     * To add a new builtin, just append a row.                          */
+    static const struct { const char *name; TypeKind kind; } table[] = {
+        /* i32 — array builtins */
+        {"arr_dot",         TYPE_I32},
+        {"arr_fill",        TYPE_I32},
+        {"arr_get",         TYPE_I32},
+        {"arr_len",         TYPE_I32},
+        {"arr_new",         TYPE_I32},
+        {"arr_scale",       TYPE_I32},
+        {"arr_set",         TYPE_I32},
+        {"arr_sum",         TYPE_I32},
+        /* i32 — buffer / memory */
+        {"buf_stack",       TYPE_I32},
+        /* i32 — dec (decimal literal, treated as i32 for type checking) */
+        {"dec",             TYPE_I32},
+        /* i32 — epoll */
+        {"epoll_add",       TYPE_I32},
+        {"epoll_create",    TYPE_I32},
+        {"epoll_del",       TYPE_I32},
+        {"epoll_wait",      TYPE_I32},
+        /* i32 — file I/O */
+        {"file_close",      TYPE_I32},
+        {"file_open",       TYPE_I32},
+        {"file_read",       TYPE_I32},
+        {"file_write",      TYPE_I32},
+        /* i32 — conversion */
+        {"float_to_int",    TYPE_I32},
+        /* f64 — conversion */
+        {"int_to_float",    TYPE_F64},
+        /* i32 — network */
+        {"ip4",             TYPE_I32},
+        /* i32 — memory */
+        {"mem_free",        TYPE_I32},
+        /* void — print helpers (side-effect only) */
+        {"print_dec",       TYPE_VOID},
+        {"print_float",     TYPE_VOID},
+        {"print_int",       TYPE_VOID},
+        {"print_str",       TYPE_VOID},
+        /* i32 — read helpers */
+        {"read_float",      TYPE_F64},
+        {"read_int",        TYPE_I32},
+        /* i32 — socket builtins */
+        {"socket_accept",   TYPE_I32},
+        {"socket_bind",     TYPE_I32},
+        {"socket_close",    TYPE_I32},
+        {"socket_connect",  TYPE_I32},
+        {"socket_create",   TYPE_I32},
+        {"socket_listen",   TYPE_I32},
+        {"socket_opt",      TYPE_I32},
+        {"socket_recv",     TYPE_I32},
+        {"socket_send",     TYPE_I32},
+        /* i32 — string builtins */
+        {"str_char_at",     TYPE_I32},
+        {"str_concat",      TYPE_I32},
+        {"str_eq",          TYPE_I32},
+        {"str_len",         TYPE_I32},
+        {"str_new",         TYPE_I32},
+        /* void — string print */
+        {"str_println",     TYPE_VOID},
+    };
+    static const size_t table_len = sizeof(table) / sizeof(table[0]);
+
+    for (size_t i = 0; i < table_len; i++) {
+        if (strcmp(name, table[i].name) == 0)
+            return type_create(table[i].kind);
+    }
     return NULL;
 }
 

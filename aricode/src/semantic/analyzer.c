@@ -272,7 +272,13 @@ static AriType *builtin_return_type(const char *name) {
         strcmp(name, "file_open") == 0 ||
         strcmp(name, "file_read") == 0 ||
         strcmp(name, "file_write") == 0 ||
-        strcmp(name, "file_close") == 0)
+        strcmp(name, "file_close") == 0 ||
+        strcmp(name, "socket_opt") == 0 ||
+        strcmp(name, "buf_stack") == 0 ||
+        strcmp(name, "epoll_create") == 0 ||
+        strcmp(name, "epoll_add") == 0 ||
+        strcmp(name, "epoll_del") == 0 ||
+        strcmp(name, "epoll_wait") == 0)
         return type_create(TYPE_I32);
     /* f64 return builtins */
     if (strcmp(name, "read_float") == 0 ||

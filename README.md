@@ -43,14 +43,16 @@ Binaries under 3.5 KB with zero runtime dependencies make Aricode ideal for **ro
 - **Imports:** `import "file.ari";` or `import "file.ari" as ns;` with namespace support
 - **Networking:** TCP client/server via direct syscalls (HTTP server in 1,349 bytes)
 
-### Builtins (32)
+### Builtins (43)
 | Category | Functions |
 |----------|-----------|
 | **Console** | print_str, print_int, print_float, print_dec, read_int, read_float |
 | **Strings** | str_new, str_len, str_eq, str_char_at, str_println, str_concat |
-| **Arrays** | arr_new, arr_get, arr_set, arr_len |
+| **Arrays** | arr_new, arr_get, arr_set, arr_len, arr_sum, arr_fill, arr_scale, arr_dot |
+| **Memory** | mem_free, buf_stack |
 | **Files** | file_open, file_read, file_write, file_close |
-| **Networking** | socket_create, socket_connect, socket_send, socket_recv, socket_close, socket_bind, socket_listen, socket_accept, ip4 |
+| **Networking** | socket_create, socket_connect, socket_send, socket_recv, socket_close, socket_bind, socket_listen, socket_accept, socket_opt, ip4 |
+| **I/O Multiplex** | epoll_create, epoll_add, epoll_del, epoll_wait |
 | **Convert** | int_to_float, float_to_int, dec |
 
 ### Compiler

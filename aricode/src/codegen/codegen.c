@@ -447,7 +447,26 @@ do_div_mod:
             n = emit_syscall(BUF(cg));
             EMIT(cg, n);
 
-            /* mov rdi, 1 (exit code) */
+            /* Check if try/catch is active (R15 == 1):
+             * if active, jump to catch handler instead of exit */
+            uint8_t *b2;
+            /* test r15, r15 */
+            b2 = BUF(cg); b2[0]=0x4D; b2[1]=0x85; b2[2]=0xFF; EMIT(cg, 3);
+            /* je .no_catch (if R15==0, no handler, do exit) */
+            size_t je_nocatch = cg->code_size;
+            b2 = BUF(cg); b2[0]=0x74; b2[1]=0x00; EMIT(cg, 2);
+
+            /* Catch is active: restore RSP/RBP from R12/R13 and jump to R14 */
+            /* mov rax, 1 (error code for catch) */
+            n = emit_mov_reg_imm32(BUF(cg), REG_RAX, 1); EMIT(cg, n);
+            b2 = BUF(cg); b2[0]=0x4C; b2[1]=0x89; b2[2]=0xE4; EMIT(cg, 3); /* mov rsp, r12 */
+            b2 = BUF(cg); b2[0]=0x4C; b2[1]=0x89; b2[2]=0xED; EMIT(cg, 3); /* mov rbp, r13 */
+            b2 = BUF(cg); b2[0]=0x41; b2[1]=0xFF; b2[2]=0xE6; EMIT(cg, 3); /* jmp r14 */
+
+            /* .no_catch: patch je */
+            cg->code[je_nocatch + 1] = (uint8_t)(cg->code_size - (je_nocatch + 2));
+
+            /* No catch handler: exit with code 1 */
             n = emit_mov_reg_imm32(BUF(cg), REG_RDI, 1);
             EMIT(cg, n);
             /* mov rax, 60 (__NR_exit) */
@@ -1017,13 +1036,52 @@ static void emit_call_expr(CodegenState *cg, const ASTNode *node) {
             return;
         }
         if (strcmp(callee->string_val, "arr_get") == 0 && argc == 2) {
-            /* arr_get(base, idx): load [base + idx*8] */
+            /* arr_get(base, idx): load [base + idx*8] with bounds check */
             emit_expression(cg, node->children[2]); /* idx -> RAX */
             int pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
             emit_expression(cg, node->children[1]); /* base -> RAX */
             pn = emit_pop(BUF(cg), REG_RCX); EMIT(cg, pn); /* RCX = idx */
+
+            /* ── Bounds check: 0 <= idx < length ──
+             * RDX = [RAX - 8] (length)
+             * if idx < 0 || idx >= length → error */
+            uint8_t *b;
+            /* mov rdx, [rax - 8]  (load length) */
+            pn = emit_mov_reg_mem(BUF(cg), REG_RDX, REG_RAX, -8); EMIT(cg, pn);
+            /* cmp rcx, rdx */
+            pn = emit_cmp_reg_reg(BUF(cg), REG_RCX, REG_RDX); EMIT(cg, pn);
+            /* jb .bounds_ok (unsigned: catches negative idx too) */
+            size_t jb_pos = cg->code_size;
+            b = BUF(cg); b[0]=0x0F; b[1]=0x82; memset(b+2,0,4); EMIT(cg, 6);
+
+            /* Error: index out of bounds */
+            {
+                const char *errmsg = "Runtime error: array index out of bounds\n";
+                size_t errmsg_len = 41;
+                size_t jmp_str = cg->code_size;
+                pn = emit_jmp(BUF(cg), 0); EMIT(cg, pn);
+                size_t str_pos = cg->code_size;
+                memcpy(BUF(cg), errmsg, errmsg_len); cg->code_size += errmsg_len;
+                int32_t jo = (int32_t)(cg->code_size - (jmp_str + 5));
+                memcpy(cg->code + jmp_str + 1, &jo, 4);
+                int32_t rip_off = (int32_t)((int64_t)str_pos - (int64_t)(cg->code_size + 7));
+                b = BUF(cg);
+                b[0]=rex(1,reg_ext(REG_RSI),0,0); b[1]=0x8D;
+                b[2]=modrm(0,REG_RSI,5); memcpy(b+3,&rip_off,4); EMIT(cg,7);
+                pn = emit_mov_reg_imm32(BUF(cg), REG_RDX, (uint32_t)errmsg_len); EMIT(cg, pn);
+                pn = emit_mov_reg_imm32(BUF(cg), REG_RDI, 2); EMIT(cg, pn);
+                pn = emit_mov_reg_imm32(BUF(cg), REG_RAX, 1); EMIT(cg, pn);
+                pn = emit_syscall(BUF(cg)); EMIT(cg, pn);
+                pn = emit_mov_reg_imm32(BUF(cg), REG_RDI, 1); EMIT(cg, pn);
+                pn = emit_mov_reg_imm32(BUF(cg), REG_RAX, 60); EMIT(cg, pn);
+                pn = emit_syscall(BUF(cg)); EMIT(cg, pn);
+            }
+            /* .bounds_ok: patch jb */
+            int32_t jb_off = (int32_t)(cg->code_size - (jb_pos + 6));
+            memcpy(cg->code + jb_pos + 2, &jb_off, 4);
+
             /* lea rcx, [rax + rcx*8] */
-            uint8_t *b = BUF(cg);
+            b = BUF(cg);
             b[0] = rex(1, reg_ext(REG_RCX), reg_ext(REG_RCX), reg_ext(REG_RAX));
             b[1] = 0x8D;
             b[2] = modrm(0, REG_RCX & 7, 4); /* SIB */
@@ -1037,7 +1095,7 @@ static void emit_call_expr(CodegenState *cg, const ASTNode *node) {
             return;
         }
         if (strcmp(callee->string_val, "arr_set") == 0 && argc == 3) {
-            /* arr_set(base, idx, val) */
+            /* arr_set(base, idx, val) with bounds check */
             emit_expression(cg, node->children[3]); /* val -> RAX */
             int pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
             emit_expression(cg, node->children[2]); /* idx -> RAX */
@@ -1045,8 +1103,49 @@ static void emit_call_expr(CodegenState *cg, const ASTNode *node) {
             emit_expression(cg, node->children[1]); /* base -> RAX */
             pn = emit_pop(BUF(cg), REG_RCX); EMIT(cg, pn); /* RCX = idx */
             pn = emit_pop(BUF(cg), REG_RDX); EMIT(cg, pn); /* RDX = val */
+
+            /* ── Bounds check: 0 <= idx < length ── */
+            uint8_t *b;
+            /* Save RDX (val) before we use it */
+            pn = emit_push(BUF(cg), REG_RDX); EMIT(cg, pn);
+            /* r11 = [rax - 8] (length) */
+            b = BUF(cg); b[0]=0x4C; b[1]=0x8B; b[2]=0x58; b[3]=0xF8; EMIT(cg, 4); /* mov r11,[rax-8] */
+            /* cmp rcx, r11 */
+            b = BUF(cg); b[0]=0x4C; b[1]=0x39; b[2]=0xD9; EMIT(cg, 3); /* cmp rcx, r11 */
+            /* jb .bounds_ok */
+            size_t jb_pos = cg->code_size;
+            b = BUF(cg); b[0]=0x0F; b[1]=0x82; memset(b+2,0,4); EMIT(cg, 6);
+
+            /* Error: index out of bounds */
+            {
+                const char *errmsg = "Runtime error: array index out of bounds\n";
+                size_t errmsg_len = 41;
+                size_t jmp_str = cg->code_size;
+                pn = emit_jmp(BUF(cg), 0); EMIT(cg, pn);
+                size_t str_pos = cg->code_size;
+                memcpy(BUF(cg), errmsg, errmsg_len); cg->code_size += errmsg_len;
+                int32_t jo = (int32_t)(cg->code_size - (jmp_str + 5));
+                memcpy(cg->code + jmp_str + 1, &jo, 4);
+                int32_t rip_off = (int32_t)((int64_t)str_pos - (int64_t)(cg->code_size + 7));
+                b = BUF(cg);
+                b[0]=rex(1,reg_ext(REG_RSI),0,0); b[1]=0x8D;
+                b[2]=modrm(0,REG_RSI,5); memcpy(b+3,&rip_off,4); EMIT(cg,7);
+                pn = emit_mov_reg_imm32(BUF(cg), REG_RDX, (uint32_t)errmsg_len); EMIT(cg, pn);
+                pn = emit_mov_reg_imm32(BUF(cg), REG_RDI, 2); EMIT(cg, pn);
+                pn = emit_mov_reg_imm32(BUF(cg), REG_RAX, 1); EMIT(cg, pn);
+                pn = emit_syscall(BUF(cg)); EMIT(cg, pn);
+                pn = emit_mov_reg_imm32(BUF(cg), REG_RDI, 1); EMIT(cg, pn);
+                pn = emit_mov_reg_imm32(BUF(cg), REG_RAX, 60); EMIT(cg, pn);
+                pn = emit_syscall(BUF(cg)); EMIT(cg, pn);
+            }
+            /* .bounds_ok: patch jb */
+            int32_t jb_off = (int32_t)(cg->code_size - (jb_pos + 6));
+            memcpy(cg->code + jb_pos + 2, &jb_off, 4);
+            /* Restore RDX (val) */
+            pn = emit_pop(BUF(cg), REG_RDX); EMIT(cg, pn);
+
             /* lea rcx, [rax + rcx*8] */
-            uint8_t *b = BUF(cg);
+            b = BUF(cg);
             b[0] = rex(1, reg_ext(REG_RCX), reg_ext(REG_RCX), reg_ext(REG_RAX));
             b[1] = 0x8D;
             b[2] = modrm(0, REG_RCX & 7, 4);
@@ -1067,6 +1166,31 @@ static void emit_call_expr(CodegenState *cg, const ASTNode *node) {
             /* mov rax, [rax - 8] */
             int pn = emit_mov_reg_mem(BUF(cg), REG_RAX, REG_RAX, -8);
             EMIT(cg, pn);
+            return;
+        }
+
+        if (strcmp(callee->string_val, "mem_free") == 0 && argc == 1) {
+            /* mem_free(base): munmap the heap allocation.
+             * base points to elem0/char0. Real mmap ptr = base - 8.
+             * For arrays:  mmap_size = (length + 1) * 8
+             * For strings: mmap_size = length + 8
+             * We store length at [base-8], mmap started at base-8.
+             * munmap(addr, size) = syscall 11 */
+            emit_expression(cg, node->children[1]); /* base -> RAX */
+            int pn;
+            /* RDI = base - 8 (real mmap address) */
+            pn = emit_mov_reg_reg(BUF(cg), REG_RDI, REG_RAX); EMIT(cg, pn);
+            pn = emit_add_reg_imm(BUF(cg), REG_RDI, -8); EMIT(cg, pn);
+            /* RSI = [base - 8] (length) */
+            pn = emit_mov_reg_mem(BUF(cg), REG_RSI, REG_RAX, -8); EMIT(cg, pn);
+            /* RSI = (length + 1) * 8 — conservative size covering both arrays and strings */
+            pn = emit_add_reg_imm(BUF(cg), REG_RSI, 1); EMIT(cg, pn);
+            pn = emit_shl_reg_imm(BUF(cg), REG_RSI, 3); EMIT(cg, pn);
+            /* syscall munmap(rdi, rsi) */
+            pn = emit_mov_reg_imm32(BUF(cg), REG_RAX, 11); EMIT(cg, pn); /* __NR_munmap */
+            pn = emit_syscall(BUF(cg)); EMIT(cg, pn);
+            /* Return 0 on success */
+            pn = emit_xor_reg_reg(BUF(cg), REG_RAX, REG_RAX); EMIT(cg, pn);
             return;
         }
 
@@ -1485,13 +1609,44 @@ static void emit_call_expr(CodegenState *cg, const ASTNode *node) {
         }
 
         if (strcmp(callee->string_val, "str_char_at") == 0 && argc == 2) {
-            /* str_char_at(s, i) → ASCII value */
-            emit_expression(cg, node->children[2]);
+            /* str_char_at(s, i) → ASCII value, with bounds check */
+            emit_expression(cg, node->children[2]); /* idx */
             int pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
-            emit_expression(cg, node->children[1]);
+            emit_expression(cg, node->children[1]); /* base */
             pn = emit_pop(BUF(cg), REG_RCX); EMIT(cg, pn);
+
+            /* ── Bounds check: 0 <= idx < str_len ── */
+            uint8_t *b;
+            pn = emit_mov_reg_mem(BUF(cg), REG_RDX, REG_RAX, -8); EMIT(cg, pn); /* rdx=len */
+            pn = emit_cmp_reg_reg(BUF(cg), REG_RCX, REG_RDX); EMIT(cg, pn);
+            size_t jb_pos = cg->code_size;
+            b = BUF(cg); b[0]=0x0F; b[1]=0x82; memset(b+2,0,4); EMIT(cg, 6); /* jb .ok */
+            {
+                const char *errmsg = "Runtime error: string index out of bounds\n";
+                size_t errmsg_len = 42;
+                size_t jmp_str = cg->code_size;
+                pn = emit_jmp(BUF(cg), 0); EMIT(cg, pn);
+                size_t str_pos = cg->code_size;
+                memcpy(BUF(cg), errmsg, errmsg_len); cg->code_size += errmsg_len;
+                int32_t jo = (int32_t)(cg->code_size - (jmp_str + 5));
+                memcpy(cg->code + jmp_str + 1, &jo, 4);
+                int32_t rip_off = (int32_t)((int64_t)str_pos - (int64_t)(cg->code_size + 7));
+                b = BUF(cg);
+                b[0]=rex(1,reg_ext(REG_RSI),0,0); b[1]=0x8D;
+                b[2]=modrm(0,REG_RSI,5); memcpy(b+3,&rip_off,4); EMIT(cg,7);
+                pn = emit_mov_reg_imm32(BUF(cg), REG_RDX, (uint32_t)errmsg_len); EMIT(cg, pn);
+                pn = emit_mov_reg_imm32(BUF(cg), REG_RDI, 2); EMIT(cg, pn);
+                pn = emit_mov_reg_imm32(BUF(cg), REG_RAX, 1); EMIT(cg, pn);
+                pn = emit_syscall(BUF(cg)); EMIT(cg, pn);
+                pn = emit_mov_reg_imm32(BUF(cg), REG_RDI, 1); EMIT(cg, pn);
+                pn = emit_mov_reg_imm32(BUF(cg), REG_RAX, 60); EMIT(cg, pn);
+                pn = emit_syscall(BUF(cg)); EMIT(cg, pn);
+            }
+            int32_t jb_off = (int32_t)(cg->code_size - (jb_pos + 6));
+            memcpy(cg->code + jb_pos + 2, &jb_off, 4);
+
             /* movzx rax, byte [rax + rcx] */
-            uint8_t *b = BUF(cg);
+            b = BUF(cg);
             b[0]=rex(1,reg_ext(REG_RAX),reg_ext(REG_RCX),reg_ext(REG_RAX));
             b[1]=0x0F; b[2]=0xB6;
             b[3]=modrm(0,REG_RAX&7,4);
@@ -2422,7 +2577,7 @@ static void emit_statement(CodegenState *cg, const ASTNode *node) {
         size_t catch_addr = cg->code_size;
 
         /* Patch R14 with the catch address + ELF load base (0x400000 + header) */
-        uint64_t catch_runtime_addr = 0x400078 + catch_addr; /* ELF base + header */
+        uint64_t catch_runtime_addr = 0x400000 + (64 + 56 * 2) + catch_addr; /* ELF base + ELF header(64) + 2 PHDRs(56*2) */
         memcpy(cg->code + r14_patch + 2, &catch_runtime_addr, 8);
 
         /* Restore RSP and RBP from R12/R13 */

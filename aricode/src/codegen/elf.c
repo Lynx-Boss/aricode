@@ -24,7 +24,8 @@
 
 #define ELF_EHDR_SIZE  64   /* sizeof(Elf64_Ehdr) */
 #define ELF_PHDR_SIZE  56   /* sizeof(Elf64_Phdr) */
-#define ELF_HDR_TOTAL  (ELF_EHDR_SIZE + ELF_PHDR_SIZE)
+#define ELF_PHDR_COUNT 2    /* PT_LOAD + PT_GNU_STACK */
+#define ELF_HDR_TOTAL  (ELF_EHDR_SIZE + ELF_PHDR_SIZE * ELF_PHDR_COUNT)
 
 #define LOAD_ADDR      0x400000ULL
 
@@ -37,6 +38,7 @@
 #define ET_EXEC        2
 #define EM_X86_64      62
 #define PT_LOAD        1
+#define PT_GNU_STACK   0x6474E551
 #define PF_X           1
 #define PF_R           4
 #define PF_W           2
@@ -95,8 +97,8 @@ ElfBinary *elf_create(const uint8_t *code_buf, size_t code_size,
     v16 = ELF_EHDR_SIZE;  memcpy(e + 52, &v16, 2);
     /* e_phentsize */
     v16 = ELF_PHDR_SIZE;  memcpy(e + 54, &v16, 2);
-    /* e_phnum = 1 */
-    v16 = 1;              memcpy(e + 56, &v16, 2);
+    /* e_phnum = 2 (PT_LOAD + PT_GNU_STACK) */
+    v16 = ELF_PHDR_COUNT; memcpy(e + 56, &v16, 2);
     /* e_shentsize = 0 */
     v16 = 0;              memcpy(e + 58, &v16, 2);
     /* e_shnum = 0 */
@@ -123,6 +125,19 @@ ElfBinary *elf_create(const uint8_t *code_buf, size_t code_size,
     v64 = total;           memcpy(p + 40, &v64, 8);
     /* p_align = 0x1000 (page alignment) */
     v64 = 0x1000;          memcpy(p + 48, &v64, 8);
+
+    /* ---- PT_GNU_STACK Program Header (56 bytes) ----
+     * Marks the stack as non-executable (NX).
+     * Without this, the kernel may allow code execution on the stack,
+     * enabling shellcode injection attacks. */
+    uint8_t *p2 = buf + ELF_EHDR_SIZE + ELF_PHDR_SIZE;
+
+    /* p_type = PT_GNU_STACK */
+    v32 = PT_GNU_STACK;   memcpy(p2 + 0, &v32, 4);
+    /* p_flags = PF_R | PF_W (read+write, NO execute) */
+    v32 = PF_R | PF_W;   memcpy(p2 + 4, &v32, 4);
+    /* All other fields = 0 (offset, vaddr, paddr, filesz, memsz, align) */
+    /* Already zeroed by calloc */
 
     /* ---- Code ---- */
     memcpy(buf + ELF_HDR_TOTAL, code_buf, code_size);

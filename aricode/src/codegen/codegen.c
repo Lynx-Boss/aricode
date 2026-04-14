@@ -1267,6 +1267,224 @@ static void emit_call_expr(CodegenState *cg, const ASTNode *node) {
         }
 
         /*
+         * SSE2 SIMD BUILTINS — vectorized array operations
+         * Process 2 i64 elements per cycle (128-bit XMM registers).
+         * Universal on all x86_64 processors — safe for embedded/robotics.
+         *
+         * arr_sum(base)          → sum of all elements
+         * arr_fill(base, val)    → fill all elements with val
+         * arr_scale(base, factor)→ multiply all elements by factor
+         * arr_dot(a, b)          → dot product of two same-length arrays
+         */
+        if (strcmp(callee->string_val, "arr_sum") == 0 && argc == 1) {
+            /* SSE2 vectorized sum: PADDQ on 2 x i64 per iteration
+             * XMM0 = accumulator [sum_lo, sum_hi]
+             * Loop: xmm1 = [elem[i], elem[i+1]]; xmm0 += xmm1
+             * After loop: horizontal add xmm0 → rax */
+            emit_expression(cg, node->children[1]); /* base → RAX */
+            int pn; uint8_t *b;
+            /* RDI = base, RCX = length */
+            pn = emit_mov_reg_reg(BUF(cg), REG_RDI, REG_RAX); EMIT(cg, pn);
+            pn = emit_mov_reg_mem(BUF(cg), REG_RCX, REG_RAX, -8); EMIT(cg, pn);
+            /* pxor xmm0, xmm0 (zero accumulator) */
+            b = BUF(cg); b[0]=0x66; b[1]=0x0F; b[2]=0xEF; b[3]=0xC0; EMIT(cg, 4);
+            /* RSI = i = 0 */
+            pn = emit_xor_reg_reg(BUF(cg), REG_RSI, REG_RSI); EMIT(cg, pn);
+
+            /* .simd_loop: cmp rsi+2, rcx — can we do 2 at a time? */
+            size_t simd_loop = cg->code_size;
+            /* lea rdx, [rsi+2] */
+            b = BUF(cg); b[0]=0x48; b[1]=0x8D; b[2]=0x56; b[3]=0x02; EMIT(cg, 4);
+            /* cmp rdx, rcx */
+            pn = emit_cmp_reg_reg(BUF(cg), REG_RDX, REG_RCX); EMIT(cg, pn);
+            /* ja .scalar_tail */
+            size_t ja_scalar = cg->code_size;
+            b = BUF(cg); b[0]=0x0F; b[1]=0x87; memset(b+2,0,4); EMIT(cg, 6);
+
+            /* movdqu xmm1, [rdi + rsi*8] — load 2 elements */
+            b = BUF(cg); b[0]=0xF3; b[1]=0x0F; b[2]=0x6F;
+            b[3]=modrm(0, 1, 4); /* xmm1, SIB */
+            b[4]=(uint8_t)((3<<6)|(REG_RSI<<3)|REG_RDI); /* scale=8 */
+            EMIT(cg, 5);
+            /* paddq xmm0, xmm1 */
+            b = BUF(cg); b[0]=0x66; b[1]=0x0F; b[2]=0xD4; b[3]=0xC1; EMIT(cg, 4);
+            /* add rsi, 2 */
+            pn = emit_add_reg_imm(BUF(cg), REG_RSI, 2); EMIT(cg, pn);
+            /* jmp .simd_loop */
+            int32_t back = (int32_t)((int64_t)simd_loop - (int64_t)(cg->code_size + 5));
+            pn = emit_jmp(BUF(cg), back); EMIT(cg, pn);
+
+            /* .scalar_tail: handle remaining element */
+            int32_t ja_off = (int32_t)(cg->code_size - (ja_scalar + 6));
+            memcpy(cg->code + ja_scalar + 2, &ja_off, 4);
+
+            /* cmp rsi, rcx */
+            pn = emit_cmp_reg_reg(BUF(cg), REG_RSI, REG_RCX); EMIT(cg, pn);
+            /* jae .done */
+            size_t jae_done = cg->code_size;
+            b = BUF(cg); b[0]=0x0F; b[1]=0x83; memset(b+2,0,4); EMIT(cg, 6);
+            /* add xmm0, [rdi + rsi*8] as scalar via GPR */
+            /* mov rdx, [rdi + rsi*8] */
+            b = BUF(cg); b[0]=rex(1,reg_ext(REG_RDX),reg_ext(REG_RSI),reg_ext(REG_RDI));
+            b[1]=0x8B; b[2]=modrm(0,REG_RDX&7,4);
+            b[3]=(uint8_t)((3<<6)|((REG_RSI&7)<<3)|(REG_RDI&7));
+            EMIT(cg, 4);
+            /* movq xmm1, rdx */
+            b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xCA; EMIT(cg, 5);
+            /* paddq xmm0, xmm1 */
+            b = BUF(cg); b[0]=0x66; b[1]=0x0F; b[2]=0xD4; b[3]=0xC1; EMIT(cg, 4);
+
+            /* .done: horizontal sum xmm0 → rax */
+            int32_t jae_off = (int32_t)(cg->code_size - (jae_done + 6));
+            memcpy(cg->code + jae_done + 2, &jae_off, 4);
+
+            /* movq rax, xmm0 (low 64 bits) */
+            b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x7E; b[4]=0xC0; EMIT(cg, 5);
+            /* psrldq xmm0, 8 (shift high 64 bits to low) */
+            b = BUF(cg); b[0]=0x66; b[1]=0x0F; b[2]=0x73; b[3]=0xD8; b[4]=0x08; EMIT(cg, 5);
+            /* movq rdx, xmm0 */
+            b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x7E; b[4]=0xC2; EMIT(cg, 5);
+            /* add rax, rdx */
+            pn = emit_add_reg_reg(BUF(cg), REG_RAX, REG_RDX); EMIT(cg, pn);
+            return;
+        }
+
+        if (strcmp(callee->string_val, "arr_fill") == 0 && argc == 2) {
+            /* SSE2 vectorized fill: store [val, val] via MOVDQU, 2 per cycle */
+            emit_expression(cg, node->children[2]); /* val → RAX */
+            int pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
+            emit_expression(cg, node->children[1]); /* base → RAX */
+            pn = emit_pop(BUF(cg), REG_RDX); EMIT(cg, pn); /* RDX = val */
+            uint8_t *b;
+            /* RDI = base, RCX = length */
+            pn = emit_mov_reg_reg(BUF(cg), REG_RDI, REG_RAX); EMIT(cg, pn);
+            pn = emit_mov_reg_mem(BUF(cg), REG_RCX, REG_RAX, -8); EMIT(cg, pn);
+            /* movq xmm0, rdx */
+            b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xC2; EMIT(cg, 5);
+            /* punpcklqdq xmm0, xmm0 (broadcast val to both lanes) */
+            b = BUF(cg); b[0]=0x66; b[1]=0x0F; b[2]=0x6C; b[3]=0xC0; EMIT(cg, 4);
+            /* RSI = 0 */
+            pn = emit_xor_reg_reg(BUF(cg), REG_RSI, REG_RSI); EMIT(cg, pn);
+
+            size_t loop_top = cg->code_size;
+            /* lea rdx, [rsi+2] */
+            b = BUF(cg); b[0]=0x48; b[1]=0x8D; b[2]=0x56; b[3]=0x02; EMIT(cg, 4);
+            pn = emit_cmp_reg_reg(BUF(cg), REG_RDX, REG_RCX); EMIT(cg, pn);
+            size_t ja_tail = cg->code_size;
+            b = BUF(cg); b[0]=0x0F; b[1]=0x87; memset(b+2,0,4); EMIT(cg, 6);
+            /* movdqu [rdi + rsi*8], xmm0 */
+            b = BUF(cg); b[0]=0xF3; b[1]=0x0F; b[2]=0x7F;
+            b[3]=modrm(0, 0, 4);
+            b[4]=(uint8_t)((3<<6)|(REG_RSI<<3)|REG_RDI);
+            EMIT(cg, 5);
+            pn = emit_add_reg_imm(BUF(cg), REG_RSI, 2); EMIT(cg, pn);
+            int32_t back = (int32_t)((int64_t)loop_top - (int64_t)(cg->code_size + 5));
+            pn = emit_jmp(BUF(cg), back); EMIT(cg, pn);
+            /* scalar tail */
+            int32_t ja_off = (int32_t)(cg->code_size - (ja_tail + 6));
+            memcpy(cg->code + ja_tail + 2, &ja_off, 4);
+            pn = emit_cmp_reg_reg(BUF(cg), REG_RSI, REG_RCX); EMIT(cg, pn);
+            size_t jae_done = cg->code_size;
+            b = BUF(cg); b[0]=0x0F; b[1]=0x83; memset(b+2,0,4); EMIT(cg, 6);
+            /* movq xmm0 → rdx, then mov [rdi+rsi*8], rdx */
+            b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x7E; b[4]=0xC2; EMIT(cg, 5);
+            b = BUF(cg); b[0]=rex(1,reg_ext(REG_RDX),reg_ext(REG_RSI),reg_ext(REG_RDI));
+            b[1]=0x89; b[2]=modrm(0,REG_RDX&7,4);
+            b[3]=(uint8_t)((3<<6)|((REG_RSI&7)<<3)|(REG_RDI&7));
+            EMIT(cg, 4);
+            /* .done */
+            int32_t jae_off2 = (int32_t)(cg->code_size - (jae_done + 6));
+            memcpy(cg->code + jae_done + 2, &jae_off2, 4);
+            pn = emit_xor_reg_reg(BUF(cg), REG_RAX, REG_RAX); EMIT(cg, pn);
+            return;
+        }
+
+        if (strcmp(callee->string_val, "arr_scale") == 0 && argc == 2) {
+            /* Scalar multiply (SSE2 lacks 64-bit integer multiply).
+             * Uses GPR imul — still vectorization-ready loop structure. */
+            emit_expression(cg, node->children[2]); /* factor → RAX */
+            int pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
+            emit_expression(cg, node->children[1]); /* base → RAX */
+            pn = emit_pop(BUF(cg), REG_RDX); EMIT(cg, pn); /* RDX = factor */
+            uint8_t *b;
+            pn = emit_mov_reg_reg(BUF(cg), REG_RDI, REG_RAX); EMIT(cg, pn); /* base */
+            pn = emit_mov_reg_mem(BUF(cg), REG_RCX, REG_RAX, -8); EMIT(cg, pn); /* len */
+            pn = emit_xor_reg_reg(BUF(cg), REG_RSI, REG_RSI); EMIT(cg, pn); /* i=0 */
+
+            size_t loop_top = cg->code_size;
+            pn = emit_cmp_reg_reg(BUF(cg), REG_RSI, REG_RCX); EMIT(cg, pn);
+            size_t jae_done = cg->code_size;
+            b = BUF(cg); b[0]=0x0F; b[1]=0x83; memset(b+2,0,4); EMIT(cg, 6);
+            /* mov rax, [rdi + rsi*8] */
+            b = BUF(cg); b[0]=rex(1,reg_ext(REG_RAX),reg_ext(REG_RSI),reg_ext(REG_RDI));
+            b[1]=0x8B; b[2]=modrm(0,REG_RAX&7,4);
+            b[3]=(uint8_t)((3<<6)|((REG_RSI&7)<<3)|(REG_RDI&7));
+            EMIT(cg, 4);
+            /* imul rax, rdx */
+            pn = emit_imul_reg_reg(BUF(cg), REG_RAX, REG_RDX); EMIT(cg, pn);
+            /* mov [rdi + rsi*8], rax */
+            b = BUF(cg); b[0]=rex(1,reg_ext(REG_RAX),reg_ext(REG_RSI),reg_ext(REG_RDI));
+            b[1]=0x89; b[2]=modrm(0,REG_RAX&7,4);
+            b[3]=(uint8_t)((3<<6)|((REG_RSI&7)<<3)|(REG_RDI&7));
+            EMIT(cg, 4);
+            pn = emit_inc_reg(BUF(cg), REG_RSI); EMIT(cg, pn);
+            int32_t back = (int32_t)((int64_t)loop_top - (int64_t)(cg->code_size + 5));
+            pn = emit_jmp(BUF(cg), back); EMIT(cg, pn);
+            int32_t jae_off = (int32_t)(cg->code_size - (jae_done + 6));
+            memcpy(cg->code + jae_done + 2, &jae_off, 4);
+            pn = emit_xor_reg_reg(BUF(cg), REG_RAX, REG_RAX); EMIT(cg, pn);
+            return;
+        }
+
+        if (strcmp(callee->string_val, "arr_dot") == 0 && argc == 2) {
+            /* Dot product: sum(a[i] * b[i]) using GPR multiply + accumulate.
+             * Both arrays must have same length (uses a's length).
+             * Uses RBX (callee-saved) for b_ptr to avoid r8 SIB encoding issues. */
+            emit_expression(cg, node->children[2]); /* b → RAX */
+            int pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
+            emit_expression(cg, node->children[1]); /* a → RAX */
+            pn = emit_pop(BUF(cg), REG_RDX); EMIT(cg, pn); /* RDX = b base */
+            uint8_t *b;
+            /* Save RBX (callee-saved) */
+            pn = emit_push(BUF(cg), REG_RBX); EMIT(cg, pn);
+            /* RDI = a, RBX = b, RCX = len, R9 = accumulator */
+            pn = emit_mov_reg_reg(BUF(cg), REG_RDI, REG_RAX); EMIT(cg, pn);
+            pn = emit_mov_reg_reg(BUF(cg), REG_RBX, REG_RDX); EMIT(cg, pn);
+            pn = emit_mov_reg_mem(BUF(cg), REG_RCX, REG_RAX, -8); EMIT(cg, pn);
+            b = BUF(cg); b[0]=0x4D; b[1]=0x31; b[2]=0xC9; EMIT(cg, 3); /* xor r9, r9 (acc=0) */
+            pn = emit_xor_reg_reg(BUF(cg), REG_RSI, REG_RSI); EMIT(cg, pn); /* i=0 */
+
+            size_t loop_top = cg->code_size;
+            pn = emit_cmp_reg_reg(BUF(cg), REG_RSI, REG_RCX); EMIT(cg, pn);
+            size_t jae_done = cg->code_size;
+            b = BUF(cg); b[0]=0x0F; b[1]=0x83; memset(b+2,0,4); EMIT(cg, 6);
+            /* mov rax, [rdi + rsi*8] — a[i] */
+            b = BUF(cg); b[0]=rex(1,reg_ext(REG_RAX),reg_ext(REG_RSI),reg_ext(REG_RDI));
+            b[1]=0x8B; b[2]=modrm(0,REG_RAX&7,4);
+            b[3]=(uint8_t)((3<<6)|((REG_RSI&7)<<3)|(REG_RDI&7));
+            EMIT(cg, 4);
+            /* mov rdx, [rbx + rsi*8] — b[i] */
+            b = BUF(cg); b[0]=rex(1,reg_ext(REG_RDX),reg_ext(REG_RSI),reg_ext(REG_RBX));
+            b[1]=0x8B; b[2]=modrm(0,REG_RDX&7,4);
+            b[3]=(uint8_t)((3<<6)|((REG_RSI&7)<<3)|(REG_RBX&7));
+            EMIT(cg, 4);
+            /* imul rax, rdx */
+            pn = emit_imul_reg_reg(BUF(cg), REG_RAX, REG_RDX); EMIT(cg, pn);
+            /* add r9, rax */
+            b = BUF(cg); b[0]=0x49; b[1]=0x01; b[2]=0xC1; EMIT(cg, 3);
+            pn = emit_inc_reg(BUF(cg), REG_RSI); EMIT(cg, pn);
+            int32_t back = (int32_t)((int64_t)loop_top - (int64_t)(cg->code_size + 5));
+            pn = emit_jmp(BUF(cg), back); EMIT(cg, pn);
+            int32_t jae_off = (int32_t)(cg->code_size - (jae_done + 6));
+            memcpy(cg->code + jae_done + 2, &jae_off, 4);
+            /* Restore RBX */
+            pn = emit_pop(BUF(cg), REG_RBX); EMIT(cg, pn);
+            /* mov rax, r9 (return accumulator) */
+            b = BUF(cg); b[0]=0x4C; b[1]=0x89; b[2]=0xC8; EMIT(cg, 3);
+            return;
+        }
+
+        /*
          * print_float(x): Print f64 with 6 decimal places.
          * Strategy: print integer part, ".", then fractional part.
          * Uses the integer print_int mechanism for each part.

@@ -1581,6 +1581,233 @@ static void emit_call_expr(CodegenState *cg, const ASTNode *node) {
             return;
         }
 
+        /*
+         * NETWORK HELPERS
+         * ip4(a, b, c, d) → 32-bit IPv4 in network byte order
+         *   ip4(127, 0, 0, 1) → 0x0100007F (127.0.0.1 in little-endian)
+         */
+        if (strcmp(callee->string_val, "ip4") == 0 && argc == 4) {
+            /* Build 32-bit IP: a | (b<<8) | (c<<16) | (d<<24) — network byte order */
+            int pn;
+            emit_expression(cg, node->children[4]); /* d */
+            pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
+            emit_expression(cg, node->children[3]); /* c */
+            pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
+            emit_expression(cg, node->children[2]); /* b */
+            pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
+            emit_expression(cg, node->children[1]); /* a */
+            /* rax = a, stack: [b, c, d] */
+            pn = emit_pop(BUF(cg), REG_RCX); EMIT(cg, pn); /* rcx = b */
+            uint8_t *b;
+            /* shl rcx, 8 */
+            b = BUF(cg); b[0]=0x48; b[1]=0xC1; b[2]=0xE1; b[3]=8; EMIT(cg, 4);
+            pn = emit_or_reg_reg(BUF(cg), REG_RAX, REG_RCX); EMIT(cg, pn);
+            pn = emit_pop(BUF(cg), REG_RCX); EMIT(cg, pn); /* rcx = c */
+            b = BUF(cg); b[0]=0x48; b[1]=0xC1; b[2]=0xE1; b[3]=16; EMIT(cg, 4);
+            pn = emit_or_reg_reg(BUF(cg), REG_RAX, REG_RCX); EMIT(cg, pn);
+            pn = emit_pop(BUF(cg), REG_RCX); EMIT(cg, pn); /* rcx = d */
+            b = BUF(cg); b[0]=0x48; b[1]=0xC1; b[2]=0xE1; b[3]=24; EMIT(cg, 4);
+            pn = emit_or_reg_reg(BUF(cg), REG_RAX, REG_RCX); EMIT(cg, pn);
+            return;
+        }
+
+        /*
+         * NETWORKING BUILTINS (direct syscalls, no libc)
+         *
+         * socket_create()                → fd (TCP IPv4 socket)
+         * socket_connect(fd, ip, port)   → 0 on success, -errno on error
+         *   ip = 32-bit IPv4 address (e.g. 0x7F000001 = 127.0.0.1)
+         *   port = port number (host byte order, converted internally)
+         * socket_send(fd, buf, len)      → bytes sent
+         * socket_recv(fd, buf, max_len)  → bytes received
+         * socket_close(fd)               → 0
+         * socket_bind(fd, ip, port)      → 0 on success
+         * socket_listen(fd, backlog)     → 0 on success
+         * socket_accept(fd)              → new client fd
+         */
+        if (strcmp(callee->string_val, "socket_create") == 0 && argc == 0) {
+            /* socket(AF_INET=2, SOCK_STREAM=1, IPPROTO_TCP=6) → fd
+             * syscall 41: rdi=domain, rsi=type, rdx=protocol */
+            int pn;
+            pn = emit_mov_reg_imm32(BUF(cg), REG_RDI, 2); EMIT(cg, pn);  /* AF_INET */
+            pn = emit_mov_reg_imm32(BUF(cg), REG_RSI, 1); EMIT(cg, pn);  /* SOCK_STREAM */
+            pn = emit_mov_reg_imm32(BUF(cg), REG_RDX, 6); EMIT(cg, pn);  /* IPPROTO_TCP */
+            pn = emit_mov_reg_imm32(BUF(cg), REG_RAX, 41); EMIT(cg, pn); /* __NR_socket */
+            pn = emit_syscall(BUF(cg)); EMIT(cg, pn);
+            return;
+        }
+        if (strcmp(callee->string_val, "socket_connect") == 0 && argc == 3) {
+            /* connect(fd, sockaddr*, 16)
+             * syscall 42: rdi=fd, rsi=addr, rdx=addrlen
+             * We build struct sockaddr_in on the stack:
+             *   [rsp+0]: sin_family(2) + sin_port(2) = 4 bytes
+             *   [rsp+4]: sin_addr(4)
+             *   [rsp+8]: padding(8)
+             */
+            int pn;
+            /* Evaluate args: fd, ip, port */
+            emit_expression(cg, node->children[3]); /* port → RAX */
+            pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
+            emit_expression(cg, node->children[2]); /* ip → RAX */
+            pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
+            emit_expression(cg, node->children[1]); /* fd → RAX */
+            pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
+
+            /* Pop fd→R8, ip→R9, port→R10 (save in callee-usable regs) */
+            uint8_t *b;
+            b = BUF(cg); b[0]=0x41; b[1]=0x58; EMIT(cg, 2); /* pop r8  = fd */
+            b = BUF(cg); b[0]=0x41; b[1]=0x59; EMIT(cg, 2); /* pop r9  = ip */
+            b = BUF(cg); b[0]=0x41; b[1]=0x5A; EMIT(cg, 2); /* pop r10 = port */
+
+            /* sub rsp, 16 — allocate sockaddr_in on stack */
+            b = BUF(cg); b[0]=0x48; b[1]=0x83; b[2]=0xEC; b[3]=16; EMIT(cg, 4);
+
+            /* Build sockaddr_in at [rsp]:
+             * mov word [rsp], 2           ; sin_family = AF_INET */
+            b = BUF(cg); b[0]=0x66; b[1]=0xC7; b[2]=0x04; b[3]=0x24;
+            b[4]=0x02; b[5]=0x00; EMIT(cg, 6);
+
+            /* Convert port to network byte order (big-endian): xchg al,ah
+             * mov rax, r10 */
+            b = BUF(cg); b[0]=0x4C; b[1]=0x89; b[2]=0xD0; EMIT(cg, 3); /* mov rax, r10 */
+            /* xchg al, ah (swap bytes for network order) */
+            b = BUF(cg); b[0]=0x86; b[1]=0xE0; EMIT(cg, 2);
+            /* mov [rsp+2], ax  ; sin_port */
+            b = BUF(cg); b[0]=0x66; b[1]=0x89; b[2]=0x44; b[3]=0x24; b[4]=0x02; EMIT(cg, 5);
+
+            /* mov [rsp+4], r9d  ; sin_addr (already in network order from caller) */
+            b = BUF(cg); b[0]=0x44; b[1]=0x89; b[2]=0x4C; b[3]=0x24; b[4]=0x04; EMIT(cg, 5);
+
+            /* Zero padding: mov qword [rsp+8], 0 */
+            b = BUF(cg); b[0]=0x48; b[1]=0xC7; b[2]=0x44; b[3]=0x24;
+            b[4]=0x08; b[5]=0x00; b[6]=0x00; b[7]=0x00; b[8]=0x00; EMIT(cg, 9);
+
+            /* syscall connect(fd, &sockaddr, 16)
+             * rdi = fd (r8), rsi = rsp, rdx = 16 */
+            b = BUF(cg); b[0]=0x4C; b[1]=0x89; b[2]=0xC7; EMIT(cg, 3); /* mov rdi, r8 */
+            pn = emit_mov_reg_reg(BUF(cg), REG_RSI, REG_RSP); EMIT(cg, pn); /* rsi = rsp */
+            pn = emit_mov_reg_imm32(BUF(cg), REG_RDX, 16); EMIT(cg, pn);    /* addrlen=16 */
+            pn = emit_mov_reg_imm32(BUF(cg), REG_RAX, 42); EMIT(cg, pn);    /* __NR_connect */
+            pn = emit_syscall(BUF(cg)); EMIT(cg, pn);
+
+            /* Clean up stack: add rsp, 16 */
+            b = BUF(cg); b[0]=0x48; b[1]=0x83; b[2]=0xC4; b[3]=16; EMIT(cg, 4);
+            return;
+        }
+        if (strcmp(callee->string_val, "socket_send") == 0 && argc == 3) {
+            /* sendto(fd, buf, len, 0, NULL, 0) — syscall 44
+             * rdi=fd, rsi=buf, rdx=len, r10=flags=0, r8=NULL, r9=0 */
+            int pn;
+            emit_expression(cg, node->children[3]); /* len */
+            pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
+            emit_expression(cg, node->children[2]); /* buf */
+            pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
+            emit_expression(cg, node->children[1]); /* fd */
+            pn = emit_mov_reg_reg(BUF(cg), REG_RDI, REG_RAX); EMIT(cg, pn);
+            pn = emit_pop(BUF(cg), REG_RSI); EMIT(cg, pn); /* buf */
+            pn = emit_pop(BUF(cg), REG_RDX); EMIT(cg, pn); /* len */
+            /* r10=0 (flags), r8=NULL, r9=0 */
+            uint8_t *b;
+            b = BUF(cg); b[0]=0x4D; b[1]=0x31; b[2]=0xD2; EMIT(cg, 3); /* xor r10, r10 */
+            b = BUF(cg); b[0]=0x4D; b[1]=0x31; b[2]=0xC0; EMIT(cg, 3); /* xor r8, r8 */
+            b = BUF(cg); b[0]=0x4D; b[1]=0x31; b[2]=0xC9; EMIT(cg, 3); /* xor r9, r9 */
+            pn = emit_mov_reg_imm32(BUF(cg), REG_RAX, 44); EMIT(cg, pn); /* __NR_sendto */
+            pn = emit_syscall(BUF(cg)); EMIT(cg, pn);
+            return;
+        }
+        if (strcmp(callee->string_val, "socket_recv") == 0 && argc == 3) {
+            /* recvfrom(fd, buf, max_len, 0, NULL, NULL) — syscall 45
+             * rdi=fd, rsi=buf, rdx=max_len, r10=flags=0, r8=NULL, r9=NULL */
+            int pn;
+            emit_expression(cg, node->children[3]); /* max_len */
+            pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
+            emit_expression(cg, node->children[2]); /* buf */
+            pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
+            emit_expression(cg, node->children[1]); /* fd */
+            pn = emit_mov_reg_reg(BUF(cg), REG_RDI, REG_RAX); EMIT(cg, pn);
+            pn = emit_pop(BUF(cg), REG_RSI); EMIT(cg, pn); /* buf */
+            pn = emit_pop(BUF(cg), REG_RDX); EMIT(cg, pn); /* max_len */
+            uint8_t *b;
+            b = BUF(cg); b[0]=0x4D; b[1]=0x31; b[2]=0xD2; EMIT(cg, 3); /* xor r10, r10 */
+            b = BUF(cg); b[0]=0x4D; b[1]=0x31; b[2]=0xC0; EMIT(cg, 3); /* xor r8, r8 */
+            b = BUF(cg); b[0]=0x4D; b[1]=0x31; b[2]=0xC9; EMIT(cg, 3); /* xor r9, r9 */
+            pn = emit_mov_reg_imm32(BUF(cg), REG_RAX, 45); EMIT(cg, pn); /* __NR_recvfrom */
+            pn = emit_syscall(BUF(cg)); EMIT(cg, pn);
+            return;
+        }
+        if (strcmp(callee->string_val, "socket_close") == 0 && argc == 1) {
+            /* close(fd) — syscall 3 (same as file_close) */
+            emit_expression(cg, node->children[1]);
+            int pn = emit_mov_reg_reg(BUF(cg), REG_RDI, REG_RAX); EMIT(cg, pn);
+            pn = emit_mov_reg_imm32(BUF(cg), REG_RAX, 3); EMIT(cg, pn); /* __NR_close */
+            pn = emit_syscall(BUF(cg)); EMIT(cg, pn);
+            return;
+        }
+        if (strcmp(callee->string_val, "socket_bind") == 0 && argc == 3) {
+            /* bind(fd, sockaddr*, 16) — syscall 49
+             * Same sockaddr_in construction as socket_connect */
+            int pn;
+            emit_expression(cg, node->children[3]); /* port */
+            pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
+            emit_expression(cg, node->children[2]); /* ip */
+            pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
+            emit_expression(cg, node->children[1]); /* fd */
+            pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
+
+            uint8_t *b;
+            b = BUF(cg); b[0]=0x41; b[1]=0x58; EMIT(cg, 2); /* pop r8  = fd */
+            b = BUF(cg); b[0]=0x41; b[1]=0x59; EMIT(cg, 2); /* pop r9  = ip */
+            b = BUF(cg); b[0]=0x41; b[1]=0x5A; EMIT(cg, 2); /* pop r10 = port */
+
+            /* sub rsp, 16 */
+            b = BUF(cg); b[0]=0x48; b[1]=0x83; b[2]=0xEC; b[3]=16; EMIT(cg, 4);
+            /* mov word [rsp], 2  ; AF_INET */
+            b = BUF(cg); b[0]=0x66; b[1]=0xC7; b[2]=0x04; b[3]=0x24;
+            b[4]=0x02; b[5]=0x00; EMIT(cg, 6);
+            /* mov rax, r10; xchg al,ah; mov [rsp+2], ax */
+            b = BUF(cg); b[0]=0x4C; b[1]=0x89; b[2]=0xD0; EMIT(cg, 3);
+            b = BUF(cg); b[0]=0x86; b[1]=0xE0; EMIT(cg, 2);
+            b = BUF(cg); b[0]=0x66; b[1]=0x89; b[2]=0x44; b[3]=0x24; b[4]=0x02; EMIT(cg, 5);
+            /* mov [rsp+4], r9d */
+            b = BUF(cg); b[0]=0x44; b[1]=0x89; b[2]=0x4C; b[3]=0x24; b[4]=0x04; EMIT(cg, 5);
+            /* mov qword [rsp+8], 0 */
+            b = BUF(cg); b[0]=0x48; b[1]=0xC7; b[2]=0x44; b[3]=0x24;
+            b[4]=0x08; b[5]=0x00; b[6]=0x00; b[7]=0x00; b[8]=0x00; EMIT(cg, 9);
+
+            /* bind(r8, rsp, 16) */
+            b = BUF(cg); b[0]=0x4C; b[1]=0x89; b[2]=0xC7; EMIT(cg, 3); /* mov rdi, r8 */
+            pn = emit_mov_reg_reg(BUF(cg), REG_RSI, REG_RSP); EMIT(cg, pn);
+            pn = emit_mov_reg_imm32(BUF(cg), REG_RDX, 16); EMIT(cg, pn);
+            pn = emit_mov_reg_imm32(BUF(cg), REG_RAX, 49); EMIT(cg, pn); /* __NR_bind */
+            pn = emit_syscall(BUF(cg)); EMIT(cg, pn);
+
+            b = BUF(cg); b[0]=0x48; b[1]=0x83; b[2]=0xC4; b[3]=16; EMIT(cg, 4); /* add rsp,16 */
+            return;
+        }
+        if (strcmp(callee->string_val, "socket_listen") == 0 && argc == 2) {
+            /* listen(fd, backlog) — syscall 50 */
+            int pn;
+            emit_expression(cg, node->children[2]); /* backlog */
+            pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
+            emit_expression(cg, node->children[1]); /* fd */
+            pn = emit_mov_reg_reg(BUF(cg), REG_RDI, REG_RAX); EMIT(cg, pn);
+            pn = emit_pop(BUF(cg), REG_RSI); EMIT(cg, pn); /* backlog */
+            pn = emit_mov_reg_imm32(BUF(cg), REG_RAX, 50); EMIT(cg, pn); /* __NR_listen */
+            pn = emit_syscall(BUF(cg)); EMIT(cg, pn);
+            return;
+        }
+        if (strcmp(callee->string_val, "socket_accept") == 0 && argc == 1) {
+            /* accept(fd, NULL, NULL) — syscall 43 */
+            int pn;
+            emit_expression(cg, node->children[1]); /* fd */
+            pn = emit_mov_reg_reg(BUF(cg), REG_RDI, REG_RAX); EMIT(cg, pn);
+            pn = emit_xor_reg_reg(BUF(cg), REG_RSI, REG_RSI); EMIT(cg, pn); /* NULL */
+            pn = emit_xor_reg_reg(BUF(cg), REG_RDX, REG_RDX); EMIT(cg, pn); /* NULL */
+            pn = emit_mov_reg_imm32(BUF(cg), REG_RAX, 43); EMIT(cg, pn); /* __NR_accept */
+            pn = emit_syscall(BUF(cg)); EMIT(cg, pn);
+            return;
+        }
+
     if (argc > SYS_V_ARG_COUNT) {
         cg_error(cg, "too many arguments (max %d) at %d:%d",
                  SYS_V_ARG_COUNT, node->line, node->col);

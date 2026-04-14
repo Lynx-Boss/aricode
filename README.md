@@ -2,10 +2,10 @@
 
 **The first native compilation target for AI agents.**
 
-Every AI coding system today generates Python, C, or JavaScript — languages designed for humans, compiled by heavyweight toolchains. Aricode is different: it's a language designed for **machines to write**, compiled directly to x86_64 machine code in **sub-millisecond**, producing binaries as small as **199 bytes** with **zero runtime dependencies**.
+Every AI coding system today generates Python, C, or JavaScript — languages designed for humans, compiled by heavyweight toolchains. Aricode is different: it's a language designed for **machines to write**, compiled directly to x86_64 machine code in **sub-millisecond**, producing binaries as small as **255 bytes** with **zero runtime dependencies**.
 
 ```
-AI Agent → generates .ari → aric (0.3ms) → 199-byte ELF binary → runs
+AI Agent → generates .ari → aric (0.3ms) → 255-byte ELF binary → runs
 ```
 
 No LLVM. No linker. No libc. No runtime. Just raw machine code.
@@ -57,7 +57,7 @@ Binaries under 3.5 KB with zero runtime dependencies make Aricode ideal for **ro
 
 ### Compiler
 - **Direct x86_64 codegen** - AST to machine code, no LLVM, no IR
-- **Minimal ELF binaries** - 199 bytes (Hello World) to 3.3 KB (physics sim)
+- **Minimal ELF binaries** - 255 bytes (Hello World) to 3.3 KB (physics sim)
 - **6 optimization passes** - constant folding, strength reduction, peephole, TCO, DCE, decimal folding
 - **Semantic analyzer** - 5-level error hierarchy, always-on, zero false positives
 - **Podium system** - compile-time code quality rating (Gold/Silver/Bronze/Iron)

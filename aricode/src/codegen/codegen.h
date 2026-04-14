@@ -109,6 +109,25 @@ typedef struct {
 } CodegenState;
 
 /* ------------------------------------------------------------------ */
+/*  Macros shared with codegen modules                                */
+/* ------------------------------------------------------------------ */
+
+#define EMIT(cg, count) do { (cg)->code_size += (count); } while (0)
+#define BUF(cg) ((cg)->code + (cg)->code_size)
+
+/* ------------------------------------------------------------------ */
+/*  Internal helpers (shared between codegen.c and codegen_builtins.c)*/
+/* ------------------------------------------------------------------ */
+
+void cg_error(CodegenState *cg, const char *fmt, ...);
+int  emit_expression(CodegenState *cg, const ASTNode *node);
+void emit_runtime_error(CodegenState *cg, const char *errmsg, size_t errmsg_len);
+void emit_builtin_print_str(CodegenState *cg, const ASTNode *arg);
+void emit_builtin_print_int(CodegenState *cg, const ASTNode *arg);
+void emit_builtin_read_int(CodegenState *cg);
+LocalVar *add_local(CodegenState *cg, const char *name);
+
+/* ------------------------------------------------------------------ */
 /*  API                                                               */
 /* ------------------------------------------------------------------ */
 

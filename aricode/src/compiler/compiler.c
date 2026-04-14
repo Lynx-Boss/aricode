@@ -654,34 +654,27 @@ int compiler_compile_string(Compiler *c, const char *source,
 
         analyzer_analyze(&analyzer);
 
-        /* Count duplicate function declarations — these always block */
-        size_t dup_fn_count = 0;
-        for (size_t i = 0; i < analyzer.error_count; i++) {
-            if (analyzer.errors[i].level == ARI_LEVEL_LOGIC &&
-                strstr(analyzer.errors[i].message, "Duplicate function")) {
-                dup_fn_count++;
-            }
-        }
-
-        if (analyzer.level0_count > 0 || dup_fn_count > 0) {
-            /* Level 0 (SILENT) errors BLOCK compilation.
-             * Duplicate function declarations BLOCK compilation. */
-            size_t blocking = analyzer.level0_count + dup_fn_count;
+        if (analyzer.level0_count > 0 || analyzer.level1_count > 0) {
+            /* Level 0 (SILENT) and Level 1 (LOGIC) errors BLOCK compilation.
+             * Level 0: code that can fail silently does NOT compile.
+             * Level 1: logic errors (duplicates, type mismatches,
+             *          undefined variables) do NOT compile. */
+            size_t blocking = analyzer.level0_count + analyzer.level1_count;
             if (analyzer.level0_count > 0) {
                 printf("  %s[FAIL]%s Semantic analysis: %zu SILENT error(s)",
                        CLR_RED, CLR_RESET, analyzer.level0_count);
             }
-            if (dup_fn_count > 0) {
-                printf("%s  %s[FAIL]%s Semantic analysis: %zu duplicate function(s)",
+            if (analyzer.level1_count > 0) {
+                printf("%s  %s[FAIL]%s Semantic analysis: %zu LOGIC error(s)",
                        analyzer.level0_count > 0 ? "\n" : "",
-                       CLR_RED, CLR_RESET, dup_fn_count);
+                       CLR_RED, CLR_RESET, analyzer.level1_count);
             }
             printf(" — compilation BLOCKED\n");
             analyzer_print_errors(&analyzer);
             c->error_count += blocking;
             analyzer_destroy(&analyzer);
         } else {
-            size_t total_warnings = analyzer.level1_count + analyzer.level2_count;
+            size_t total_warnings = analyzer.level2_count;
             if (total_warnings > 0 && c->options.verbose) {
                 analyzer_print_errors(&analyzer);
             }

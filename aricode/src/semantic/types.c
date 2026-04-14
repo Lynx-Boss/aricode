@@ -274,6 +274,10 @@ bool types_can_assign(const AriType *target, const AriType *source) {
         return !types_loses_data(target, source);
     }
 
+    /* Bool → integer is always safe (bool is 0 or 1) */
+    if (source->kind == TYPE_BOOL && type_is_integer(target))
+        return true;
+
     return false;
 }
 

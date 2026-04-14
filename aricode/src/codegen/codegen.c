@@ -55,6 +55,78 @@ static void emit_block(CodegenState *cg, const ASTNode *node);
 static void emit_if(CodegenState *cg, const ASTNode *node);
 
 /* ------------------------------------------------------------------ */
+/*  Runtime error block emitter (with string deduplication)           */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Emit a runtime error block: write error string to stderr + exit(1).
+ * If the error string was already embedded, reuse its address.
+ * If try/catch is active (R15==1), jump to catch handler instead.
+ * Caller must emit a conditional jump OVER this block for the happy path.
+ */
+static void emit_runtime_error(CodegenState *cg, const char *errmsg, size_t errmsg_len) {
+    int n; uint8_t *b;
+
+    /* Check if this error string was already embedded */
+    size_t str_pos = 0;
+    int found = 0;
+    for (size_t i = 0; i < cg->error_string_count; i++) {
+        if (cg->error_strings[i].text == errmsg) {
+            str_pos = cg->error_strings[i].code_pos;
+            found = 1;
+            break;
+        }
+    }
+
+    if (!found) {
+        /* Embed string: JMP over data, then string bytes */
+        size_t jmp_str = cg->code_size;
+        n = emit_jmp(BUF(cg), 0); EMIT(cg, n);
+        str_pos = cg->code_size;
+        memcpy(BUF(cg), errmsg, errmsg_len);
+        cg->code_size += errmsg_len;
+        int32_t jo = (int32_t)(cg->code_size - (jmp_str + 5));
+        memcpy(cg->code + jmp_str + 1, &jo, 4);
+        /* Cache it */
+        if (cg->error_string_count < 16) {
+            cg->error_strings[cg->error_string_count].text = errmsg;
+            cg->error_strings[cg->error_string_count].code_pos = str_pos;
+            cg->error_strings[cg->error_string_count].len = errmsg_len;
+            cg->error_string_count++;
+        }
+    }
+
+    /* lea rsi, [rip + offset_to_string] */
+    int32_t rip_off = (int32_t)((int64_t)str_pos - (int64_t)(cg->code_size + 7));
+    b = BUF(cg);
+    b[0] = rex(1, reg_ext(REG_RSI), 0, 0);
+    b[1] = 0x8D;
+    b[2] = modrm(0, REG_RSI, 5);
+    memcpy(b + 3, &rip_off, 4);
+    EMIT(cg, 7);
+    n = emit_mov_reg_imm32(BUF(cg), REG_RDX, (uint32_t)errmsg_len); EMIT(cg, n);
+    n = emit_mov_reg_imm32(BUF(cg), REG_RDI, 2); EMIT(cg, n); /* stderr */
+    n = emit_mov_reg_imm32(BUF(cg), REG_RAX, 1); EMIT(cg, n); /* __NR_write */
+    n = emit_syscall(BUF(cg)); EMIT(cg, n);
+
+    /* Check try/catch: if R15==1, jump to catch handler */
+    b = BUF(cg); b[0]=0x4D; b[1]=0x85; b[2]=0xFF; EMIT(cg, 3); /* test r15,r15 */
+    size_t je_pos = cg->code_size;
+    b = BUF(cg); b[0]=0x74; b[1]=0x00; EMIT(cg, 2); /* je .no_catch */
+    /* Catch active: mov rax,1; restore rsp/rbp; jmp r14 */
+    n = emit_mov_reg_imm32(BUF(cg), REG_RAX, 1); EMIT(cg, n);
+    b = BUF(cg); b[0]=0x4C; b[1]=0x89; b[2]=0xE4; EMIT(cg, 3); /* mov rsp, r12 */
+    b = BUF(cg); b[0]=0x4C; b[1]=0x89; b[2]=0xED; EMIT(cg, 3); /* mov rbp, r13 */
+    b = BUF(cg); b[0]=0x41; b[1]=0xFF; b[2]=0xE6; EMIT(cg, 3); /* jmp r14 */
+    /* .no_catch: */
+    cg->code[je_pos + 1] = (uint8_t)(cg->code_size - (je_pos + 2));
+    /* Exit */
+    n = emit_mov_reg_imm32(BUF(cg), REG_RDI, 1); EMIT(cg, n);
+    n = emit_mov_reg_imm32(BUF(cg), REG_RAX, 60); EMIT(cg, n);
+    n = emit_syscall(BUF(cg)); EMIT(cg, n);
+}
+
+/* ------------------------------------------------------------------ */
 /*  Symbol lookup                                                     */
 /* ------------------------------------------------------------------ */
 
@@ -1963,6 +2035,145 @@ static void emit_call_expr(CodegenState *cg, const ASTNode *node) {
             return;
         }
 
+        /*
+         * EPOLL BUILTINS — I/O multiplexing for concurrent connections
+         *
+         * epoll_create()              → epoll fd
+         * epoll_add(epfd, fd, events) → 0 on success
+         *   events: 1=EPOLLIN, 4=EPOLLOUT, 3=EPOLLIN|EPOLLOUT
+         * epoll_wait(epfd, buf, max, timeout) → number of ready fds
+         *   buf = arr_new(max*3) — stores [fd, events, ...] triples
+         *   timeout in ms, -1 = block forever
+         * epoll_del(epfd, fd)         → 0 on success
+         */
+        /*
+         * STACK BUFFER — zero-syscall temp buffer allocation
+         * buf_stack(n) → pointer to n bytes on stack (no mmap, no munmap)
+         * WARNING: pointer is only valid within the current function scope.
+         * Use for temp read buffers instead of arr_new + mem_free.
+         */
+        if (strcmp(callee->string_val, "buf_stack") == 0 && argc == 1) {
+            /* sub rsp, n (aligned to 16); mov rax, rsp */
+            emit_expression(cg, node->children[1]); /* n → RAX */
+            int pn; uint8_t *b;
+            /* Align n to 16: add rax,15; and rax,~15 */
+            pn = emit_add_reg_imm(BUF(cg), REG_RAX, 15); EMIT(cg, pn);
+            b = BUF(cg); b[0]=0x48; b[1]=0x83; b[2]=0xE0; b[3]=0xF0; EMIT(cg, 4); /* and rax, -16 */
+            /* sub rsp, rax */
+            b = BUF(cg); b[0]=0x48; b[1]=0x29; b[2]=0xC4; EMIT(cg, 3); /* sub rsp, rax */
+            /* mov rax, rsp (return pointer) */
+            pn = emit_mov_reg_reg(BUF(cg), REG_RAX, REG_RSP); EMIT(cg, pn);
+            return;
+        }
+
+        if (strcmp(callee->string_val, "epoll_create") == 0 && argc == 0) {
+            /* epoll_create1(0) — syscall 291 */
+            int pn;
+            pn = emit_xor_reg_reg(BUF(cg), REG_RDI, REG_RDI); EMIT(cg, pn);
+            pn = emit_mov_reg_imm32(BUF(cg), REG_RAX, 291); EMIT(cg, pn);
+            pn = emit_syscall(BUF(cg)); EMIT(cg, pn);
+            return;
+        }
+        if (strcmp(callee->string_val, "epoll_add") == 0 && argc == 3) {
+            /* epoll_ctl(epfd, EPOLL_CTL_ADD=1, fd, &event)
+             * syscall 233: rdi=epfd, rsi=op, rdx=fd, r10=&event
+             * struct epoll_event: [u32 events][u64 data(fd)] = 12 bytes */
+            int pn; uint8_t *b;
+            emit_expression(cg, node->children[3]); /* events */
+            pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
+            emit_expression(cg, node->children[2]); /* fd */
+            pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
+            emit_expression(cg, node->children[1]); /* epfd */
+            pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
+
+            b = BUF(cg); b[0]=0x41; b[1]=0x58; EMIT(cg, 2); /* pop r8 = epfd */
+            b = BUF(cg); b[0]=0x41; b[1]=0x59; EMIT(cg, 2); /* pop r9 = fd */
+            b = BUF(cg); b[0]=0x41; b[1]=0x5A; EMIT(cg, 2); /* pop r10 = events */
+
+            /* Build epoll_event on stack: sub rsp,16 */
+            b = BUF(cg); b[0]=0x48; b[1]=0x83; b[2]=0xEC; b[3]=16; EMIT(cg, 4);
+            /* mov [rsp], r10d (events - 32bit) */
+            b = BUF(cg); b[0]=0x44; b[1]=0x89; b[2]=0x14; b[3]=0x24; EMIT(cg, 4);
+            /* mov [rsp+4], r9 (data.fd - 64bit, we use only lower 32) */
+            b = BUF(cg); b[0]=0x4C; b[1]=0x89; b[2]=0x4C; b[3]=0x24; b[4]=0x04; EMIT(cg, 5);
+
+            /* epoll_ctl(epfd=r8, EPOLL_CTL_ADD=1, fd=r9, event=rsp) */
+            b = BUF(cg); b[0]=0x4C; b[1]=0x89; b[2]=0xC7; EMIT(cg, 3); /* mov rdi, r8 */
+            pn = emit_mov_reg_imm32(BUF(cg), REG_RSI, 1); EMIT(cg, pn); /* EPOLL_CTL_ADD */
+            b = BUF(cg); b[0]=0x4C; b[1]=0x89; b[2]=0xCA; EMIT(cg, 3); /* mov rdx, r9 */
+            b = BUF(cg); b[0]=0x49; b[1]=0x89; b[2]=0xE2; EMIT(cg, 3); /* mov r10, rsp */
+            pn = emit_mov_reg_imm32(BUF(cg), REG_RAX, 233); EMIT(cg, pn); /* __NR_epoll_ctl */
+            pn = emit_syscall(BUF(cg)); EMIT(cg, pn);
+
+            b = BUF(cg); b[0]=0x48; b[1]=0x83; b[2]=0xC4; b[3]=16; EMIT(cg, 4); /* add rsp,16 */
+            return;
+        }
+        if (strcmp(callee->string_val, "epoll_del") == 0 && argc == 2) {
+            /* epoll_ctl(epfd, EPOLL_CTL_DEL=2, fd, NULL) — syscall 233 */
+            int pn;
+            emit_expression(cg, node->children[2]); /* fd */
+            pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
+            emit_expression(cg, node->children[1]); /* epfd */
+            pn = emit_mov_reg_reg(BUF(cg), REG_RDI, REG_RAX); EMIT(cg, pn);
+            pn = emit_mov_reg_imm32(BUF(cg), REG_RSI, 2); EMIT(cg, pn); /* EPOLL_CTL_DEL */
+            pn = emit_pop(BUF(cg), REG_RDX); EMIT(cg, pn); /* fd */
+            uint8_t *b;
+            b = BUF(cg); b[0]=0x4D; b[1]=0x31; b[2]=0xD2; EMIT(cg, 3); /* xor r10,r10 (NULL) */
+            pn = emit_mov_reg_imm32(BUF(cg), REG_RAX, 233); EMIT(cg, pn);
+            pn = emit_syscall(BUF(cg)); EMIT(cg, pn);
+            return;
+        }
+        if (strcmp(callee->string_val, "epoll_wait") == 0 && argc == 4) {
+            /* epoll_wait(epfd, events_buf, maxevents, timeout)
+             * syscall 232: rdi=epfd, rsi=events, rdx=maxevents, r10=timeout
+             * events_buf is an array — we write fd into arr[i*2], events into arr[i*2+1] */
+            int pn;
+            emit_expression(cg, node->children[4]); /* timeout */
+            pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
+            emit_expression(cg, node->children[3]); /* maxevents */
+            pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
+            emit_expression(cg, node->children[2]); /* events_buf (array base) */
+            pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
+            emit_expression(cg, node->children[1]); /* epfd */
+            pn = emit_mov_reg_reg(BUF(cg), REG_RDI, REG_RAX); EMIT(cg, pn);
+            pn = emit_pop(BUF(cg), REG_RSI); EMIT(cg, pn); /* events_buf */
+            pn = emit_pop(BUF(cg), REG_RDX); EMIT(cg, pn); /* maxevents */
+            uint8_t *b;
+            b = BUF(cg); b[0]=0x41; b[1]=0x5A; EMIT(cg, 2); /* pop r10 = timeout */
+            pn = emit_mov_reg_imm32(BUF(cg), REG_RAX, 232); EMIT(cg, pn); /* __NR_epoll_wait */
+            pn = emit_syscall(BUF(cg)); EMIT(cg, pn);
+            return;
+        }
+
+        if (strcmp(callee->string_val, "socket_opt") == 0 && argc == 3) {
+            /* socket_opt(fd, option, value)
+             * setsockopt(fd, SOL_SOCKET=1, option, &value, 4) — syscall 54
+             * Common options: 2=SO_REUSEADDR, 15=SO_REUSEPORT, 1=TCP_NODELAY(lvl6) */
+            int pn;
+            emit_expression(cg, node->children[3]); /* value */
+            pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
+            emit_expression(cg, node->children[2]); /* option */
+            pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
+            emit_expression(cg, node->children[1]); /* fd */
+            pn = emit_mov_reg_reg(BUF(cg), REG_RDI, REG_RAX); EMIT(cg, pn); /* rdi = fd */
+            pn = emit_mov_reg_imm32(BUF(cg), REG_RSI, 1); EMIT(cg, pn); /* rsi = SOL_SOCKET */
+            pn = emit_pop(BUF(cg), REG_RDX); EMIT(cg, pn); /* rdx = option */
+            /* Store value on stack and point R10 to it */
+            /* value is already on stack from the first push */
+            uint8_t *b;
+            b = BUF(cg); b[0]=0x4C; b[1]=0x89; b[2]=0xD2; EMIT(cg, 3); /* mov rdx,rdx (nop placeholder) */
+            /* r10 = rsp (point to value on stack) */
+            b = BUF(cg); b[0]=0x49; b[1]=0x89; b[2]=0xE2; EMIT(cg, 3); /* mov r10, rsp */
+            /* r8 = 4 (optlen = sizeof(int)) */
+            b = BUF(cg); b[0]=0x49; b[1]=0xC7; b[2]=0xC0;
+            int32_t four = 4; memcpy(b+3, &four, 4); EMIT(cg, 7);
+            pn = emit_mov_reg_imm32(BUF(cg), REG_RAX, 54); EMIT(cg, pn); /* __NR_setsockopt */
+            pn = emit_syscall(BUF(cg)); EMIT(cg, pn);
+            /* Clean stack (pop the value) */
+            pn = emit_pop(BUF(cg), REG_RCX); EMIT(cg, pn);
+            return;
+        }
+
     if (argc > SYS_V_ARG_COUNT) {
         cg_error(cg, "too many arguments (max %d) at %d:%d",
                  SYS_V_ARG_COUNT, node->line, node->col);
@@ -2577,7 +2788,7 @@ static void emit_statement(CodegenState *cg, const ASTNode *node) {
         size_t catch_addr = cg->code_size;
 
         /* Patch R14 with the catch address + ELF load base (0x400000 + header) */
-        uint64_t catch_runtime_addr = 0x400000 + (64 + 56 * 2) + catch_addr; /* ELF base + ELF header(64) + 2 PHDRs(56*2) */
+        uint64_t catch_runtime_addr = ARICODE_ELF_BASE + ARICODE_ELF_HDR_TOTAL + catch_addr;
         memcpy(cg->code + r14_patch + 2, &catch_runtime_addr, 8);
 
         /* Restore RSP and RBP from R12/R13 */

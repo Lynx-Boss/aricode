@@ -26,6 +26,13 @@
 #define CODEGEN_MAX_FUNCS  256           /* max function definitions  */
 #define CODEGEN_MAX_VARS   256           /* max locals per function   */
 
+/* ELF constants shared with codegen for address calculation */
+#define ARICODE_ELF_BASE   0x400000ULL  /* ELF load address           */
+#define ARICODE_ELF_EHDR   64           /* ELF64 header size          */
+#define ARICODE_ELF_PHDR   56           /* program header entry size  */
+#define ARICODE_ELF_PHNUM  2            /* PT_LOAD + PT_GNU_STACK     */
+#define ARICODE_ELF_HDR_TOTAL (ARICODE_ELF_EHDR + ARICODE_ELF_PHDR * ARICODE_ELF_PHNUM)
+
 /* ------------------------------------------------------------------ */
 /*  Symbol / variable tracking                                        */
 /* ------------------------------------------------------------------ */
@@ -91,6 +98,14 @@ typedef struct {
     /* Error tracking */
     int         had_error;
     char        error_msg[512];
+
+    /* Error string dedup cache — stores code offsets of embedded error strings */
+    struct {
+        const char *text;     /* pointer to static error string          */
+        size_t      code_pos; /* position in code buffer where embedded  */
+        size_t      len;      /* length of the string                    */
+    } error_strings[16];
+    size_t      error_string_count;
 } CodegenState;
 
 /* ------------------------------------------------------------------ */

@@ -241,6 +241,56 @@ static AriType *analyze_unary_op(Analyzer *a, ASTNode *node) {
     return operand;
 }
 
+/*
+ * Builtin return type lookup.
+ * Returns the known return type for built-in functions,
+ * or NULL if the function is not a builtin.
+ */
+static AriType *builtin_return_type(const char *name) {
+    /* i32 return builtins */
+    if (strcmp(name, "arr_new") == 0 ||
+        strcmp(name, "arr_get") == 0 ||
+        strcmp(name, "arr_set") == 0 ||
+        strcmp(name, "arr_len") == 0 ||
+        strcmp(name, "str_new") == 0 ||
+        strcmp(name, "str_len") == 0 ||
+        strcmp(name, "str_eq") == 0 ||
+        strcmp(name, "str_char_at") == 0 ||
+        strcmp(name, "str_concat") == 0 ||
+        strcmp(name, "read_int") == 0 ||
+        strcmp(name, "float_to_int") == 0 ||
+        strcmp(name, "ip4") == 0 ||
+        strcmp(name, "socket_create") == 0 ||
+        strcmp(name, "socket_connect") == 0 ||
+        strcmp(name, "socket_send") == 0 ||
+        strcmp(name, "socket_recv") == 0 ||
+        strcmp(name, "socket_close") == 0 ||
+        strcmp(name, "socket_bind") == 0 ||
+        strcmp(name, "socket_listen") == 0 ||
+        strcmp(name, "socket_accept") == 0 ||
+        strcmp(name, "mem_free") == 0 ||
+        strcmp(name, "file_open") == 0 ||
+        strcmp(name, "file_read") == 0 ||
+        strcmp(name, "file_write") == 0 ||
+        strcmp(name, "file_close") == 0)
+        return type_create(TYPE_I32);
+    /* f64 return builtins */
+    if (strcmp(name, "read_float") == 0 ||
+        strcmp(name, "int_to_float") == 0)
+        return type_create(TYPE_F64);
+    /* void return builtins (side-effect only) */
+    if (strcmp(name, "print_str") == 0 ||
+        strcmp(name, "print_int") == 0 ||
+        strcmp(name, "print_float") == 0 ||
+        strcmp(name, "print_dec") == 0 ||
+        strcmp(name, "str_println") == 0)
+        return type_create(TYPE_VOID);
+    /* dec() returns a decimal compile-time type — treat as i32 for type checking */
+    if (strcmp(name, "dec") == 0)
+        return type_create(TYPE_I32);
+    return NULL;
+}
+
 static AriType *analyze_call(Analyzer *a, ASTNode *node) {
     if (node->child_count < 1) return type_create(TYPE_UNKNOWN);
 
@@ -249,6 +299,15 @@ static AriType *analyze_call(Analyzer *a, ASTNode *node) {
     const char *fn_name = fn_expr->string_val;
 
     if (fn_expr->type == NODE_IDENTIFIER && fn_name) {
+        /* Check builtins first — these are not in the symbol table */
+        AriType *bi_ret = builtin_return_type(fn_name);
+        if (bi_ret) {
+            /* Analyze arguments but don't type-check params for builtins */
+            for (size_t i = 1; i < node->child_count; i++)
+                type_free(analyze_expr(a, node->children[i]));
+            return bi_ret;
+        }
+
         Symbol *sym = symtab_lookup(a->symbols, fn_name);
         if (!sym) {
             emit_error(a, ARI_LEVEL_LOGIC, ARI_L006_CODE, ARI_L006_FIX,
@@ -509,31 +568,32 @@ static void analyze_fn_decl(Analyzer *a, ASTNode *node) {
     /* We need at least a body */
     if (node->child_count < 1) return;
 
-    /* Determine the structure:
-     * Last child is always the body (NODE_BLOCK).
-     * Second-to-last might be return type (NODE_TYPE_ANNOTATION).
-     * Everything before that is parameters. */
+    /* Parser AST structure for fn_decl:
+     *   children[0]   = params wrapper node (contains param VAR_DECLs as its children)
+     *   children[1]   = return type (NODE_TYPE_ANNOTATION) — optional
+     *   children[last] = body (NODE_BLOCK)
+     */
     size_t body_idx = node->child_count - 1;
     ASTNode *body = node->children[body_idx];
 
     /* Find return type annotation */
     AriType *ret_type = type_create(TYPE_VOID);
-    size_t param_end = body_idx;
-
     if (body_idx > 0 && node->children[body_idx - 1] &&
         node->children[body_idx - 1]->type == NODE_TYPE_ANNOTATION) {
         type_free(ret_type);
         ret_type = resolve_type_annotation(a, node->children[body_idx - 1]);
-        param_end = body_idx - 1;
     }
 
-    /* Build parameter types */
-    size_t param_count = param_end;
+    /* Extract parameters from the params wrapper node (children[0]) */
+    ASTNode *params_node = (node->child_count > 1) ? node->children[0] : NULL;
+    size_t param_count = 0;
     AriType **param_types = NULL;
-    if (param_count > 0) {
+
+    if (params_node && params_node->child_count > 0) {
+        param_count = params_node->child_count;
         param_types = malloc(param_count * sizeof(AriType *));
         for (size_t i = 0; i < param_count; i++) {
-            ASTNode *param = node->children[i];
+            ASTNode *param = params_node->children[i];
             if (param && param->child_count > 0 &&
                 param->children[0]->type == NODE_TYPE_ANNOTATION) {
                 param_types[i] = resolve_type_annotation(a, param->children[0]);
@@ -574,12 +634,14 @@ static void analyze_fn_decl(Analyzer *a, ASTNode *node) {
     symtab_push_scope(a->symbols);
 
     /* Define parameters in the function scope */
-    for (size_t i = 0; i < param_count; i++) {
-        ASTNode *param = node->children[i];
-        if (param && param->string_val) {
-            AriType *pt = type_clone(fn_type->param_types[i]);
-            symtab_define(a->symbols, param->string_val, pt,
-                          false, true, param->line, param->col);
+    if (params_node) {
+        for (size_t i = 0; i < param_count; i++) {
+            ASTNode *param = params_node->children[i];
+            if (param && param->string_val) {
+                AriType *pt = type_clone(fn_type->param_types[i]);
+                symtab_define(a->symbols, param->string_val, pt,
+                              false, true, param->line, param->col);
+            }
         }
     }
 

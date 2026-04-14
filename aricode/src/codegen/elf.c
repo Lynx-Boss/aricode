@@ -12,6 +12,7 @@
  */
 
 #include "elf.h"
+#include "codegen.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -19,15 +20,15 @@
 #include <sys/stat.h>
 
 /* ------------------------------------------------------------------ */
-/*  ELF64 constants                                                   */
+/*  ELF64 constants (derived from codegen.h shared definitions)       */
 /* ------------------------------------------------------------------ */
 
-#define ELF_EHDR_SIZE  64   /* sizeof(Elf64_Ehdr) */
-#define ELF_PHDR_SIZE  56   /* sizeof(Elf64_Phdr) */
-#define ELF_PHDR_COUNT 2    /* PT_LOAD + PT_GNU_STACK */
-#define ELF_HDR_TOTAL  (ELF_EHDR_SIZE + ELF_PHDR_SIZE * ELF_PHDR_COUNT)
+#define ELF_EHDR_SIZE  ARICODE_ELF_EHDR
+#define ELF_PHDR_SIZE  ARICODE_ELF_PHDR
+#define ELF_PHDR_COUNT ARICODE_ELF_PHNUM
+#define ELF_HDR_TOTAL  ARICODE_ELF_HDR_TOTAL
 
-#define LOAD_ADDR      0x400000ULL
+#define LOAD_ADDR      ARICODE_ELF_BASE
 
 /* ELF identification */
 #define ELFMAG0        0x7F

@@ -80,7 +80,7 @@ static void test_let_statement(void)
     printf("\n--- Test: let x: i32 = 10; ---\n");
     const char *src = "let x: i32 = 10;";
     Lexer lex;
-    lexer_init(&lex, src, "test.vt");
+    lexer_init(&lex, src, "test.ari");
     TokenList list = lexer_tokenize_all(&lex);
 
     expect_token(&list, 0, TOKEN_LET,       "let",  "let keyword");
@@ -104,7 +104,7 @@ static void test_fn_declaration(void)
     printf("\n--- Test: fn add(a: i32, b: i32) -> i32 { return a + b; } ---\n");
     const char *src = "fn add(a: i32, b: i32) -> i32 { return a + b; }";
     Lexer lex;
-    lexer_init(&lex, src, "test.vt");
+    lexer_init(&lex, src, "test.ari");
     TokenList list = lexer_tokenize_all(&lex);
 
     expect_token(&list,  0, TOKEN_FN,         "fn",     "fn keyword");
@@ -142,7 +142,7 @@ static void test_error_level(void)
     const char *src =
         "if (b == 0) { error.raise(Level.LOGIC, \"Division by zero\"); }";
     Lexer lex;
-    lexer_init(&lex, src, "test.vt");
+    lexer_init(&lex, src, "test.ari");
     TokenList list = lexer_tokenize_all(&lex);
 
     expect_token(&list,  0, TOKEN_IF,              "if",               "if keyword");
@@ -178,7 +178,7 @@ static void test_comments(void)
         "// this is a comment\n"
         "let a: i32 = 1; /* inline comment */ let b: i32 = 2;\n";
     Lexer lex;
-    lexer_init(&lex, src, "test.vt");
+    lexer_init(&lex, src, "test.ari");
     TokenList list = lexer_tokenize_all(&lex);
 
     /* First real token after the line comment */
@@ -198,7 +198,7 @@ static void test_numeric_literals(void)
     printf("\n--- Test: numeric literals ---\n");
     const char *src = "42 3.14 0xFF 0b1010 1_000_000 2.5e10";
     Lexer lex;
-    lexer_init(&lex, src, "test.vt");
+    lexer_init(&lex, src, "test.ari");
     TokenList list = lexer_tokenize_all(&lex);
 
     expect_token(&list, 0, TOKEN_INTEGER, "42",      "decimal int");
@@ -220,7 +220,7 @@ static void test_string_escapes(void)
     printf("\n--- Test: string escape sequences ---\n");
     const char *src = "\"hello\\nworld\" \"tab\\there\" \"quote\\\"inside\"";
     Lexer lex;
-    lexer_init(&lex, src, "test.vt");
+    lexer_init(&lex, src, "test.ari");
     TokenList list = lexer_tokenize_all(&lex);
 
     expect_token(&list, 0, TOKEN_STRING, "hello\nworld",    "newline escape");
@@ -239,7 +239,7 @@ static void test_operators(void)
     printf("\n--- Test: operators ---\n");
     const char *src = "+ - * / % == != <= >= && || << >> -> =>";
     Lexer lex;
-    lexer_init(&lex, src, "test.vt");
+    lexer_init(&lex, src, "test.ari");
     TokenList list = lexer_tokenize_all(&lex);
 
     expect_token(&list,  0, TOKEN_PLUS,      "+",  "plus");
@@ -272,7 +272,7 @@ static void test_keywords(void)
         "fn let const if else for while return match try catch "
         "error log import export true false Some None Option";
     Lexer lex;
-    lexer_init(&lex, src, "test.vt");
+    lexer_init(&lex, src, "test.ari");
     TokenList list = lexer_tokenize_all(&lex);
 
     expect_token(&list,  0, TOKEN_FN,      "fn",     "fn");
@@ -308,7 +308,7 @@ static void test_types(void)
     printf("\n--- Test: type keywords ---\n");
     const char *src = "i8 i16 i32 i64 u8 u16 u32 u64 f32 f64 str bool arr map";
     Lexer lex;
-    lexer_init(&lex, src, "test.vt");
+    lexer_init(&lex, src, "test.ari");
     TokenList list = lexer_tokenize_all(&lex);
 
     expect_token(&list,  0, TOKEN_TYPE_I8,   "i8",   "i8");
@@ -339,7 +339,7 @@ static void test_error_levels(void)
     const char *src =
         "Level.SILENT Level.LOGIC Level.WARNING Level.SYSTEM Level.CATASTROPHIC";
     Lexer lex;
-    lexer_init(&lex, src, "test.vt");
+    lexer_init(&lex, src, "test.ari");
     TokenList list = lexer_tokenize_all(&lex);
 
     expect_token(&list, 0, TOKEN_LEVEL_SILENT,       "Level.SILENT",       "Level.SILENT");
@@ -374,7 +374,7 @@ static void test_peek(void)
     printf("\n--- Test: peek ---\n");
     tests_run++;
     Lexer lex;
-    lexer_init(&lex, "let x", "test.vt");
+    lexer_init(&lex, "let x", "test.ari");
     Token p = lexer_peek(&lex);
     Token n = lexer_next_token(&lex);
     if (p.type == n.type && strcmp(p.value, n.value) == 0) {
@@ -394,7 +394,7 @@ static void test_line_column(void)
     printf("\n--- Test: line/column tracking ---\n");
     const char *src = "let x\nlet y";
     Lexer lex;
-    lexer_init(&lex, src, "test.vt");
+    lexer_init(&lex, src, "test.ari");
 
     Token t1 = lexer_next_token(&lex); /* let */
     Token t2 = lexer_next_token(&lex); /* x   */

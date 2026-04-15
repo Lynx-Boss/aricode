@@ -4,9 +4,9 @@
 
 aricode is a statically typed, compiled programming language that produces optimized x86_64 machine code. It uses JavaScript-like syntax with strict type safety, mandatory error handling, and zero tolerance for silent failures.
 
-**Target**: x86_64 native machine code (ELF binaries on Linux, PE on Windows, Mach-O on macOS).
+**Target**: x86_64 native machine code (ELF binaries on Linux x86_64).
 
-**File extension**: `.vt`
+**File extension**: `.ari`
 
 **Entry point**: Every aricode program must have a `main` function:
 
@@ -677,13 +677,13 @@ All errors (compile-time and runtime) are logged to `.aricode/errors.log` in the
 
 Log entry format:
 ```
-[2026-04-11T14:30:00.000Z] LEVEL=1 FILE=src/main.vt LINE=42 COL=15
+[2026-04-11T14:30:00.000Z] LEVEL=1 FILE=src/main.ari LINE=42 COL=15
   MESSAGE: Division by zero
   FUNCTION: calculate_average
   STACK:
-    at calculate_average (src/main.vt:42:15)
-    at process_data (src/data.vt:108:3)
-    at main (src/main.vt:12:5)
+    at calculate_average (src/main.ari:42:15)
+    at process_data (src/data.ari:108:3)
+    at main (src/main.ari:12:5)
 ```
 
 Querying the error log programmatically:
@@ -694,7 +694,7 @@ import aricode.errors;
 let recent: arr<ErrorEntry> = errors.query(
   level: Level.LOGIC,
   since: "2026-04-11",
-  file: "src/main.vt"
+  file: "src/main.ari"
 );
 
 for (entry in recent) {
@@ -941,10 +941,10 @@ Generics in aricode are monomorphized at compile time. `Stack<i32>` and `Stack<s
 
 ### 13.1 Module Declaration
 
-Each `.vt` file is a module. The module name is derived from the file path.
+Each `.ari` file is a module. The module name is derived from the file path.
 
 ```
-// File: src/math/vector.vt
+// File: src/math/vector.ari
 module math.vector;
 
 pub struct Vec2 {
@@ -1338,7 +1338,7 @@ let min: Option<i32> = pq.pop();  // Some(1)
 ### 19.1 Compiler Phases
 
 ```
-Source (.vt files)
+Source (.ari files)
     |
     v
 [1. Lexer] --> Token stream
@@ -1374,16 +1374,16 @@ Source (.vt files)
 ### 19.2 Compiler Invocation
 
 ```bash
-vtc build src/main.vt              # Compile to executable
-vtc build src/main.vt -o myapp     # Specify output name
-vtc build src/main.vt --release    # Optimized release build
-vtc build src/main.vt --debug      # Debug build with symbols
-vtc check src/main.vt              # Type check without compiling
-vtc run src/main.vt                # Compile and run
-vtc podium src/main.vt             # Show podium ratings only
-vtc errors                         # Query error log
-vtc fmt src/                       # Format source files
-vtc test src/                      # Run tests
+aric build src/main.ari              # Compile to executable
+aric build src/main.ari -o myapp     # Specify output name
+aric build src/main.ari --release    # Optimized release build
+aric build src/main.ari --debug      # Debug build with symbols
+aric check src/main.ari              # Type check without compiling
+aric run src/main.ari                # Compile and run
+aric podium src/main.ari             # Show podium ratings only
+aric errors                         # Query error log
+aric fmt src/                       # Format source files
+aric test src/                      # Run tests
 ```
 
 ### 19.3 Compiler Flags
@@ -1407,14 +1407,14 @@ vtc test src/                      # Run tests
 myproject/
   aricode.toml          # Project manifest
   src/
-    main.vt            # Entry point
-    lib.vt             # Library root (for libraries)
+    main.ari            # Entry point
+    lib.ari             # Library root (for libraries)
     utils/
-      math.vt
-      string.vt
+      math.ari
+      string.ari
   test/
-    test_main.vt
-    test_utils.vt
+    test_main.ari
+    test_utils.ari
   .aricode/
     errors.log         # Error registry
     podium.json        # Cached podium ratings
@@ -1809,9 +1809,9 @@ fn main() -> i32 {
 Expected compiler output:
 
 ```
-vtc build src/main.vt --release
+aric build src/main.ari --release
 
-[BUILD] src/main.vt -> main
+[BUILD] src/main.ari -> main
 [CHECK] Type checking... OK
 [CHECK] Error analysis... OK
 [CHECK] Ownership analysis... OK
@@ -1884,4 +1884,4 @@ The following features are planned but not part of v1.0:
 - SIMD intrinsics as first-class types
 - GPU compute shaders
 - Hot code reloading
-- Package manager (`vtpkg`)
+- Package manager (`aripkg`)

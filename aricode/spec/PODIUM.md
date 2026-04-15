@@ -76,11 +76,11 @@ fn find_duplicates(items: &arr<str>) -> arr<str>  ->  BRONZE (256 bytes, O(n^2))
 When `--podium-min` is set, functions that fall below the threshold will cause the build to fail.
 
 ```
-vtc build --podium-min=silver src/main.vt
+aric build --podium-min=silver src/main.ari
 
 ERROR: Function 'find_duplicates' rated BRONZE, minimum is SILVER.
   Suggestion: Use a Set<str> instead of nested loop for O(n) lookup.
-  Location: src/search.vt:42
+  Location: src/search.ari:42
 ```
 
 ---
@@ -187,9 +187,9 @@ fn process_data(data: &arr<Record>) -> arr<Result>  ->  SILVER (128 bytes, O(n))
 ### Standard Build Output
 
 ```
-vtc build src/main.vt --release
+aric build src/main.ari --release
 
-[BUILD] src/main.vt -> main
+[BUILD] src/main.ari -> main
 [CHECK] All checks passed.
 [COMPILE] Generating x86_64...
 
@@ -208,7 +208,7 @@ SUMMARY: 4 GOLD, 1 SILVER, 0 BRONZE
 ### Detailed Podium Report
 
 ```
-vtc podium src/main.vt --detail
+aric podium src/main.ari --detail
 
 PODIUM DETAILED REPORT
 ======================
@@ -252,7 +252,7 @@ fn main() -> i32
 ### JSON Output
 
 ```
-vtc podium src/main.vt --json
+aric podium src/main.ari --json
 ```
 
 Produces `.aricode/podium.json`:
@@ -260,13 +260,13 @@ Produces `.aricode/podium.json`:
 ```json
 {
   "timestamp": "2026-04-11T14:30:00.000Z",
-  "file": "src/main.vt",
+  "file": "src/main.ari",
   "target": "x86_64-linux",
   "opt_level": 3,
   "functions": [
     {
       "name": "Point.distance",
-      "file": "src/main.vt",
+      "file": "src/main.ari",
       "line": 15,
       "rating": "gold",
       "code_size_bytes": 28,
@@ -281,7 +281,7 @@ Produces `.aricode/podium.json`:
     },
     {
       "name": "main",
-      "file": "src/main.vt",
+      "file": "src/main.ari",
       "line": 50,
       "rating": "silver",
       "code_size_bytes": 148,
@@ -510,14 +510,14 @@ fn raw_copy(src: *u8, dst: *u8, len: u64) -> void  ->  BRONZE (24 bytes, O(n)) |
 Podium results are stored in `.aricode/podium.json` after each build. This enables tracking performance over time.
 
 ```
-vtc podium --history
+aric podium --history
 
 PODIUM HISTORY: fn Point.distance()
   2026-04-01  GOLD   (28 bytes, 8 cycles)
   2026-04-05  SILVER (36 bytes, 10 cycles)  <- regression
   2026-04-06  GOLD   (28 bytes, 8 cycles)   <- fixed
 
-vtc podium --regressions
+aric podium --regressions
 
 REGRESSIONS SINCE LAST BUILD:
   fn process_data()  GOLD -> SILVER  (added heap allocation on line 45)
@@ -538,7 +538,7 @@ baseline = ".aricode/podium-baseline.json"
 
 ```bash
 # In CI pipeline:
-vtc build --release src/main.vt
-vtc podium --check-regressions --baseline=.aricode/podium-baseline.json
+aric build --release src/main.ari
+aric podium --check-regressions --baseline=.aricode/podium-baseline.json
 # Exit code 1 if any regressions detected
 ```

@@ -713,16 +713,16 @@ Each entry is a structured record:
 TIMESTAMP: 2026-04-11T14:30:00.000Z
 LEVEL:     1 (LOGIC_ERROR)
 CODE:      L1-001
-FILE:      src/math/calc.vt
+FILE:      src/math/calc.ari
 LINE:      42
 COLUMN:    15
 FUNCTION:  calculate_average
 MESSAGE:   Division by zero: parameter 'count' is 0
 PHASE:     compile    (or: runtime)
 STACK:
-  at calculate_average (src/math/calc.vt:42:15)
-  at process_data (src/data.vt:108:3)
-  at main (src/main.vt:12:5)
+  at calculate_average (src/math/calc.ari:42:15)
+  at process_data (src/data.ari:108:3)
+  at main (src/main.ari:12:5)
 ================================================================================
 ```
 
@@ -740,7 +740,7 @@ let recent: arr<ErrorEntry> = errors.query(
 
 // Filter by file
 let file_errors: arr<ErrorEntry> = errors.query(
-  file: "src/main.vt"
+  file: "src/main.ari"
 );
 
 // Filter by code
@@ -841,11 +841,11 @@ L2-008 = "error"      # Float equality -> block
 ### Compiler Flags
 
 ```
-vtc build --warn-as-error          # All L2 warnings become L1 errors
-vtc build --warn-as-error=L2-001   # Only specific warning becomes error
-vtc errors                          # Show error log summary
-vtc errors --level=1               # Show only Level 1 errors
-vtc errors --since=2026-04-01      # Show errors since date
-vtc errors --file=src/main.vt      # Show errors in specific file
-vtc errors --clear                 # Clear the error log
+aric build --warn-as-error          # All L2 warnings become L1 errors
+aric build --warn-as-error=L2-001   # Only specific warning becomes error
+aric errors                          # Show error log summary
+aric errors --level=1               # Show only Level 1 errors
+aric errors --since=2026-04-01      # Show errors since date
+aric errors --file=src/main.ari      # Show errors in specific file
+aric errors --clear                 # Clear the error log
 ```

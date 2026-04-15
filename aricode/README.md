@@ -91,4 +91,5 @@ make install    # Install aric to /usr/local/bin (requires sudo)
 
 ## License
 
-MIT
+Copyright (c) 2026 Edwin F. Veliz Jaramillo. All rights reserved.
+See [LICENSE](../LICENSE) for details.

@@ -34,7 +34,7 @@ static void test_error_create(void) {
         ARI_LEVEL_LOGIC,
         ARI_L001_CODE,
         ARI_L001_MSG,
-        "main.vt",
+        "main.ari",
         15, 8,
         "  return a / b;",
         ARI_L001_FIX
@@ -58,7 +58,7 @@ static void test_level_silent(void) {
         ARI_LEVEL_SILENT,
         ARI_S001_CODE,
         ARI_S001_MSG,
-        "math.vt",
+        "math.ari",
         42, 12,
         "  let result = x / y;",
         ARI_S001_FIX
@@ -69,7 +69,7 @@ static void test_level_silent(void) {
         ARI_LEVEL_SILENT,
         ARI_S004_CODE,
         ARI_S004_MSG,
-        "handler.vt",
+        "handler.ari",
         88, 3,
         "  catch(e) {}",
         ARI_S004_FIX
@@ -89,7 +89,7 @@ static void test_level_logic(void) {
         ARI_LEVEL_LOGIC,
         ARI_L001_CODE,
         ARI_L001_MSG,
-        "main.vt",
+        "main.ari",
         15, 8,
         "  return a / b;",
         ARI_L001_FIX
@@ -100,7 +100,7 @@ static void test_level_logic(void) {
         ARI_LEVEL_LOGIC,
         ARI_L003_CODE,
         ARI_L003_MSG,
-        "data.vt",
+        "data.ari",
         103, 14,
         "  let val = arr[idx];",
         ARI_L003_FIX
@@ -120,7 +120,7 @@ static void test_level_warning(void) {
         ARI_LEVEL_WARNING,
         ARI_W001_CODE,
         ARI_W001_MSG,
-        "utils.vt",
+        "utils.ari",
         7, 5,
         "  let temp = 42;",
         ARI_W001_FIX
@@ -131,7 +131,7 @@ static void test_level_warning(void) {
         ARI_LEVEL_WARNING,
         ARI_W005_CODE,
         ARI_W005_MSG,
-        "parser.vt",
+        "parser.ari",
         200, 1,
         "fn parse_everything(input: str) -> Result {",
         ARI_W005_FIX
@@ -151,7 +151,7 @@ static void test_level_system(void) {
         ARI_LEVEL_SYSTEM,
         ARI_Y001_CODE,
         ARI_Y001_MSG,
-        "io.vt",
+        "io.ari",
         33, 10,
         "  let f = File.open(path);",
         ARI_Y001_FIX
@@ -171,7 +171,7 @@ static void test_level_catastrophic(void) {
         ARI_LEVEL_CATASTROPHIC,
         ARI_C001_CODE,
         ARI_C001_MSG,
-        "allocator.vt",
+        "allocator.ari",
         512, 1,
         "  let buf = alloc(1_000_000_000);",
         ARI_C001_FIX
@@ -223,7 +223,7 @@ static void test_error_format(void) {
         ARI_LEVEL_LOGIC,
         ARI_L002_CODE,
         ARI_L002_MSG,
-        "ptr.vt",
+        "ptr.ari",
         50, 5,
         "  val = ptr.value;",
         ARI_L002_FIX

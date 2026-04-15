@@ -36,3 +36,4 @@ sparring/results/
 # Python cache
 __pycache__/
 *.pyc
+paper/*.pdf

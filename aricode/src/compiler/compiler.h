@@ -19,6 +19,7 @@ typedef struct {
     bool        show_ast;
     bool        show_tokens;
     bool        verbose;
+    bool        use_avx2;       /* --avx2: enable AVX2 SIMD (4x i64) */
 } CompilerOptions;
 
 /* ── Compiler State ──────────────────────────────────────────────────── */

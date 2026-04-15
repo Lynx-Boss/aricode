@@ -71,6 +71,8 @@ int main(int argc, char *argv[]) {
             opts.show_tokens = true;
         } else if (strcmp(argv[i], "--verbose") == 0 || strcmp(argv[i], "-v") == 0) {
             opts.verbose = true;
+        } else if (strcmp(argv[i], "--avx2") == 0) {
+            opts.use_avx2 = true;
         } else if (strcmp(argv[i], "-o") == 0) {
             if (i + 1 < argc) {
                 opts.output_file = argv[++i];

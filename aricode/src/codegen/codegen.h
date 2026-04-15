@@ -99,6 +99,9 @@ typedef struct {
     int         had_error;
     char        error_msg[512];
 
+    /* Feature flags */
+    int         use_avx2;          /* 1 = emit AVX2 (256-bit) instructions */
+
     /* Error string dedup cache — stores code offsets of embedded error strings */
     struct {
         const char *text;     /* pointer to static error string          */

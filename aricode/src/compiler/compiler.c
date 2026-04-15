@@ -349,6 +349,7 @@ int compiler_compile_string(Compiler *c, const char *source,
 
     if (c->error_count == 0) {
         codegen_init(&cg);
+        cg.use_avx2 = c->options.use_avx2 ? 1 : 0;
 
         if (codegen_generate(&cg, ast) != 0) {
             printf("  %s[FAIL]%s Code generation: %s\n",

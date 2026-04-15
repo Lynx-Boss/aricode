@@ -261,6 +261,10 @@ static AriType *builtin_return_type(const char *name) {
         {"arr_sum",         TYPE_I32},
         /* i32 — buffer / memory */
         {"buf_stack",       TYPE_I32},
+        /* i32 — threading */
+        {"thread_spawn",    TYPE_I32},
+        {"thread_wait",     TYPE_I32},
+        {"thread_exit",     TYPE_VOID},
         /* i32 — dec (decimal literal, treated as i32 for type checking) */
         {"dec",             TYPE_I32},
         /* i32 — epoll */

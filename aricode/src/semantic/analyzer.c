@@ -263,7 +263,10 @@ static AriType *builtin_return_type(const char *name) {
         {"buf_stack",       TYPE_I32},
         /* f64 — math functions */
         {"math_sqrt",       TYPE_F64},
+        {"math_exp",        TYPE_F64},
+        {"math_log",        TYPE_F64},
         {"math_abs",        TYPE_F64},
+        {"buf_free",        TYPE_VOID},
         /* i32 — f64 arrays (return i32 base ptr or i32 0) */
         {"arr_f64_new",     TYPE_I32},
         {"arr_f64_set",     TYPE_I32},

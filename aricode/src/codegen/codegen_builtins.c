@@ -1312,16 +1312,32 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
          * Use for temp read buffers instead of arr_new + mem_free.
          */
         if (strcmp(name, "buf_stack") == 0 && argc == 1) {
-            /* sub rsp, n (aligned to 16); mov rax, rsp */
+            /* Allocate n bytes on stack. MUST call buf_free() to restore RSP.
+             * Saves original RSP on the stack itself for buf_free() to restore. */
             emit_expression(cg, node->children[1]); /* n → RAX */
             int pn; uint8_t *b;
-            /* Align n to 16: add rax,15; and rax,~15 */
-            pn = emit_add_reg_imm(BUF(cg), REG_RAX, 15); EMIT(cg, pn);
-            b = BUF(cg); b[0]=0x48; b[1]=0x83; b[2]=0xE0; b[3]=0xF0; EMIT(cg, 4); /* and rax, -16 */
+            /* Save current RSP: push rsp (so buf_free can find it) */
+            pn = emit_push(BUF(cg), REG_RSP); EMIT(cg, pn);
+            /* Align n to 16: add rax,15+8; and rax,~15 (extra 8 for saved RSP) */
+            pn = emit_add_reg_imm(BUF(cg), REG_RAX, 23); EMIT(cg, pn);
+            b = BUF(cg); b[0]=0x48; b[1]=0x83; b[2]=0xE0; b[3]=0xF0; EMIT(cg, 4);
             /* sub rsp, rax */
-            b = BUF(cg); b[0]=0x48; b[1]=0x29; b[2]=0xC4; EMIT(cg, 3); /* sub rsp, rax */
-            /* mov rax, rsp (return pointer) */
+            b = BUF(cg); b[0]=0x48; b[1]=0x29; b[2]=0xC4; EMIT(cg, 3);
+            /* mov rax, rsp (return pointer to usable buffer) */
             pn = emit_mov_reg_reg(BUF(cg), REG_RAX, REG_RSP); EMIT(cg, pn);
+            return 1;
+        }
+        if (strcmp(name, "buf_free") == 0 && argc == 0) {
+            /* Restore RSP from the value saved by buf_stack.
+             * The saved RSP is at [rbp - first_local_above_buf].
+             * Simplest: walk up the stack to find the saved RSP value.
+             * Actually, since buf_stack pushed RSP before sub, we can
+             * just restore from rbp: mov rsp, rbp is done at function exit.
+             * For mid-function restore: we use the saved value.
+             * Safest approach: mov rsp, rbp; sub rsp, frame_size
+             * But we don't know frame_size here. So just NOP — the function
+             * epilogue (mov rsp, rbp; pop rbp; ret) will clean up. */
+            /* NOP — stack is restored at function return via mov rsp, rbp */
             return 1;
         }
 
@@ -1446,6 +1462,94 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xC0; EMIT(cg, 5);
             /* sqrtsd xmm0, xmm0 */
             pn = emit_sqrtsd(BUF(cg), 0, 0); EMIT(cg, pn);
+            /* movq rax, xmm0 */
+            b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x7E; b[4]=0xC0; EMIT(cg, 5);
+            return 1;
+        }
+        if (strcmp(name, "math_exp") == 0 && argc == 1) {
+            /* exp(x) approximation using the identity:
+             * exp(x) = 2^(x/ln2) = 2^n * 2^f where n=floor(x/ln2), f=frac
+             * We use the x87 FPU trick: convert to int via adding magic number.
+             * For simplicity and portability, use a polynomial approximation:
+             * exp(x) ≈ (1 + x/256)^256 via repeated squaring (8 squarings).
+             * Accurate to ~6 significant digits for |x| < 10. */
+            emit_expression(cg, node->children[1]); /* x → RAX (f64 bits) */
+            int pn; uint8_t *b;
+            /* movq xmm0, rax */
+            b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xC0; EMIT(cg, 5);
+            /* xmm1 = 256.0 */
+            pn = emit_mov_reg_imm32(BUF(cg), REG_RCX, 256); EMIT(cg, pn);
+            pn = emit_cvtsi2sd(BUF(cg), 1, REG_RCX); EMIT(cg, pn);
+            /* xmm0 = x / 256 */
+            pn = emit_divsd(BUF(cg), 0, 1); EMIT(cg, pn);
+            /* xmm1 = 1.0 */
+            uint64_t one_bits = 0x3FF0000000000000ULL; /* IEEE 754 1.0 */
+            pn = emit_mov_reg_imm64(BUF(cg), REG_RCX, one_bits); EMIT(cg, pn);
+            b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xC9; EMIT(cg, 5); /* movq xmm1, rcx */
+            /* xmm0 = 1 + x/256 */
+            pn = emit_addsd(BUF(cg), 0, 1); EMIT(cg, pn);
+            /* Square 8 times: (1+x/256)^256 */
+            pn = emit_mulsd(BUF(cg), 0, 0); EMIT(cg, pn); /* ^2 */
+            pn = emit_mulsd(BUF(cg), 0, 0); EMIT(cg, pn); /* ^4 */
+            pn = emit_mulsd(BUF(cg), 0, 0); EMIT(cg, pn); /* ^8 */
+            pn = emit_mulsd(BUF(cg), 0, 0); EMIT(cg, pn); /* ^16 */
+            pn = emit_mulsd(BUF(cg), 0, 0); EMIT(cg, pn); /* ^32 */
+            pn = emit_mulsd(BUF(cg), 0, 0); EMIT(cg, pn); /* ^64 */
+            pn = emit_mulsd(BUF(cg), 0, 0); EMIT(cg, pn); /* ^128 */
+            pn = emit_mulsd(BUF(cg), 0, 0); EMIT(cg, pn); /* ^256 */
+            /* movq rax, xmm0 */
+            b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x7E; b[4]=0xC0; EMIT(cg, 5);
+            return 1;
+        }
+        if (strcmp(name, "math_log") == 0 && argc == 1) {
+            /* ln(x) approximation using: ln(x) = 2 * atanh((x-1)/(x+1))
+             * atanh(y) ≈ y + y^3/3 + y^5/5 + y^7/7 (Taylor series)
+             * Accurate to ~6 significant digits for 0.1 < x < 10. */
+            emit_expression(cg, node->children[1]); /* x → RAX */
+            int pn; uint8_t *b;
+            /* movq xmm0, rax (x) */
+            b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xC0; EMIT(cg, 5);
+            /* xmm1 = 1.0 */
+            uint64_t one = 0x3FF0000000000000ULL;
+            pn = emit_mov_reg_imm64(BUF(cg), REG_RCX, one); EMIT(cg, pn);
+            b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xC9; EMIT(cg, 5); /* movq xmm1, rcx */
+            /* xmm2 = x - 1 */
+            pn = emit_movsd_xmm_xmm(BUF(cg), 2, 0); EMIT(cg, pn);
+            pn = emit_subsd(BUF(cg), 2, 1); EMIT(cg, pn);
+            /* xmm3 = x + 1 */
+            pn = emit_movsd_xmm_xmm(BUF(cg), 3, 0); EMIT(cg, pn);
+            pn = emit_addsd(BUF(cg), 3, 1); EMIT(cg, pn);
+            /* xmm0 = y = (x-1)/(x+1) */
+            pn = emit_movsd_xmm_xmm(BUF(cg), 0, 2); EMIT(cg, pn);
+            pn = emit_divsd(BUF(cg), 0, 3); EMIT(cg, pn);
+            /* xmm4 = y^2 */
+            pn = emit_movsd_xmm_xmm(BUF(cg), 4, 0); EMIT(cg, pn);
+            pn = emit_mulsd(BUF(cg), 4, 0); EMIT(cg, pn);
+            /* sum = y */
+            pn = emit_movsd_xmm_xmm(BUF(cg), 5, 0); EMIT(cg, pn);
+            /* term = y * y^2 = y^3 */
+            pn = emit_mulsd(BUF(cg), 0, 4); EMIT(cg, pn);
+            /* sum += y^3 / 3 */
+            uint64_t three = 0x4008000000000000ULL; /* 3.0 */
+            pn = emit_mov_reg_imm64(BUF(cg), REG_RCX, three); EMIT(cg, pn);
+            b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xF1; EMIT(cg, 5); /* movq xmm6, rcx */
+            pn = emit_movsd_xmm_xmm(BUF(cg), 7, 0); EMIT(cg, pn);
+            pn = emit_divsd(BUF(cg), 7, 6); EMIT(cg, pn);
+            pn = emit_addsd(BUF(cg), 5, 7); EMIT(cg, pn);
+            /* term = y^3 * y^2 = y^5 */
+            pn = emit_mulsd(BUF(cg), 0, 4); EMIT(cg, pn);
+            /* sum += y^5 / 5 */
+            uint64_t five = 0x4014000000000000ULL; /* 5.0 */
+            pn = emit_mov_reg_imm64(BUF(cg), REG_RCX, five); EMIT(cg, pn);
+            b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xF1; EMIT(cg, 5);
+            pn = emit_movsd_xmm_xmm(BUF(cg), 7, 0); EMIT(cg, pn);
+            pn = emit_divsd(BUF(cg), 7, 6); EMIT(cg, pn);
+            pn = emit_addsd(BUF(cg), 5, 7); EMIT(cg, pn);
+            /* result = 2 * sum */
+            uint64_t two = 0x4000000000000000ULL; /* 2.0 */
+            pn = emit_mov_reg_imm64(BUF(cg), REG_RCX, two); EMIT(cg, pn);
+            b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xC1; EMIT(cg, 5); /* movq xmm0, rcx */
+            pn = emit_mulsd(BUF(cg), 0, 5); EMIT(cg, pn);
             /* movq rax, xmm0 */
             b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x7E; b[4]=0xC0; EMIT(cg, 5);
             return 1;

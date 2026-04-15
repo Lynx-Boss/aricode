@@ -206,10 +206,43 @@ typedef struct {
 } NsEntry;
 
 /* ------------------------------------------------------------------ */
+/*  Import cycle detection                                             */
+/* ------------------------------------------------------------------ */
+
+#define MAX_IMPORT_DEPTH 64
+
+static char import_stack[MAX_IMPORT_DEPTH][768];
+static size_t import_depth = 0;
+
+static int import_stack_contains(const char *path) {
+    for (size_t i = 0; i < import_depth; i++) {
+        if (strcmp(import_stack[i], path) == 0) return 1;
+    }
+    return 0;
+}
+
+static void import_stack_push(const char *path) {
+    if (import_depth < MAX_IMPORT_DEPTH) {
+        strncpy(import_stack[import_depth], path, 767);
+        import_stack[import_depth][767] = '\0';
+        import_depth++;
+    }
+}
+
+static void import_stack_pop(void) {
+    if (import_depth > 0) import_depth--;
+}
+
+/* ------------------------------------------------------------------ */
 /*  Public: resolve all imports                                        */
 /* ------------------------------------------------------------------ */
 
 char *resolve_imports(const char *source, const char *base_path) {
+    /* Push current file to import stack (for cycle detection) */
+    if (base_path && import_depth == 0) {
+        import_stack_push(base_path);
+    }
+
     /* Extract directory from base_path */
     char dir[512] = ".";
     if (base_path) {
@@ -278,6 +311,17 @@ char *resolve_imports(const char *source, const char *base_path) {
                     char full_path[768];
                     snprintf(full_path, sizeof(full_path), "%s/%s", dir, import_name);
 
+                    /* Check for circular imports */
+                    if (import_stack_contains(full_path)) {
+                        fprintf(stderr, "\033[31mImport error:\033[0m circular import detected: '%s'\n", full_path);
+                        /* Skip this import line */
+                        p = after_quote;
+                        while (*p == ' ' || *p == '\t') p++;
+                        if (*p == ';') p++;
+                        if (*p == '\n') p++;
+                        continue;
+                    }
+
                     /* Read the imported file */
                     FILE *f = fopen(full_path, "r");
                     if (!f) {
@@ -293,7 +337,9 @@ char *resolve_imports(const char *source, const char *base_path) {
                         fclose(f);
 
                         /* Recursively resolve imports in the imported file */
+                        import_stack_push(full_path);
                         char *resolved = resolve_imports(content, full_path);
+                        import_stack_pop();
                         free(content);
 
                         /* If namespaced, rename all functions */

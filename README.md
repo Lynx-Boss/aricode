@@ -1,26 +1,26 @@
 # Aricode
 
-**The first native compilation target for AI agents.**
+**A compiled language that produces the smallest, fastest binaries — with zero silent errors.**
 
-Every AI coding system today generates Python, C, or JavaScript — languages designed for humans, compiled by heavyweight toolchains. Aricode is different: it's a language designed for **machines to write**, compiled directly to x86_64 machine code in **sub-millisecond**, producing binaries as small as **255 bytes** with **zero runtime dependencies**.
+Aricode is not an AI. It is a **compiler** — a tool that transforms human-readable code into minimal x86_64 machine code, directly, without LLVM, without a linker, without libc, without any runtime. The result: standalone ELF binaries as small as **255 bytes** that run on bare Linux.
 
 ```
-AI Agent → generates .ari → aric (0.3ms) → 255-byte ELF binary → runs
+Source (.ari) → aric compiler (0.3ms) → 255-byte ELF binary → runs
 ```
 
-No LLVM. No linker. No libc. No runtime. Just raw machine code.
+Where other languages need megabytes of runtime and toolchains, Aricode reduces that cost to **zero**. A neural network trainer compiles to 8.4 KB. An HTTP server to 1 KB. A PID motor controller to 3 KB. All with zero dependencies.
 
 ## Why Aricode?
 
-**For AI agents, not humans.** Every feature exists to maximize machine efficiency.
+**Maximum efficiency, minimum cost.** Every program compiles in sub-millisecond to a binary that needs nothing else to run — no interpreter, no VM, no shared libraries.
 
-### Machine-writes, human-verifies
+### Human-readable, machine-optimal
 
-Although designed for AI generation, Aricode's mandatory error handling and explicit control flow make generated code **easy for humans to audit**. Every division is guarded, every error path is handled, every type conversion is explicit — a human reviewer can quickly spot logic errors without deep domain expertise.
+Aricode code is clear enough for humans to read and verify, but compiles to machine code that competes with hand-written assembly. Every division is guarded, every error path is handled, every type conversion is explicit — a human reviewer can quickly spot logic errors without deep domain expertise.
 
-### Built for the edge
+### Built for resource-constrained environments
 
-Binaries under 3.5 KB with zero runtime dependencies make Aricode ideal for **robotics, embedded systems, and edge computing**. An AI agent on a robotic platform can generate, compile, and execute task-specific programs in under 1 ms — real-time adaptive behavior without heavyweight toolchains.
+Binaries under 3.5 KB with zero runtime dependencies make Aricode ideal for **robotics, embedded systems, and edge computing** — anywhere resources are scarce and every byte counts. A program can be generated, compiled, and executed in under 1 ms.
 
 | Problem | C | Go | Rust | **Aricode** |
 |---------|---|-----|------|-------------|

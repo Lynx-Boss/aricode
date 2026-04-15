@@ -33,8 +33,8 @@
 \lstset{style=aricode}
 
 % ---- Metadata ----
-\title{\textbf{Aricode: The First Native Compilation Target for AI Agents}\\[0.5em]
-\large Direct x86\_64 Code Generation Without Runtime, Linker, or Standard Library}
+\title{\textbf{Aricode: A Minimal Compiled Language with Direct x86\_64 Code Generation}\\[0.5em]
+\large Zero Runtime Dependencies, Zero Silent Errors, Sub-Millisecond Compilation}
 
 \author{
 Edwin F. Veliz Jaramillo\\
@@ -57,22 +57,22 @@ the AriDecimal type, the compiler implementation, and all benchmark
 results herein, is the original intellectual property of the author.
 Any use, reproduction, or derivative work requires explicit written
 permission and must cite this paper.
-First public record: arXiv submission, April 2026.
+First public record: Zenodo/arXiv, April 2026.
 Repository: \url{https://github.com/Lynx-Boss/aricode}.
 }}\vspace{1em}
 
 % ---- Abstract ----
 \begin{abstract}
-Every existing AI coding system---GitHub Copilot, Claude, GPT-4, Devin---generates code in languages designed for humans (Python, C, Rust, JavaScript) and depends on heavyweight toolchains to compile and execute it. We present \textsc{Aricode}, the first programming language designed explicitly as a \emph{native compilation target for AI agents}. Unlike human-oriented languages, Aricode prioritizes properties that matter for machine-generated code: sub-millisecond compilation, deterministic code generation, zero runtime overhead, direct hardware access via syscalls, and minimal binary size (199 bytes for Hello World). The compiler generates x86\_64 machine code directly from the AST---no LLVM, no linker, no standard library---producing standalone ELF binaries that an AI agent can generate, compile, and execute in a single pipeline under 1ms.
+We present \textsc{Aricode}, a compiled language and toolchain that generates x86\_64 machine code directly from the AST---no LLVM, no linker, no standard library---producing standalone ELF binaries as small as 255~bytes with zero runtime dependencies. Aricode is not an artificial intelligence system; it is a \emph{compiler} designed to minimize the cost of producing, deploying, and maintaining executable programs, particularly in resource-constrained environments.
 
-The language provides 23 built-in operations spanning console I/O, heap memory (\texttt{mmap}), file system access (direct syscalls), SSE2 floating-point, exact decimal arithmetic, and cross-function error handling via register-based unwinding (R12--R15). Six optimization passes---constant folding, strength reduction, peephole optimization, tail call optimization, dead code elimination, and compile-time decimal evaluation---ensure that generated code competes with hand-written assembly.
+The language enforces mandatory error handling at compile time: code that can fail silently does not compile. The compiler provides 54~built-in operations spanning console I/O, heap memory (\texttt{mmap}), file I/O, TCP networking (\texttt{socket/epoll}), SSE2/AVX2 SIMD vectorization, f64 array operations for machine learning, exact decimal arithmetic, and cross-function error handling via register-based unwinding (R12--R15). Six optimization passes ensure that generated code competes with hand-written assembly.
 
-Benchmarks across 14 computational challenges (154 binaries, 12 implementations including GCC, Clang, Rust, and Go) demonstrate that Aricode places second overall behind hand-optimized NASM assembly, while producing binaries 72{,}000$\times$ smaller than Rust and 12{,}000$\times$ smaller than Go. Despite being designed for machine generation, Aricode's mandatory error handling and explicit control flow make AI-generated code straightforward for human reviewers to audit---every guard, type conversion, and error path is visible in the source. The minimal binary footprint (under 3.5~KB with zero runtime dependencies) also positions Aricode as a viable target for resource-constrained domains such as robotics, embedded systems, and edge computing, where an AI agent can generate, compile, and deploy task-specific binaries in real time.
+Benchmarks across 14 computational challenges (154 binaries, 12 implementations including GCC, Clang, Rust, and Go) demonstrate that Aricode places second overall behind hand-optimized NASM assembly, while producing binaries 72{,}000$\times$ smaller than Rust and 12{,}000$\times$ smaller than Go. A complete neural network with backpropagation trains to zero error in an 8.4~KB binary---237{,}000$\times$ smaller than a PyTorch installation. An HTTP server compiles to under 1~KB and handles 25{,}000~requests/second, matching GCC-optimized C.
 
-To our knowledge, no other project combines direct native code generation, zero runtime dependencies, and explicit design for AI agent use. Aricode establishes a new paradigm: instead of AI writing human code for human compilers, AI writes machine-optimal code for a machine-optimal compiler.
+Aricode's mandatory error handling and explicit control flow make code straightforward for humans to read and verify, while its minimal binary footprint makes it viable for robotics, embedded systems, and edge computing where traditional toolchains cannot fit. The source code is clear enough for a human to audit, yet compiles to binaries small enough for a microcontroller.
 \end{abstract}
 
-\textbf{Keywords:} AI agents, compilation target, code generation, x86\_64, machine code, zero runtime, binary optimization, LLM, autonomous coding, human auditability, embedded systems, robotics
+\textbf{Keywords:} compiler, code generation, x86\_64, machine code, zero runtime, binary optimization, embedded systems, robotics, neural networks, SIMD
 
 % ============================================================
 \section{Introduction}
@@ -84,9 +84,9 @@ Existing programming languages address this problem with varying degrees of stri
 
 We present \textsc{Aricode}, a compiled language built on a single principle: \textbf{no silent errors, ever}. This is not a guideline or a best practice---it is enforced by the compiler. Code that can fail silently does not compile. Code that can fail at runtime must handle every failure path explicitly.
 
-Although Aricode is designed primarily as a compilation target for AI agents, its strict error enforcement and explicit control flow make AI-generated code \emph{easy for humans to audit}. Every division is guarded, every error path is handled, and every type conversion is explicit---a human reviewer can inspect machine-generated Aricode and quickly identify logic errors or missing edge cases without deep domain expertise. This ``machine-writes, human-verifies'' paradigm creates a natural division of labor: the AI agent generates correct-by-construction code, and the human operator validates intent.
+Aricode is a \emph{compiler}, not an AI system. Its purpose is to reduce the cost of producing executable programs to the absolute minimum: sub-millisecond compilation, binaries as small as 255~bytes, zero runtime dependencies. The language is designed to be readable by humans---every division is guarded, every error path is handled, every type conversion is explicit---while compiling to machine code that competes with hand-written assembly.
 
-Furthermore, the minimal binary footprint---199~bytes for Hello World, under 3.5~KB for complex programs, with zero runtime dependencies---makes Aricode a compelling target for \textbf{resource-constrained environments} such as robotics, embedded systems, and edge computing. Where traditional compiled languages produce multi-megabyte binaries that require operating system support and runtime libraries, Aricode binaries are self-contained ELF executables that run directly on bare Linux kernels. An AI agent deployed on a robotic platform could generate, compile, and execute task-specific Aricode programs in under 1~ms, enabling real-time adaptive behavior without the overhead of interpreted languages or heavyweight toolchains.
+The minimal binary footprint---255~bytes for Hello World, under 3.5~KB for complex programs, with zero runtime dependencies---makes Aricode particularly suited for \textbf{resource-constrained environments} such as robotics, embedded systems, and edge computing. Where traditional compiled languages produce multi-megabyte binaries that require runtime libraries, Aricode binaries are self-contained ELF executables that run directly on bare Linux kernels. A neural network with backpropagation compiles to 8.4~KB. An HTTP server compiles to 1~KB. Programs can be compiled and deployed in under 1~ms.
 
 \subsection{Contributions}
 

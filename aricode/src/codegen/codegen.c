@@ -1800,11 +1800,18 @@ static void emit_function(CodegenState *cg, const ASTNode *node) {
     n = emit_mov_reg_reg(BUF(cg), REG_RBP, REG_RSP);
     EMIT(cg, n);
 
-    /* Reserve stack space placeholder -- we'll patch it after body */
+    /* Reserve stack space placeholder -- we'll patch it after body.
+     * Always reserve 7 bytes (imm32 form) so we can handle any frame size.
+     * REX.W 81 EC imm32 = sub rsp, imm32 */
     size_t sub_rsp_pos = cg->code_size;
-    /* Emit a sub rsp, imm8 placeholder (4 bytes: REX.W 83 EC imm8) */
-    n = emit_sub_reg_imm(BUF(cg), REG_RSP, 0);
-    EMIT(cg, n);
+    {
+        uint8_t *b = BUF(cg);
+        b[0] = rex(1, 0, 0, 0);    /* REX.W */
+        b[1] = 0x81;               /* sub r/m64, imm32 */
+        b[2] = modrm(3, 5, REG_RSP);
+        memset(b + 3, 0, 4);       /* imm32 = 0 (placeholder) */
+        EMIT(cg, 7);
+    }
 
     /* Allocate locals for parameters and store from ABI registers.
      * Aricode internal ABI: ALL args passed via GPRs (RDI,RSI,RDX,RCX,R8,R9).
@@ -1843,17 +1850,14 @@ static void emit_function(CodegenState *cg, const ASTNode *node) {
     if (frame_size == 0)
         frame_size = 0; /* no locals */
 
-    /* Re-encode the sub rsp, imm at sub_rsp_pos.
-     * OPTIMIZATION: If frame_size is 0 (no locals), NOP-out the sub rsp
-     * instruction to avoid wasting 4 bytes. */
+    /* Patch the sub rsp placeholder with the actual frame size.
+     * The placeholder is always 7 bytes (imm32 form). */
     if (frame_size > 0) {
-        size_t saved_size = cg->code_size;
-        cg->code_size = sub_rsp_pos;
-        n = emit_sub_reg_imm(BUF(cg), REG_RSP, frame_size);
-        cg->code_size = saved_size;
+        /* Patch imm32 at sub_rsp_pos + 3 */
+        memcpy(cg->code + sub_rsp_pos + 3, &frame_size, 4);
     } else {
-        /* NOP-fill the 4 bytes of the placeholder sub rsp, 0 */
-        memset(cg->code + sub_rsp_pos, 0x90, 4); /* 4x NOP */
+        /* NOP-fill the 7 bytes of the placeholder */
+        memset(cg->code + sub_rsp_pos, 0x90, 7);
     }
 
     /* OPTIMIZATION: Only emit safety epilogue if the block doesn't

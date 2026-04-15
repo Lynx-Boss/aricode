@@ -284,18 +284,25 @@ static void emit_binary_op(CodegenState *cg, const ASTNode *node) {
     int right_is_float = expr_is_float(cg, right);
 
     if (left_is_float || right_is_float) {
-        /* Evaluate left -> xmm0 */
+        /* Evaluate left → result in RAX (f64 bits) or xmm0
+         * All expressions ultimately leave f64 bits in RAX.
+         * Push RAX to save the left value on the stack. */
         emit_expression(cg, left);
-        /* Save xmm0 via RAX -> stack */
-        n = emit_movq_reg_xmm(BUF(cg), REG_RAX, 0); EMIT(cg, n);
+        /* Ensure f64 bits are in RAX (if came from xmm0, move it) */
+        if (left->type == NODE_FLOAT_LITERAL ||
+            (left->type == NODE_IDENTIFIER && find_local(cg, left->string_val) &&
+             find_local(cg, left->string_val)->is_float)) {
+            /* Value was loaded into xmm0 AND RAX by emit_expression */
+        }
+        /* RAX has the f64 bits — push to stack */
         n = emit_push(BUF(cg), REG_RAX); EMIT(cg, n);
 
-        /* Evaluate right -> xmm0 */
+        /* Evaluate right → RAX (f64 bits) */
         emit_expression(cg, right);
-        /* xmm1 = right (xmm0) */
-        n = emit_movsd_xmm_xmm(BUF(cg), 1, 0); EMIT(cg, n);
+        /* Move right result to xmm1: movq xmm1, rax */
+        n = emit_movq_xmm_reg(BUF(cg), 1, REG_RAX); EMIT(cg, n);
 
-        /* Pop left into xmm0 via stack */
+        /* Pop left from stack into xmm0: movsd xmm0, [rsp]; add rsp,8 */
         n = emit_movsd_xmm_mem(BUF(cg), 0, REG_RSP, 0); EMIT(cg, n);
         n = emit_add_reg_imm(BUF(cg), REG_RSP, 8); EMIT(cg, n);
 
@@ -1058,6 +1065,9 @@ static void emit_call_expr(CodegenState *cg, const ASTNode *node) {
     /*
      * Evaluate arguments right-to-left, push each.
      * Then pop into the correct ABI registers.
+     * We use a unified approach: all args go through GPRs (RAX contains
+     * f64 bits for float args). The callee detects float params and
+     * loads them from GPR slots into XMM registers as needed.
      */
     for (size_t i = argc; i > 0; i--) {
         emit_expression(cg, node->children[i]);
@@ -1796,13 +1806,24 @@ static void emit_function(CodegenState *cg, const ASTNode *node) {
     n = emit_sub_reg_imm(BUF(cg), REG_RSP, 0);
     EMIT(cg, n);
 
-    /* Allocate locals for parameters and store from ABI registers */
+    /* Allocate locals for parameters and store from ABI registers.
+     * Aricode internal ABI: ALL args passed via GPRs (RDI,RSI,RDX,RCX,R8,R9).
+     * For f64 params, the GPR carries the IEEE 754 bits.
+     * The callee marks float params and loads them into XMM when used. */
     for (size_t i = 0; i < params->child_count && i < SYS_V_ARG_COUNT; i++) {
         const ASTNode *param = params->children[i];
         LocalVar *v = add_local(cg, param->string_val);
         if (!v) return;
 
-        /* Store argument register to local slot */
+        /* Check if parameter is float type */
+        if (param->child_count > 0 && param->children[0] &&
+            param->children[0]->string_val &&
+            (strcmp(param->children[0]->string_val, "f64") == 0 ||
+             strcmp(param->children[0]->string_val, "f32") == 0)) {
+            v->is_float = 1;
+        }
+
+        /* Store from GPR — f64 bits are carried in the integer register */
         n = emit_mov_mem_reg(BUF(cg), REG_RBP, v->rbp_off,
                              SYS_V_ARG_REGS[i]);
         EMIT(cg, n);

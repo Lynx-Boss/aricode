@@ -42,8 +42,10 @@ Binaries under 3.5 KB with zero runtime dependencies make Aricode ideal for **ro
 - **Data structures:** heap arrays (mmap), struct patterns
 - **Imports:** `import "file.ari";` or `import "file.ari" as ns;` with namespace support
 - **Networking:** TCP client/server via direct syscalls (HTTP server in 1,349 bytes)
+- **Threading:** process-based parallelism via fork/waitpid syscalls
+- **SIMD:** SSE2 vectorized array ops (default), AVX2 4x i64/cycle (`--avx2` flag)
 
-### Builtins (43)
+### Builtins (46)
 | Category | Functions |
 |----------|-----------|
 | **Console** | print_str, print_int, print_float, print_dec, read_int, read_float |
@@ -53,6 +55,7 @@ Binaries under 3.5 KB with zero runtime dependencies make Aricode ideal for **ro
 | **Files** | file_open, file_read, file_write, file_close |
 | **Networking** | socket_create, socket_connect, socket_send, socket_recv, socket_close, socket_bind, socket_listen, socket_accept, socket_opt, ip4 |
 | **I/O Multiplex** | epoll_create, epoll_add, epoll_del, epoll_wait |
+| **Threading** | thread_spawn, thread_wait, thread_exit |
 | **Convert** | int_to_float, float_to_int, dec |
 
 ### Compiler
@@ -61,6 +64,14 @@ Binaries under 3.5 KB with zero runtime dependencies make Aricode ideal for **ro
 - **6 optimization passes** - constant folding, strength reduction, peephole, TCO, DCE, decimal folding
 - **Semantic analyzer** - 5-level error hierarchy, always-on, zero false positives
 - **Podium system** - compile-time code quality rating (Gold/Silver/Bronze/Iron)
+- **Security** - NX stack (PT_GNU_STACK), bounds checking on arrays/strings, runtime div-by-zero guard
+
+### Performance Tiers
+| Mode | Flag | Throughput | Compatibility |
+|------|------|-----------|---------------|
+| Scalar | (default) | 1x baseline | All x86_64 |
+| SSE2 | (default) | **5.2x** (arr_sum, arr_fill) | All x86_64 |
+| AVX2 | `--avx2` | **10.5x** (arr_sum) | Desktop/server CPUs |
 
 ## Benchmarks
 

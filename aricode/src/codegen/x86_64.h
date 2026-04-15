@@ -1010,4 +1010,19 @@ static inline int emit_movq_xmm_reg(uint8_t *buf, int xmm, int gpr) {
     return off;
 }
 
+/*
+ * SQRTSD xmm, xmm  (square root of scalar double)
+ * Opcode: F2 0F 51 /r
+ */
+static inline int emit_sqrtsd(uint8_t *buf, int dst, int src) {
+    int off = 0;
+    buf[off++] = 0xF2;
+    if (reg_ext(dst) || reg_ext(src))
+        buf[off++] = rex(0, reg_ext(dst), 0, reg_ext(src));
+    buf[off++] = 0x0F;
+    buf[off++] = 0x51;
+    buf[off++] = modrm(3, dst & 7, src & 7);
+    return off;
+}
+
 #endif /* ARICODE_X86_64_H */

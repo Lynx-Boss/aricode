@@ -1433,6 +1433,204 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             return 1;
         }
         /*
+         * MATH BUILTINS — f64 math functions via SSE2
+         *
+         * math_sqrt(x: f64) → f64    (hardware SQRTSD)
+         * math_abs(x: f64)  → f64    (clear sign bit)
+         * math_floor(x: f64)→ i32    (truncate toward negative infinity)
+         */
+        if (strcmp(name, "math_sqrt") == 0 && argc == 1) {
+            emit_expression(cg, node->children[1]); /* x → xmm0 via RAX bits */
+            int pn; uint8_t *b;
+            /* movq xmm0, rax */
+            b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xC0; EMIT(cg, 5);
+            /* sqrtsd xmm0, xmm0 */
+            pn = emit_sqrtsd(BUF(cg), 0, 0); EMIT(cg, pn);
+            /* movq rax, xmm0 */
+            b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x7E; b[4]=0xC0; EMIT(cg, 5);
+            return 1;
+        }
+        if (strcmp(name, "math_abs") == 0 && argc == 1) {
+            emit_expression(cg, node->children[1]); /* x → RAX (f64 bits) */
+            int pn; uint8_t *b;
+            /* Clear sign bit: btr rax, 63 */
+            b = BUF(cg); b[0]=0x48; b[1]=0x0F; b[2]=0xBA; b[3]=0xF0; b[4]=63; EMIT(cg, 5);
+            return 1;
+        }
+
+        /*
+         * F64 ARRAY BUILTINS — arrays of doubles for neural networks
+         *
+         * Layout: [i64 length][f64 elem0][f64 elem1]...
+         * Same mmap structure as i32 arrays (8 bytes per element).
+         * f64 stored as raw IEEE 754 bits in the i64 slots.
+         *
+         * arr_f64_new(n)           → base ptr (mmap'd)
+         * arr_f64_get(base, idx)   → f64 value
+         * arr_f64_set(base, idx, val) → 0
+         * arr_f64_dot(a, b)        → f64 dot product (SSE2 MULSD+ADDSD)
+         * arr_f64_scale(base, factor) → 0 (multiply all by f64 factor)
+         * arr_f64_sum(base)        → f64 sum
+         */
+        if (strcmp(name, "arr_f64_new") == 0 && argc == 1) {
+            /* Same as arr_new — f64 also uses 8 bytes per element */
+            emit_expression(cg, node->children[1]); /* n → RAX */
+            int pn; uint8_t *b;
+            pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
+            pn = emit_add_reg_imm(BUF(cg), REG_RAX, 1); EMIT(cg, pn);
+            pn = emit_shl_reg_imm(BUF(cg), REG_RAX, 3); EMIT(cg, pn);
+            pn = emit_mov_reg_reg(BUF(cg), REG_RSI, REG_RAX); EMIT(cg, pn);
+            pn = emit_xor_reg_reg(BUF(cg), REG_RDI, REG_RDI); EMIT(cg, pn);
+            pn = emit_mov_reg_imm32(BUF(cg), REG_RDX, 3); EMIT(cg, pn);
+            b = BUF(cg); b[0]=0x49; b[1]=0xC7; b[2]=0xC2;
+            int32_t v=0x22; memcpy(b+3,&v,4); EMIT(cg,7);
+            b = BUF(cg); b[0]=0x49; b[1]=0xC7; b[2]=0xC0;
+            v=-1; memcpy(b+3,&v,4); EMIT(cg,7);
+            b = BUF(cg); b[0]=0x4D; b[1]=0x31; b[2]=0xC9; EMIT(cg,3);
+            pn = emit_mov_reg_imm32(BUF(cg), REG_RAX, 9); EMIT(cg, pn);
+            pn = emit_syscall(BUF(cg)); EMIT(cg, pn);
+            pn = emit_pop(BUF(cg), REG_RCX); EMIT(cg, pn);
+            b = BUF(cg);
+            b[0] = rex(1, reg_ext(REG_RCX), 0, reg_ext(REG_RAX));
+            b[1] = 0x89; b[2] = modrm(0, REG_RCX, REG_RAX);
+            EMIT(cg, 3);
+            pn = emit_add_reg_imm(BUF(cg), REG_RAX, 8); EMIT(cg, pn);
+            return 1;
+        }
+        if (strcmp(name, "arr_f64_get") == 0 && argc == 2) {
+            /* Load f64 from [base + idx*8], return as f64 bits in RAX */
+            emit_expression(cg, node->children[2]); /* idx */
+            int pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
+            emit_expression(cg, node->children[1]); /* base */
+            pn = emit_pop(BUF(cg), REG_RCX); EMIT(cg, pn);
+            uint8_t *b = BUF(cg);
+            b[0] = rex(1, reg_ext(REG_RAX), reg_ext(REG_RCX), reg_ext(REG_RAX));
+            b[1] = 0x8B; b[2] = modrm(0, REG_RAX & 7, 4);
+            b[3] = (uint8_t)((3 << 6) | ((REG_RCX & 7) << 3) | (REG_RAX & 7));
+            EMIT(cg, 4);
+            return 1;
+        }
+        if (strcmp(name, "arr_f64_set") == 0 && argc == 3) {
+            /* Store f64 at [base + idx*8] */
+            emit_expression(cg, node->children[3]); /* val (f64 bits in RAX) */
+            int pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
+            emit_expression(cg, node->children[2]); /* idx */
+            pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
+            emit_expression(cg, node->children[1]); /* base */
+            pn = emit_pop(BUF(cg), REG_RCX); EMIT(cg, pn); /* idx */
+            pn = emit_pop(BUF(cg), REG_RDX); EMIT(cg, pn); /* val */
+            uint8_t *b = BUF(cg);
+            b[0] = rex(1, reg_ext(REG_RDX), reg_ext(REG_RCX), reg_ext(REG_RAX));
+            b[1] = 0x89; b[2] = modrm(0, REG_RDX & 7, 4);
+            b[3] = (uint8_t)((3 << 6) | ((REG_RCX & 7) << 3) | (REG_RAX & 7));
+            EMIT(cg, 4);
+            pn = emit_xor_reg_reg(BUF(cg), REG_RAX, REG_RAX); EMIT(cg, pn);
+            return 1;
+        }
+        if (strcmp(name, "arr_f64_sum") == 0 && argc == 1) {
+            /* SSE2 sum of f64 array: ADDSD accumulator loop */
+            emit_expression(cg, node->children[1]); /* base */
+            int pn; uint8_t *b;
+            pn = emit_mov_reg_reg(BUF(cg), REG_RDI, REG_RAX); EMIT(cg, pn);
+            pn = emit_mov_reg_mem(BUF(cg), REG_RCX, REG_RAX, -8); EMIT(cg, pn);
+            /* xorpd xmm0, xmm0 (zero accumulator) */
+            b = BUF(cg); b[0]=0x66; b[1]=0x0F; b[2]=0x57; b[3]=0xC0; EMIT(cg, 4);
+            pn = emit_xor_reg_reg(BUF(cg), REG_RSI, REG_RSI); EMIT(cg, pn);
+            size_t loop_top = cg->code_size;
+            pn = emit_cmp_reg_reg(BUF(cg), REG_RSI, REG_RCX); EMIT(cg, pn);
+            size_t jae_done = cg->code_size;
+            b = BUF(cg); b[0]=0x0F; b[1]=0x83; memset(b+2,0,4); EMIT(cg, 6);
+            /* movsd xmm1, [rdi + rsi*8] */
+            b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x10;
+            b[3]=modrm(0, 1, 4); b[4]=(uint8_t)((3<<6)|(REG_RSI<<3)|REG_RDI);
+            EMIT(cg, 5);
+            /* addsd xmm0, xmm1 */
+            pn = emit_addsd(BUF(cg), 0, 1); EMIT(cg, pn);
+            pn = emit_inc_reg(BUF(cg), REG_RSI); EMIT(cg, pn);
+            int32_t back = (int32_t)((int64_t)loop_top - (int64_t)(cg->code_size + 5));
+            pn = emit_jmp(BUF(cg), back); EMIT(cg, pn);
+            int32_t jae_off = (int32_t)(cg->code_size - (jae_done + 6));
+            memcpy(cg->code + jae_done + 2, &jae_off, 4);
+            /* movq rax, xmm0 (return f64 bits) */
+            b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x7E; b[4]=0xC0; EMIT(cg, 5);
+            return 1;
+        }
+        if (strcmp(name, "arr_f64_dot") == 0 && argc == 2) {
+            /* SSE2 dot product: sum(a[i]*b[i]) with MULSD+ADDSD */
+            emit_expression(cg, node->children[2]); /* b */
+            int pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
+            emit_expression(cg, node->children[1]); /* a */
+            pn = emit_pop(BUF(cg), REG_RDX); EMIT(cg, pn);
+            uint8_t *b;
+            pn = emit_push(BUF(cg), REG_RBX); EMIT(cg, pn); /* save callee-saved */
+            pn = emit_mov_reg_reg(BUF(cg), REG_RDI, REG_RAX); EMIT(cg, pn); /* a */
+            pn = emit_mov_reg_reg(BUF(cg), REG_RBX, REG_RDX); EMIT(cg, pn); /* b */
+            pn = emit_mov_reg_mem(BUF(cg), REG_RCX, REG_RAX, -8); EMIT(cg, pn);
+            /* xorpd xmm0, xmm0 */
+            b = BUF(cg); b[0]=0x66; b[1]=0x0F; b[2]=0x57; b[3]=0xC0; EMIT(cg, 4);
+            pn = emit_xor_reg_reg(BUF(cg), REG_RSI, REG_RSI); EMIT(cg, pn);
+            size_t loop_top = cg->code_size;
+            pn = emit_cmp_reg_reg(BUF(cg), REG_RSI, REG_RCX); EMIT(cg, pn);
+            size_t jae_done = cg->code_size;
+            b = BUF(cg); b[0]=0x0F; b[1]=0x83; memset(b+2,0,4); EMIT(cg, 6);
+            /* movsd xmm1, [rdi + rsi*8] — a[i] */
+            b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x10;
+            b[3]=modrm(0, 1, 4); b[4]=(uint8_t)((3<<6)|(REG_RSI<<3)|REG_RDI);
+            EMIT(cg, 5);
+            /* movsd xmm2, [rbx + rsi*8] — b[i] */
+            b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x10;
+            b[3]=modrm(0, 2, 4); b[4]=(uint8_t)((3<<6)|(REG_RSI<<3)|REG_RBX);
+            EMIT(cg, 5);
+            /* mulsd xmm1, xmm2 */
+            pn = emit_mulsd(BUF(cg), 1, 2); EMIT(cg, pn);
+            /* addsd xmm0, xmm1 */
+            pn = emit_addsd(BUF(cg), 0, 1); EMIT(cg, pn);
+            pn = emit_inc_reg(BUF(cg), REG_RSI); EMIT(cg, pn);
+            int32_t back = (int32_t)((int64_t)loop_top - (int64_t)(cg->code_size + 5));
+            pn = emit_jmp(BUF(cg), back); EMIT(cg, pn);
+            int32_t jae_off = (int32_t)(cg->code_size - (jae_done + 6));
+            memcpy(cg->code + jae_done + 2, &jae_off, 4);
+            pn = emit_pop(BUF(cg), REG_RBX); EMIT(cg, pn);
+            /* movq rax, xmm0 */
+            b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x7E; b[4]=0xC0; EMIT(cg, 5);
+            return 1;
+        }
+        if (strcmp(name, "arr_f64_scale") == 0 && argc == 2) {
+            /* Multiply all elements by f64 factor */
+            emit_expression(cg, node->children[2]); /* factor f64 bits → RAX */
+            int pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
+            emit_expression(cg, node->children[1]); /* base */
+            pn = emit_pop(BUF(cg), REG_RDX); EMIT(cg, pn);
+            uint8_t *b;
+            pn = emit_mov_reg_reg(BUF(cg), REG_RDI, REG_RAX); EMIT(cg, pn);
+            pn = emit_mov_reg_mem(BUF(cg), REG_RCX, REG_RAX, -8); EMIT(cg, pn);
+            /* movq xmm2, rdx (factor) */
+            b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xD2; EMIT(cg, 5);
+            pn = emit_xor_reg_reg(BUF(cg), REG_RSI, REG_RSI); EMIT(cg, pn);
+            size_t loop_top = cg->code_size;
+            pn = emit_cmp_reg_reg(BUF(cg), REG_RSI, REG_RCX); EMIT(cg, pn);
+            size_t jae_done = cg->code_size;
+            b = BUF(cg); b[0]=0x0F; b[1]=0x83; memset(b+2,0,4); EMIT(cg, 6);
+            /* movsd xmm1, [rdi + rsi*8] */
+            b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x10;
+            b[3]=modrm(0, 1, 4); b[4]=(uint8_t)((3<<6)|(REG_RSI<<3)|REG_RDI);
+            EMIT(cg, 5);
+            /* mulsd xmm1, xmm2 */
+            pn = emit_mulsd(BUF(cg), 1, 2); EMIT(cg, pn);
+            /* movsd [rdi + rsi*8], xmm1 */
+            b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x11;
+            b[3]=modrm(0, 1, 4); b[4]=(uint8_t)((3<<6)|(REG_RSI<<3)|REG_RDI);
+            EMIT(cg, 5);
+            pn = emit_inc_reg(BUF(cg), REG_RSI); EMIT(cg, pn);
+            int32_t back = (int32_t)((int64_t)loop_top - (int64_t)(cg->code_size + 5));
+            pn = emit_jmp(BUF(cg), back); EMIT(cg, pn);
+            int32_t jae_off = (int32_t)(cg->code_size - (jae_done + 6));
+            memcpy(cg->code + jae_done + 2, &jae_off, 4);
+            pn = emit_xor_reg_reg(BUF(cg), REG_RAX, REG_RAX); EMIT(cg, pn);
+            return 1;
+        }
+
+        /*
          * THREADING BUILTINS — multi-threading via clone() syscall
          *
          * thread_spawn(func_name_as_int) → child pid

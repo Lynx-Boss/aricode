@@ -73,6 +73,12 @@ int main(int argc, char *argv[]) {
             opts.verbose = true;
         } else if (strcmp(argv[i], "--avx2") == 0) {
             opts.use_avx2 = true;
+        } else if (strncmp(argv[i], "--precision=", 12) == 0) {
+            opts.precision = atoi(argv[i] + 12);
+            if (opts.precision != 6 && opts.precision != 8 && opts.precision != 15) {
+                fprintf(stderr, "Error: --precision must be 6, 8, or 15\n");
+                return 1;
+            }
         } else if (strcmp(argv[i], "-o") == 0) {
             if (i + 1 < argc) {
                 opts.output_file = argv[++i];

@@ -101,6 +101,7 @@ typedef struct {
 
     /* Feature flags */
     int         use_avx2;          /* 1 = emit AVX2 (256-bit) instructions */
+    int         precision;         /* 6=fast(5 terms), 8=default(7), 15=strict(10) */
 
     /* Error string dedup cache — stores code offsets of embedded error strings */
     struct {

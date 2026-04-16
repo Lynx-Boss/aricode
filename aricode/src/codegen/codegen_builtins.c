@@ -1467,56 +1467,68 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             return 1;
         }
         if (strcmp(name, "math_exp") == 0 && argc == 1) {
-            /* exp(x) approximation using the identity:
-             * exp(x) = 2^(x/ln2) = 2^n * 2^f where n=floor(x/ln2), f=frac
-             * We use the x87 FPU trick: convert to int via adding magic number.
-             * For simplicity and portability, use a polynomial approximation:
-             * exp(x) ≈ (1 + x/256)^256 via repeated squaring (8 squarings).
-             * Accurate to ~6 significant digits for |x| < 10. */
-            emit_expression(cg, node->children[1]); /* x → RAX (f64 bits) */
+            /* exp(x) ≈ (1 + x/N)^N via repeated squaring.
+             * Precision-aware: N = 2^squarings.
+             *   --precision=6:  6 squarings, N=64   (~4 digits, fastest)
+             *   --precision=8:  8 squarings, N=256  (~6 digits, default)
+             *   --precision=15: 12 squarings, N=4096 (~12 digits, strictest)
+             */
+            int squarings = 8; /* default */
+            int divisor = 256;
+            if (cg->precision == 6)       { squarings = 6;  divisor = 64; }
+            else if (cg->precision == 15) { squarings = 12; divisor = 4096; }
+
+            emit_expression(cg, node->children[1]);
             int pn; uint8_t *b;
-            /* movq xmm0, rax */
             b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xC0; EMIT(cg, 5);
-            /* xmm1 = 256.0 */
-            pn = emit_mov_reg_imm32(BUF(cg), REG_RCX, 256); EMIT(cg, pn);
+            pn = emit_mov_reg_imm32(BUF(cg), REG_RCX, divisor); EMIT(cg, pn);
             pn = emit_cvtsi2sd(BUF(cg), 1, REG_RCX); EMIT(cg, pn);
-            /* xmm0 = x / 256 */
             pn = emit_divsd(BUF(cg), 0, 1); EMIT(cg, pn);
-            /* xmm1 = 1.0 */
-            uint64_t one_bits = 0x3FF0000000000000ULL; /* IEEE 754 1.0 */
+            uint64_t one_bits = 0x3FF0000000000000ULL;
             pn = emit_mov_reg_imm64(BUF(cg), REG_RCX, one_bits); EMIT(cg, pn);
-            b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xC9; EMIT(cg, 5); /* movq xmm1, rcx */
-            /* xmm0 = 1 + x/256 */
+            b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xC9; EMIT(cg, 5);
             pn = emit_addsd(BUF(cg), 0, 1); EMIT(cg, pn);
-            /* Square 8 times: (1+x/256)^256 */
-            pn = emit_mulsd(BUF(cg), 0, 0); EMIT(cg, pn); /* ^2 */
-            pn = emit_mulsd(BUF(cg), 0, 0); EMIT(cg, pn); /* ^4 */
-            pn = emit_mulsd(BUF(cg), 0, 0); EMIT(cg, pn); /* ^8 */
-            pn = emit_mulsd(BUF(cg), 0, 0); EMIT(cg, pn); /* ^16 */
-            pn = emit_mulsd(BUF(cg), 0, 0); EMIT(cg, pn); /* ^32 */
-            pn = emit_mulsd(BUF(cg), 0, 0); EMIT(cg, pn); /* ^64 */
-            pn = emit_mulsd(BUF(cg), 0, 0); EMIT(cg, pn); /* ^128 */
-            pn = emit_mulsd(BUF(cg), 0, 0); EMIT(cg, pn); /* ^256 */
-            /* movq rax, xmm0 */
+            for (int sq = 0; sq < squarings; sq++) {
+                pn = emit_mulsd(BUF(cg), 0, 0); EMIT(cg, pn);
+            }
             b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x7E; b[4]=0xC0; EMIT(cg, 5);
             return 1;
         }
         if (strcmp(name, "math_log") == 0 && argc == 1) {
-            /* ln(x) approximation using: ln(x) = 2 * atanh((x-1)/(x+1))
-             * atanh(y) ≈ y + y^3/3 + y^5/5 + y^7/7 (Taylor series)
-             * Accurate to ~6 significant digits for 0.1 < x < 10. */
-            emit_expression(cg, node->children[1]); /* x → RAX */
+            /* ln(x) = 2 * atanh((x-1)/(x+1))
+             * atanh(y) = y + y^3/3 + y^5/5 + y^7/7 + ...
+             * Precision-aware: number of terms controlled by --precision.
+             *   --precision=6:  3 terms (y, y^3/3, y^5/5)           ~4 digits
+             *   --precision=8:  5 terms (+y^7/7, y^9/9)             ~8 digits
+             *   --precision=15: 8 terms (+y^11/11..y^15/15)         ~14 digits
+             */
+            int terms = 3; /* default (precision=8 uses 5) */
+            if (cg->precision == 6) terms = 3;
+            else if (cg->precision == 8) terms = 5;
+            else if (cg->precision == 15) terms = 8;
+
+            /* Odd denominators for atanh series: 1, 3, 5, 7, 9, 11, 13, 15 */
+            static const uint64_t denom_bits[8] = {
+                0x3FF0000000000000ULL, /* 1.0 */
+                0x4008000000000000ULL, /* 3.0 */
+                0x4014000000000000ULL, /* 5.0 */
+                0x401C000000000000ULL, /* 7.0 */
+                0x4022000000000000ULL, /* 9.0 */
+                0x4026000000000000ULL, /* 11.0 */
+                0x402A000000000000ULL, /* 13.0 */
+                0x402E000000000000ULL, /* 15.0 */
+            };
+
+            emit_expression(cg, node->children[1]);
             int pn; uint8_t *b;
             /* movq xmm0, rax (x) */
             b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xC0; EMIT(cg, 5);
             /* xmm1 = 1.0 */
-            uint64_t one = 0x3FF0000000000000ULL;
-            pn = emit_mov_reg_imm64(BUF(cg), REG_RCX, one); EMIT(cg, pn);
-            b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xC9; EMIT(cg, 5); /* movq xmm1, rcx */
-            /* xmm2 = x - 1 */
+            pn = emit_mov_reg_imm64(BUF(cg), REG_RCX, 0x3FF0000000000000ULL); EMIT(cg, pn);
+            b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xC9; EMIT(cg, 5);
+            /* xmm2 = x-1, xmm3 = x+1 */
             pn = emit_movsd_xmm_xmm(BUF(cg), 2, 0); EMIT(cg, pn);
             pn = emit_subsd(BUF(cg), 2, 1); EMIT(cg, pn);
-            /* xmm3 = x + 1 */
             pn = emit_movsd_xmm_xmm(BUF(cg), 3, 0); EMIT(cg, pn);
             pn = emit_addsd(BUF(cg), 3, 1); EMIT(cg, pn);
             /* xmm0 = y = (x-1)/(x+1) */
@@ -1525,32 +1537,25 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             /* xmm4 = y^2 */
             pn = emit_movsd_xmm_xmm(BUF(cg), 4, 0); EMIT(cg, pn);
             pn = emit_mulsd(BUF(cg), 4, 0); EMIT(cg, pn);
-            /* sum = y */
+            /* xmm5 = sum = y (first term, denominator 1) */
             pn = emit_movsd_xmm_xmm(BUF(cg), 5, 0); EMIT(cg, pn);
-            /* term = y * y^2 = y^3 */
-            pn = emit_mulsd(BUF(cg), 0, 4); EMIT(cg, pn);
-            /* sum += y^3 / 3 */
-            uint64_t three = 0x4008000000000000ULL; /* 3.0 */
-            pn = emit_mov_reg_imm64(BUF(cg), REG_RCX, three); EMIT(cg, pn);
-            b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xF1; EMIT(cg, 5); /* movq xmm6, rcx */
-            pn = emit_movsd_xmm_xmm(BUF(cg), 7, 0); EMIT(cg, pn);
-            pn = emit_divsd(BUF(cg), 7, 6); EMIT(cg, pn);
-            pn = emit_addsd(BUF(cg), 5, 7); EMIT(cg, pn);
-            /* term = y^3 * y^2 = y^5 */
-            pn = emit_mulsd(BUF(cg), 0, 4); EMIT(cg, pn);
-            /* sum += y^5 / 5 */
-            uint64_t five = 0x4014000000000000ULL; /* 5.0 */
-            pn = emit_mov_reg_imm64(BUF(cg), REG_RCX, five); EMIT(cg, pn);
-            b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xF1; EMIT(cg, 5);
-            pn = emit_movsd_xmm_xmm(BUF(cg), 7, 0); EMIT(cg, pn);
-            pn = emit_divsd(BUF(cg), 7, 6); EMIT(cg, pn);
-            pn = emit_addsd(BUF(cg), 5, 7); EMIT(cg, pn);
+            /* Emit remaining terms: y^(2k+1) / (2k+1) */
+            for (int t = 1; t < terms; t++) {
+                /* xmm0 = xmm0 * y^2 (advance power) */
+                pn = emit_mulsd(BUF(cg), 0, 4); EMIT(cg, pn);
+                /* xmm6 = denominator */
+                pn = emit_mov_reg_imm64(BUF(cg), REG_RCX, denom_bits[t]); EMIT(cg, pn);
+                b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xF1; EMIT(cg, 5);
+                /* xmm7 = term / denom */
+                pn = emit_movsd_xmm_xmm(BUF(cg), 7, 0); EMIT(cg, pn);
+                pn = emit_divsd(BUF(cg), 7, 6); EMIT(cg, pn);
+                /* sum += term/denom */
+                pn = emit_addsd(BUF(cg), 5, 7); EMIT(cg, pn);
+            }
             /* result = 2 * sum */
-            uint64_t two = 0x4000000000000000ULL; /* 2.0 */
-            pn = emit_mov_reg_imm64(BUF(cg), REG_RCX, two); EMIT(cg, pn);
-            b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xC1; EMIT(cg, 5); /* movq xmm0, rcx */
+            pn = emit_mov_reg_imm64(BUF(cg), REG_RCX, 0x4000000000000000ULL); EMIT(cg, pn);
+            b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xC1; EMIT(cg, 5);
             pn = emit_mulsd(BUF(cg), 0, 5); EMIT(cg, pn);
-            /* movq rax, xmm0 */
             b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x7E; b[4]=0xC0; EMIT(cg, 5);
             return 1;
         }

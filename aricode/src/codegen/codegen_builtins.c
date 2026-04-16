@@ -1559,6 +1559,8 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             int pn; uint8_t *b;
             /* Clear sign bit: btr rax, 63 */
             b = BUF(cg); b[0]=0x48; b[1]=0x0F; b[2]=0xBA; b[3]=0xF0; b[4]=63; EMIT(cg, 5);
+            /* Sync xmm0 with modified RAX (for print_float etc.) */
+            b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xC0; EMIT(cg, 5); /* movq xmm0, rax */
             return 1;
         }
 

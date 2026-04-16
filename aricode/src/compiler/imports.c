@@ -238,8 +238,9 @@ static void import_stack_pop(void) {
 /* ------------------------------------------------------------------ */
 
 char *resolve_imports(const char *source, const char *base_path) {
-    /* Push current file to import stack (for cycle detection) */
+    /* Reset and push current file to import stack (for cycle detection) */
     if (base_path && import_depth == 0) {
+        import_depth = 0; /* reset for new compilation */
         import_stack_push(base_path);
     }
 

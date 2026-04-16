@@ -45,15 +45,15 @@ Binaries under 3.5 KB with zero runtime dependencies make Aricode ideal for **ro
 - **Threading:** process-based parallelism via fork/waitpid syscalls
 - **SIMD:** SSE2 vectorized array ops (default), AVX2 4x i64/cycle (`--avx2` flag)
 
-### Builtins (54)
+### Builtins (57)
 | Category | Functions |
 |----------|-----------|
 | **Console** | print_str, print_int, print_float, print_dec, read_int, read_float |
 | **Strings** | str_new, str_len, str_eq, str_char_at, str_println, str_concat |
 | **Arrays (i32)** | arr_new, arr_get, arr_set, arr_len, arr_sum, arr_fill, arr_scale, arr_dot |
 | **Arrays (f64)** | arr_f64_new, arr_f64_get, arr_f64_set, arr_f64_sum, arr_f64_dot, arr_f64_scale |
-| **Math** | math_sqrt, math_abs |
-| **Memory** | mem_free, buf_stack |
+| **Math** | math_sqrt, math_abs, math_exp, math_log |
+| **Memory** | mem_free, buf_stack, buf_free |
 | **Files** | file_open, file_read, file_write, file_close |
 | **Networking** | socket_create, socket_connect, socket_send, socket_recv, socket_close, socket_bind, socket_listen, socket_accept, socket_opt, ip4 |
 | **I/O Multiplex** | epoll_create, epoll_add, epoll_del, epoll_wait |

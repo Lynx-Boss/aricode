@@ -149,13 +149,15 @@ static FuncEntry *find_func(CodegenState *cg, const char *name) {
 
 LocalVar *add_local(CodegenState *cg, const char *name) {
     if (cg->local_count >= CODEGEN_MAX_VARS) {
+        /* Note: no ASTNode available here — location info unavailable */
         cg_error(cg, "too many local variables");
         return NULL;
     }
     cg->stack_offset -= 8; /* each local takes 8 bytes */
     LocalVar *v = &cg->locals[cg->local_count++];
-    v->name    = name;
-    v->rbp_off = cg->stack_offset;
+    v->name     = name;
+    v->rbp_off  = cg->stack_offset;
+    v->is_float = 0;  /* default to integer — set to 1 by caller if f64 */
     return v;
 }
 
@@ -342,7 +344,7 @@ static void emit_binary_op(CodegenState *cg, const ASTNode *node) {
             n = emit_movzx_reg_reg8(BUF(cg), REG_RAX, REG_RAX); EMIT(cg, n);
             return; /* comparison returns int, not float */
         } else {
-            cg_error(cg, "unsupported float operator '%s'", op);
+            cg_error(cg, "unsupported float operator '%s' at %d:%d", op, node->line, node->col);
             return;
         }
 
@@ -635,7 +637,7 @@ static void emit_unary_op(CodegenState *cg, const ASTNode *node) {
         n = emit_movzx_reg_reg8(BUF(cg), REG_RAX, REG_RAX);
         EMIT(cg, n);
     } else {
-        cg_error(cg, "unknown unary operator '%s'", node->op);
+        cg_error(cg, "unknown unary operator '%s' at %d:%d", node->op, node->line, node->col);
     }
 }
 
@@ -654,7 +656,7 @@ static void emit_unary_op(CodegenState *cg, const ASTNode *node) {
  */
 void emit_builtin_print_str(CodegenState *cg, const ASTNode *arg) {
     if (!arg || arg->type != NODE_STRING_LITERAL || !arg->string_val) {
-        cg_error(cg, "print_str requires a string literal argument");
+        cg_error(cg, "print_str requires a string literal argument at %d:%d", arg ? arg->line : 0, arg ? arg->col : 0);
         return;
     }
 
@@ -1257,7 +1259,14 @@ static void emit_var_decl(CodegenState *cg, const ASTNode *node) {
 
     if (init_expr) {
         int expr_type = emit_expression(cg, init_expr);
-        if (expr_type == 1 && !v->is_float) v->is_float = 1;
+        /* Only infer float type if no explicit type annotation.
+         * If the variable has `: i32` or other int type, respect it. */
+        int has_type_annotation = (node->child_count >= 1 &&
+                                   node->children[0] &&
+                                   node->children[0]->type == NODE_TYPE_ANNOTATION);
+        if (expr_type == 1 && !v->is_float && !has_type_annotation) {
+            v->is_float = 1;
+        }
         int n = emit_mov_mem_reg(BUF(cg), REG_RBP, v->rbp_off, REG_RAX);
         EMIT(cg, n);
     }
@@ -1774,7 +1783,7 @@ static void emit_function(CodegenState *cg, const ASTNode *node) {
 
     /* Record function entry */
     if (cg->func_count >= CODEGEN_MAX_FUNCS) {
-        cg_error(cg, "too many functions");
+        cg_error(cg, "too many functions at %d:%d", node->line, node->col);
         return;
     }
 
@@ -1946,6 +1955,7 @@ static int patch_calls(CodegenState *cg) {
 
         FuncEntry *fe = find_func(cg, target);
         if (!fe) {
+            /* Note: no ASTNode available in link phase — location info unavailable */
             cg_error(cg, "undefined function '%s'", target);
             return -1;
         }

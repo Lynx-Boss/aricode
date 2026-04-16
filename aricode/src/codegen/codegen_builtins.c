@@ -755,7 +755,7 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             /* str_new("literal"): embed string, mmap heap copy */
             ASTNode *arg = node->children[1];
             if (!arg || arg->type != NODE_STRING_LITERAL || !arg->string_val) {
-                cg_error(cg, "str_new requires a string literal");
+                cg_error(cg, "str_new requires a string literal at %d:%d", node->line, node->col);
                 return 1;
             }
             const char *str = arg->string_val;

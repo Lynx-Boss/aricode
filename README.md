@@ -75,6 +75,24 @@ Binaries under 3.5 KB with zero runtime dependencies make Aricode ideal for **ro
 | SSE2 | (default) | **5.2x** (arr_sum, arr_fill) | All x86_64 |
 | AVX2 | `--avx2` | **10.5x** (arr_sum) | Desktop/server CPUs |
 
+### Precision Control
+
+First compiler to offer **per-compilation math precision** — no other compiler (GCC, LLVM, ICC, Rust) provides this.
+
+```bash
+aric program.ari --precision=6     # ~4 digits — IoT, sensors, ML inference
+aric program.ari --precision=8     # ~8 digits — ML training, PID (default)
+aric program.ari --precision=15    # ~12 digits — science, finance, orbital
+```
+
+| Level | Digits | math_exp terms | math_log terms | Binary cost | Use case |
+|-------|--------|---------------|---------------|-------------|----------|
+| `--precision=6` | ~4 | 6 squarings | 3 atanh | smallest | Robotics, edge, ML inference |
+| `--precision=8` | ~8 | 8 squarings | 5 atanh | default | ML training, PID controllers |
+| `--precision=15` | ~12 | 12 squarings | 8 atanh | +15% | Science, finance, orbital mechanics |
+
+The programmer decides the precision-performance trade-off at compile time, not the language.
+
 ### Neural Network Training
 
 Aricode can train neural networks with backpropagation in **zero-dependency binaries under 10 KB**.

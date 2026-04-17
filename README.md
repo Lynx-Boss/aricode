@@ -75,6 +75,16 @@ Binaries under 3.5 KB with zero runtime dependencies make Aricode ideal for **ro
 | SSE2 | (default) | **5.2x** (arr_sum, arr_fill) | All x86_64 |
 | AVX2 | `--avx2` | **10.5x** (arr_sum) | Desktop/server CPUs |
 
+### Math Performance (sin/cos/exp/log/sqrt)
+
+| Mode | vs C (gcc -O2 libm) | Binary | Precision |
+|------|---------------------|--------|-----------|
+| SSE2 minimax (default) | **1.5x slower** | 2.1 KB | ~13 digits |
+| x87 FPU (`--precision=15`) | 9x slower | 1.3 KB | 15+ digits (80-bit) |
+| C libm reference | 1x | 16 KB | 15 digits |
+
+Benchmark: 10M iterations, variable inputs, checksum-verified. Binary 8x smaller than C.
+
 ### Precision Control
 
 First compiler to offer **per-compilation math precision** — no other compiler (GCC, LLVM, ICC, Rust) provides this.

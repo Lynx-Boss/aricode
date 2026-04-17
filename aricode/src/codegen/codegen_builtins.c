@@ -531,10 +531,13 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
          * Uses the integer print_int mechanism for each part.
          */
         if (strcmp(name, "print_float") == 0 && argc == 1) {
-            emit_expression(cg, node->children[1]); /* x -> xmm0 + RAX */
+            emit_expression(cg, node->children[1]); /* x -> RAX (f64 bits) */
             int pn; uint8_t *b;
 
-            /* Save xmm0 bits on stack */
+            /* Ensure xmm0 is synced with RAX (x87 builtins return in RAX only) */
+            b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xC0; EMIT(cg, 5); /* movq xmm0, rax */
+
+            /* Save f64 bits on stack */
             pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
 
             /* Handle negative: if xmm0 < 0, print '-' and negate */

@@ -1485,63 +1485,308 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             return 1;
         }
         if (strcmp(name, "math_exp") == 0 && argc == 1) {
-            /* exp(x) via x87 FPU — IEEE 754 full precision.
-             * Algorithm: exp(x) = 2^(x * log2(e))
-             * Uses: FLDL2E, FMUL, FRNDINT, F2XM1, FSCALE */
             emit_expression(cg, node->children[1]); /* x → RAX */
             int pn; uint8_t *b;
-            b = BUF(cg); b[0]=0x48; b[1]=0x83; b[2]=0xEC; b[3]=16; EMIT(cg, 4); /* sub rsp,16 */
-            b = BUF(cg); b[0]=0x48; b[1]=0x89; b[2]=0x04; b[3]=0x24; EMIT(cg, 4); /* mov [rsp],rax */
-            /* fld [rsp]          ; ST(0) = x */
-            b = BUF(cg); b[0]=0xDD; b[1]=0x04; b[2]=0x24; EMIT(cg, 3);
-            /* fldl2e             ; ST(0) = log2(e), ST(1) = x */
-            b = BUF(cg); b[0]=0xD9; b[1]=0xEA; EMIT(cg, 2);
-            /* fmulp              ; ST(0) = x * log2(e) */
-            b = BUF(cg); b[0]=0xDE; b[1]=0xC9; EMIT(cg, 2);
-            /* fld st(0)          ; ST(0) = ST(1) = x*log2e */
-            b = BUF(cg); b[0]=0xD9; b[1]=0xC0; EMIT(cg, 2);
-            /* frndint            ; ST(0) = n = round(x*log2e), ST(1) = x*log2e */
-            b = BUF(cg); b[0]=0xD9; b[1]=0xFC; EMIT(cg, 2);
-            /* fsub st(1), st(0)  ; ST(1) = x*log2e - n = f, ST(0) = n */
-            b = BUF(cg); b[0]=0xDC; b[1]=0xE9; EMIT(cg, 2);
-            /* fxch               ; ST(0) = f, ST(1) = n */
-            b = BUF(cg); b[0]=0xD9; b[1]=0xC9; EMIT(cg, 2);
-            /* f2xm1              ; ST(0) = 2^f - 1 */
-            b = BUF(cg); b[0]=0xD9; b[1]=0xF0; EMIT(cg, 2);
-            /* fld1               ; ST(0) = 1, ST(1) = 2^f-1, ST(2) = n */
-            b = BUF(cg); b[0]=0xD9; b[1]=0xE8; EMIT(cg, 2);
-            /* faddp              ; ST(0) = 2^f, ST(1) = n */
-            b = BUF(cg); b[0]=0xDE; b[1]=0xC1; EMIT(cg, 2);
-            /* fscale             ; ST(0) = 2^f * 2^n = exp(x), ST(1) = n */
-            b = BUF(cg); b[0]=0xD9; b[1]=0xFD; EMIT(cg, 2);
-            /* fstp qword [rsp]   ; store result, pop */
-            b = BUF(cg); b[0]=0xDD; b[1]=0x1C; b[2]=0x24; EMIT(cg, 3);
-            /* fstp st(0)         ; pop remaining n */
-            b = BUF(cg); b[0]=0xDD; b[1]=0xD8; EMIT(cg, 2);
-            /* mov rax, [rsp] */
-            b = BUF(cg); b[0]=0x48; b[1]=0x8B; b[2]=0x04; b[3]=0x24; EMIT(cg, 4);
-            b = BUF(cg); b[0]=0x48; b[1]=0x83; b[2]=0xC4; b[3]=16; EMIT(cg, 4); /* add rsp,16 */
+            if (cg->precision == 15) {
+                /* exp(x) via x87 FPU — IEEE 754 full precision.
+                 * Algorithm: exp(x) = 2^(x * log2(e))
+                 * Uses: FLDL2E, FMUL, FRNDINT, F2XM1, FSCALE */
+                b = BUF(cg); b[0]=0x48; b[1]=0x83; b[2]=0xEC; b[3]=16; EMIT(cg, 4); /* sub rsp,16 */
+                b = BUF(cg); b[0]=0x48; b[1]=0x89; b[2]=0x04; b[3]=0x24; EMIT(cg, 4); /* mov [rsp],rax */
+                /* fld [rsp]          ; ST(0) = x */
+                b = BUF(cg); b[0]=0xDD; b[1]=0x04; b[2]=0x24; EMIT(cg, 3);
+                /* fldl2e             ; ST(0) = log2(e), ST(1) = x */
+                b = BUF(cg); b[0]=0xD9; b[1]=0xEA; EMIT(cg, 2);
+                /* fmulp              ; ST(0) = x * log2(e) */
+                b = BUF(cg); b[0]=0xDE; b[1]=0xC9; EMIT(cg, 2);
+                /* fld st(0)          ; ST(0) = ST(1) = x*log2e */
+                b = BUF(cg); b[0]=0xD9; b[1]=0xC0; EMIT(cg, 2);
+                /* frndint            ; ST(0) = n = round(x*log2e), ST(1) = x*log2e */
+                b = BUF(cg); b[0]=0xD9; b[1]=0xFC; EMIT(cg, 2);
+                /* fsub st(1), st(0)  ; ST(1) = x*log2e - n = f, ST(0) = n */
+                b = BUF(cg); b[0]=0xDC; b[1]=0xE9; EMIT(cg, 2);
+                /* fxch               ; ST(0) = f, ST(1) = n */
+                b = BUF(cg); b[0]=0xD9; b[1]=0xC9; EMIT(cg, 2);
+                /* f2xm1              ; ST(0) = 2^f - 1 */
+                b = BUF(cg); b[0]=0xD9; b[1]=0xF0; EMIT(cg, 2);
+                /* fld1               ; ST(0) = 1, ST(1) = 2^f-1, ST(2) = n */
+                b = BUF(cg); b[0]=0xD9; b[1]=0xE8; EMIT(cg, 2);
+                /* faddp              ; ST(0) = 2^f, ST(1) = n */
+                b = BUF(cg); b[0]=0xDE; b[1]=0xC1; EMIT(cg, 2);
+                /* fscale             ; ST(0) = 2^f * 2^n = exp(x), ST(1) = n */
+                b = BUF(cg); b[0]=0xD9; b[1]=0xFD; EMIT(cg, 2);
+                /* fstp qword [rsp]   ; store result, pop */
+                b = BUF(cg); b[0]=0xDD; b[1]=0x1C; b[2]=0x24; EMIT(cg, 3);
+                /* fstp st(0)         ; pop remaining n */
+                b = BUF(cg); b[0]=0xDD; b[1]=0xD8; EMIT(cg, 2);
+                /* mov rax, [rsp] */
+                b = BUF(cg); b[0]=0x48; b[1]=0x8B; b[2]=0x04; b[3]=0x24; EMIT(cg, 4);
+                b = BUF(cg); b[0]=0x48; b[1]=0x83; b[2]=0xC4; b[3]=16; EMIT(cg, 4); /* add rsp,16 */
+            } else {
+                /* SSE2 minimax exp(x):
+                 * 1. k = round(x * log2e)
+                 * 2. r = x - k * ln2
+                 * 3. exp(r) = 1 + r + r^2 * (P1 + r*(P2 + r*(P3 + r*(P4 + r*P5))))
+                 * 4. result = exp(r) * 2^k  via IEEE 754 bit construction */
+
+                /* movq xmm0, rax  — load x */
+                b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xC0; EMIT(cg, 5);
+
+                /* === Step 1: k = round(x * log2e) === */
+                /* xmm1 = x * log2e */
+                /* movapd xmm1, xmm0 */
+                b = BUF(cg); b[0]=0x66; b[1]=0x0F; b[2]=0x28; b[3]=0xC8; EMIT(cg, 4);
+                /* load log2e into xmm2 */
+                pn = emit_mov_reg_imm64(BUF(cg), REG_RCX, 0x3FF71547652B82FEULL); EMIT(cg, pn);
+                b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xD1; EMIT(cg, 5); /* movq xmm2, rcx */
+                /* mulsd xmm1, xmm2 */
+                b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x59; b[3]=0xCA; EMIT(cg, 4);
+                /* roundsd xmm1, xmm1, 0 (round to nearest) — SSE4.1 */
+                /* Use roundsd: 66 0F 3A 0B C9 00 */
+                b = BUF(cg); b[0]=0x66; b[1]=0x0F; b[2]=0x3A; b[3]=0x0B; b[4]=0xC9; b[5]=0x00; EMIT(cg, 6);
+                /* xmm1 = k (as double) */
+
+                /* === Step 2: r = x - k * ln2 === */
+                /* xmm2 = k * ln2 */
+                /* movapd xmm2, xmm1 */
+                b = BUF(cg); b[0]=0x66; b[1]=0x0F; b[2]=0x28; b[3]=0xD1; EMIT(cg, 4);
+                /* load ln2 into xmm3 */
+                pn = emit_mov_reg_imm64(BUF(cg), REG_RCX, 0x3FE62E42FEFA39EFULL); EMIT(cg, pn);
+                b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xD9; EMIT(cg, 5); /* movq xmm3, rcx */
+                /* mulsd xmm2, xmm3 */
+                b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x59; b[3]=0xD3; EMIT(cg, 4);
+                /* xmm0 = x - k*ln2 = r */
+                /* subsd xmm0, xmm2 */
+                b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x5C; b[3]=0xC2; EMIT(cg, 4);
+                /* xmm0 = r, xmm1 = k */
+
+                /* === Step 3: Horner evaluation of Taylor series ===
+                 * exp(r) = 1 + r*(1 + r*(1/2 + r*(1/6 + r*(1/24 + r*(1/120
+                 *   + r*(1/720 + r*(1/5040 + r*(1/40320 + r/362880))))))))
+                 * Evaluate innermost-first: xmm2 accumulates the polynomial */
+
+                /* Load C8 = 1/362880 into xmm2 */
+                pn = emit_mov_reg_imm64(BUF(cg), REG_RCX, 0x3EC71DE3A556C734ULL); EMIT(cg, pn);
+                b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xD1; EMIT(cg, 5); /* movq xmm2, rcx */
+
+                /* xmm2 = C7 + r*xmm2  (C7 = 1/40320) */
+                b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x59; b[3]=0xD0; EMIT(cg, 4); /* mulsd xmm2, xmm0 */
+                pn = emit_mov_reg_imm64(BUF(cg), REG_RCX, 0x3EFA01A01A01A01AULL); EMIT(cg, pn);
+                b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xD9; EMIT(cg, 5); /* movq xmm3, rcx */
+                b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x58; b[3]=0xD3; EMIT(cg, 4); /* addsd xmm2, xmm3 */
+
+                /* xmm2 = C6 + r*xmm2  (C6 = 1/5040) */
+                b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x59; b[3]=0xD0; EMIT(cg, 4);
+                pn = emit_mov_reg_imm64(BUF(cg), REG_RCX, 0x3F2A01A01A01A01AULL); EMIT(cg, pn);
+                b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xD9; EMIT(cg, 5);
+                b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x58; b[3]=0xD3; EMIT(cg, 4);
+
+                /* xmm2 = C5 + r*xmm2  (C5 = 1/720) */
+                b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x59; b[3]=0xD0; EMIT(cg, 4);
+                pn = emit_mov_reg_imm64(BUF(cg), REG_RCX, 0x3F56C16C16C16C17ULL); EMIT(cg, pn);
+                b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xD9; EMIT(cg, 5);
+                b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x58; b[3]=0xD3; EMIT(cg, 4);
+
+                /* xmm2 = C4 + r*xmm2  (C4 = 1/120) */
+                b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x59; b[3]=0xD0; EMIT(cg, 4);
+                pn = emit_mov_reg_imm64(BUF(cg), REG_RCX, 0x3F81111111111111ULL); EMIT(cg, pn);
+                b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xD9; EMIT(cg, 5);
+                b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x58; b[3]=0xD3; EMIT(cg, 4);
+
+                /* xmm2 = C3 + r*xmm2  (C3 = 1/24) */
+                b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x59; b[3]=0xD0; EMIT(cg, 4);
+                pn = emit_mov_reg_imm64(BUF(cg), REG_RCX, 0x3FA5555555555555ULL); EMIT(cg, pn);
+                b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xD9; EMIT(cg, 5);
+                b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x58; b[3]=0xD3; EMIT(cg, 4);
+
+                /* xmm2 = C2 + r*xmm2  (C2 = 1/6) */
+                b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x59; b[3]=0xD0; EMIT(cg, 4);
+                pn = emit_mov_reg_imm64(BUF(cg), REG_RCX, 0x3FC5555555555555ULL); EMIT(cg, pn);
+                b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xD9; EMIT(cg, 5);
+                b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x58; b[3]=0xD3; EMIT(cg, 4);
+
+                /* xmm2 = C1 + r*xmm2  (C1 = 1/2) */
+                b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x59; b[3]=0xD0; EMIT(cg, 4);
+                pn = emit_mov_reg_imm64(BUF(cg), REG_RCX, 0x3FE0000000000000ULL); EMIT(cg, pn);
+                b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xD9; EMIT(cg, 5);
+                b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x58; b[3]=0xD3; EMIT(cg, 4);
+
+                /* xmm2 = C0 + r*xmm2  (C0 = 1.0) */
+                b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x59; b[3]=0xD0; EMIT(cg, 4);
+                pn = emit_mov_reg_imm64(BUF(cg), REG_RCX, 0x3FF0000000000000ULL); EMIT(cg, pn);
+                b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xD9; EMIT(cg, 5);
+                b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x58; b[3]=0xD3; EMIT(cg, 4);
+
+                /* Final: exp(r) = 1 + r*xmm2 */
+                b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x59; b[3]=0xD0; EMIT(cg, 4); /* mulsd xmm2, xmm0 (r) */
+                pn = emit_mov_reg_imm64(BUF(cg), REG_RCX, 0x3FF0000000000000ULL); EMIT(cg, pn); /* 1.0 */
+                b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xD9; EMIT(cg, 5);
+                b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x58; b[3]=0xD3; EMIT(cg, 4); /* addsd xmm2, xmm3 */
+                /* xmm2 = exp(r) */
+
+                /* === Step 4: result = exp(r) * 2^k === */
+                /* Convert k (double in xmm1) to integer in rax */
+                /* cvttsd2si rax, xmm1 — F2 REX.W 0F 2C C1 */
+                b = BUF(cg); b[0]=0xF2; b[1]=0x48; b[2]=0x0F; b[3]=0x2C; b[4]=0xC1; EMIT(cg, 5);
+                /* rax = k as int64. Construct 2^k: (k+1023) << 52 */
+                /* add rax, 1023 */
+                b = BUF(cg); b[0]=0x48; b[1]=0x05; EMIT(cg, 2);
+                b = BUF(cg); b[0]=0xFF; b[1]=0x03; b[2]=0x00; b[3]=0x00; EMIT(cg, 4); /* imm32 = 1023 */
+                /* shl rax, 52 — REX.W C1 E0 34 */
+                b = BUF(cg); b[0]=0x48; b[1]=0xC1; b[2]=0xE0; b[3]=52; EMIT(cg, 4);
+                /* movq xmm3, rax */
+                b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xD8; EMIT(cg, 5);
+                /* mulsd xmm2, xmm3 — exp(r) * 2^k */
+                b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x59; b[3]=0xD3; EMIT(cg, 4);
+
+                /* movq rax, xmm2 — result back to RAX */
+                b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x7E; b[4]=0xD0; EMIT(cg, 5);
+            }
             return 1;
         }
         if (strcmp(name, "math_log") == 0 && argc == 1) {
-            /* ln(x) via x87 FPU — IEEE 754 full precision.
-             * Algorithm: ln(x) = log2(x) * ln(2)
-             *   FYL2X computes ST(1) * log2(ST(0)) */
             emit_expression(cg, node->children[1]); /* x → RAX */
             int pn; uint8_t *b;
-            b = BUF(cg); b[0]=0x48; b[1]=0x83; b[2]=0xEC; b[3]=16; EMIT(cg, 4); /* sub rsp, 16 */
-            b = BUF(cg); b[0]=0x48; b[1]=0x89; b[2]=0x04; b[3]=0x24; EMIT(cg, 4); /* mov [rsp], rax */
-            /* fldln2 — push ln(2) to ST(0) */
-            b = BUF(cg); b[0]=0xD9; b[1]=0xED; EMIT(cg, 2);
-            /* fld qword [rsp] — push x to ST(0), ln(2) moves to ST(1) */
-            b = BUF(cg); b[0]=0xDD; b[1]=0x04; b[2]=0x24; EMIT(cg, 3);
-            /* fyl2x — ST(1) = ST(1) * log2(ST(0)) = ln(2) * log2(x) = ln(x), pop */
-            b = BUF(cg); b[0]=0xD9; b[1]=0xF1; EMIT(cg, 2);
-            /* fstp qword [rsp] — store result */
-            b = BUF(cg); b[0]=0xDD; b[1]=0x1C; b[2]=0x24; EMIT(cg, 3);
-            /* mov rax, [rsp] */
-            b = BUF(cg); b[0]=0x48; b[1]=0x8B; b[2]=0x04; b[3]=0x24; EMIT(cg, 4);
-            b = BUF(cg); b[0]=0x48; b[1]=0x83; b[2]=0xC4; b[3]=16; EMIT(cg, 4); /* add rsp, 16 */
+            if (cg->precision == 15) {
+                /* ln(x) via x87 FPU — IEEE 754 full precision.
+                 * Algorithm: ln(x) = log2(x) * ln(2)
+                 *   FYL2X computes ST(1) * log2(ST(0)) */
+                b = BUF(cg); b[0]=0x48; b[1]=0x83; b[2]=0xEC; b[3]=16; EMIT(cg, 4); /* sub rsp, 16 */
+                b = BUF(cg); b[0]=0x48; b[1]=0x89; b[2]=0x04; b[3]=0x24; EMIT(cg, 4); /* mov [rsp], rax */
+                /* fldln2 — push ln(2) to ST(0) */
+                b = BUF(cg); b[0]=0xD9; b[1]=0xED; EMIT(cg, 2);
+                /* fld qword [rsp] — push x to ST(0), ln(2) moves to ST(1) */
+                b = BUF(cg); b[0]=0xDD; b[1]=0x04; b[2]=0x24; EMIT(cg, 3);
+                /* fyl2x — ST(1) = ST(1) * log2(ST(0)) = ln(2) * log2(x) = ln(x), pop */
+                b = BUF(cg); b[0]=0xD9; b[1]=0xF1; EMIT(cg, 2);
+                /* fstp qword [rsp] — store result */
+                b = BUF(cg); b[0]=0xDD; b[1]=0x1C; b[2]=0x24; EMIT(cg, 3);
+                /* mov rax, [rsp] */
+                b = BUF(cg); b[0]=0x48; b[1]=0x8B; b[2]=0x04; b[3]=0x24; EMIT(cg, 4);
+                b = BUF(cg); b[0]=0x48; b[1]=0x83; b[2]=0xC4; b[3]=16; EMIT(cg, 4); /* add rsp, 16 */
+            } else {
+                /* SSE2 log(x) using atanh-based series:
+                 * 1. Extract: x = 2^k * m, where 1 <= m < 2
+                 * 2. f = m - 1, s = f/(2+f)
+                 * 3. log(1+f) = 2*s + 2*s^3*(1/3 + s^2*(1/5 + s^2*(1/7 + ...)))
+                 * 4. result = k * ln2 + log(1+f) */
+
+                /* movq xmm0, rax  — load x bits (also keep in rax) */
+                b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xC0; EMIT(cg, 5);
+
+                /* === Step 1: Extract k and m from IEEE 754 bits === */
+                /* mov rcx, rax */
+                b = BUF(cg); b[0]=0x48; b[1]=0x89; b[2]=0xC1; EMIT(cg, 3);
+                /* shr rcx, 52 */
+                b = BUF(cg); b[0]=0x48; b[1]=0xC1; b[2]=0xE9; b[3]=52; EMIT(cg, 4);
+                /* sub rcx, 1023 — rcx = k */
+                b = BUF(cg); b[0]=0x48; b[1]=0x81; b[2]=0xE9; EMIT(cg, 3);
+                b = BUF(cg); b[0]=0xFF; b[1]=0x03; b[2]=0x00; b[3]=0x00; EMIT(cg, 4);
+
+                /* Construct m: clear exponent, set to 2^0 */
+                pn = emit_mov_reg_imm64(BUF(cg), REG_RDX, 0x000FFFFFFFFFFFFFULL); EMIT(cg, pn);
+                b = BUF(cg); b[0]=0x48; b[1]=0x21; b[2]=0xD0; EMIT(cg, 3); /* and rax, rdx */
+                pn = emit_mov_reg_imm64(BUF(cg), REG_RDX, 0x3FF0000000000000ULL); EMIT(cg, pn);
+                b = BUF(cg); b[0]=0x48; b[1]=0x09; b[2]=0xD0; EMIT(cg, 3); /* or rax, rdx */
+                /* movq xmm1, rax — xmm1 = m */
+                b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xC8; EMIT(cg, 5);
+
+                /* === Step 2: f = m - 1, s = f/(2+f) === */
+                pn = emit_mov_reg_imm64(BUF(cg), REG_RDX, 0x3FF0000000000000ULL); EMIT(cg, pn); /* 1.0 */
+                b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xD2; EMIT(cg, 5); /* movq xmm2, rdx */
+                /* xmm1 = f = m - 1 */
+                b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x5C; b[3]=0xCA; EMIT(cg, 4); /* subsd xmm1, xmm2 */
+
+                /* xmm3 = 2 + f = m + 1 */
+                pn = emit_mov_reg_imm64(BUF(cg), REG_RDX, 0x4000000000000000ULL); EMIT(cg, pn); /* 2.0 */
+                b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xDA; EMIT(cg, 5); /* movq xmm3, rdx */
+                /* addsd xmm3, xmm1 — xmm3 = 2 + f */
+                b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x58; b[3]=0xD9; EMIT(cg, 4);
+
+                /* xmm0 = s = f / (2+f) */
+                /* movapd xmm0, xmm1 */
+                b = BUF(cg); b[0]=0x66; b[1]=0x0F; b[2]=0x28; b[3]=0xC1; EMIT(cg, 4);
+                /* divsd xmm0, xmm3 — F2 0F 5E C3 */
+                b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x5E; b[3]=0xC3; EMIT(cg, 4);
+                /* xmm0 = s */
+
+                /* Save k on stack */
+                b = BUF(cg); b[0]=0x51; EMIT(cg, 1); /* push rcx */
+
+                /* === Step 3: series log(1+f) = 2*s + 2*s^3/3 + 2*s^5/5 + ... ===
+                 * = 2*s*(1 + s^2*(1/3 + s^2*(1/5 + s^2*(1/7 + s^2*(1/9 + s^2*(1/11 + s^2/13))))))
+                 * z = s^2 */
+
+                /* xmm4 = s^2 */
+                /* movapd xmm4, xmm0 */
+                b = BUF(cg); b[0]=0x66; b[1]=0x0F; b[2]=0x28; b[3]=0xE0; EMIT(cg, 4);
+                /* mulsd xmm4, xmm4 */
+                b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x59; b[3]=0xE4; EMIT(cg, 4);
+
+                /* Horner from innermost: xmm2 = 1/13 */
+                pn = emit_mov_reg_imm64(BUF(cg), REG_RCX, 0x3FB3B13B13B13B14ULL); EMIT(cg, pn); /* 1/13 */
+                b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xD1; EMIT(cg, 5); /* movq xmm2, rcx */
+
+                /* xmm2 = 1/11 + z*(1/13) */
+                b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x59; b[3]=0xD4; EMIT(cg, 4); /* mulsd xmm2, xmm4 (z) */
+                pn = emit_mov_reg_imm64(BUF(cg), REG_RCX, 0x3FB745D1745D1746ULL); EMIT(cg, pn); /* 1/11 */
+                b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xD9; EMIT(cg, 5);
+                b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x58; b[3]=0xD3; EMIT(cg, 4); /* addsd xmm2, xmm3 */
+
+                /* xmm2 = 1/9 + z*(...) */
+                b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x59; b[3]=0xD4; EMIT(cg, 4);
+                pn = emit_mov_reg_imm64(BUF(cg), REG_RCX, 0x3FBC71C71C71C71CULL); EMIT(cg, pn); /* 1/9 */
+                b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xD9; EMIT(cg, 5);
+                b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x58; b[3]=0xD3; EMIT(cg, 4);
+
+                /* xmm2 = 1/7 + z*(...) */
+                b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x59; b[3]=0xD4; EMIT(cg, 4);
+                pn = emit_mov_reg_imm64(BUF(cg), REG_RCX, 0x3FC2492492492492ULL); EMIT(cg, pn); /* 1/7 */
+                b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xD9; EMIT(cg, 5);
+                b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x58; b[3]=0xD3; EMIT(cg, 4);
+
+                /* xmm2 = 1/5 + z*(...) */
+                b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x59; b[3]=0xD4; EMIT(cg, 4);
+                pn = emit_mov_reg_imm64(BUF(cg), REG_RCX, 0x3FC999999999999AULL); EMIT(cg, pn); /* 1/5 */
+                b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xD9; EMIT(cg, 5);
+                b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x58; b[3]=0xD3; EMIT(cg, 4);
+
+                /* xmm2 = 1/3 + z*(...) */
+                b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x59; b[3]=0xD4; EMIT(cg, 4);
+                pn = emit_mov_reg_imm64(BUF(cg), REG_RCX, 0x3FD5555555555555ULL); EMIT(cg, pn); /* 1/3 */
+                b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xD9; EMIT(cg, 5);
+                b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x58; b[3]=0xD3; EMIT(cg, 4);
+
+                /* xmm2 = 1 + z*(...) */
+                b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x59; b[3]=0xD4; EMIT(cg, 4);
+                pn = emit_mov_reg_imm64(BUF(cg), REG_RCX, 0x3FF0000000000000ULL); EMIT(cg, pn); /* 1.0 */
+                b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xD9; EMIT(cg, 5);
+                b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x58; b[3]=0xD3; EMIT(cg, 4);
+
+                /* xmm0 = 2*s * xmm2 = log(1+f) */
+                /* mulsd xmm2, xmm0 — xmm2 *= s */
+                b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x59; b[3]=0xD0; EMIT(cg, 4);
+                /* xmm2 *= 2 — addsd xmm2, xmm2 */
+                b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x58; b[3]=0xD2; EMIT(cg, 4);
+                /* xmm0 = xmm2 (log(1+f)) */
+                /* movapd xmm0, xmm2 */
+                b = BUF(cg); b[0]=0x66; b[1]=0x0F; b[2]=0x28; b[3]=0xC2; EMIT(cg, 4);
+
+                /* === Step 4: result = k * ln2 + log(1+f) === */
+                b = BUF(cg); b[0]=0x59; EMIT(cg, 1); /* pop rcx — k */
+                /* cvtsi2sd xmm3, rcx */
+                b = BUF(cg); b[0]=0xF2; b[1]=0x48; b[2]=0x0F; b[3]=0x2A; b[4]=0xD9; EMIT(cg, 5);
+                /* load ln2 */
+                pn = emit_mov_reg_imm64(BUF(cg), REG_RCX, 0x3FE62E42FEFA39EFULL); EMIT(cg, pn);
+                b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xE1; EMIT(cg, 5); /* movq xmm4, rcx */
+                /* mulsd xmm3, xmm4 — k * ln2 */
+                b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x59; b[3]=0xDC; EMIT(cg, 4);
+                /* addsd xmm0, xmm3 */
+                b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x58; b[3]=0xC3; EMIT(cg, 4);
+
+                /* movq rax, xmm0 */
+                b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x7E; b[4]=0xC0; EMIT(cg, 5);
+            }
             return 1;
         }
         if (strcmp(name, "math_sin") == 0 && argc == 1) {

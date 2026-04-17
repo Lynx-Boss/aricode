@@ -1467,96 +1467,89 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             return 1;
         }
         if (strcmp(name, "math_exp") == 0 && argc == 1) {
-            /* exp(x) ≈ (1 + x/N)^N via repeated squaring.
-             * Precision-aware: N = 2^squarings.
-             *   --precision=6:  6 squarings, N=64   (~4 digits, fastest)
-             *   --precision=8:  8 squarings, N=256  (~6 digits, default)
-             *   --precision=15: 12 squarings, N=4096 (~12 digits, strictest)
-             */
-            int squarings = 8; /* default */
-            int divisor = 256;
-            if (cg->precision == 6)       { squarings = 6;  divisor = 64; }
-            else if (cg->precision == 15) { squarings = 12; divisor = 4096; }
-
-            emit_expression(cg, node->children[1]);
+            /* exp(x) via x87 FPU — IEEE 754 full precision.
+             * Algorithm: exp(x) = 2^(x * log2(e))
+             * Uses: FLDL2E, FMUL, FRNDINT, F2XM1, FSCALE */
+            emit_expression(cg, node->children[1]); /* x → RAX */
             int pn; uint8_t *b;
-            b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xC0; EMIT(cg, 5);
-            pn = emit_mov_reg_imm32(BUF(cg), REG_RCX, divisor); EMIT(cg, pn);
-            pn = emit_cvtsi2sd(BUF(cg), 1, REG_RCX); EMIT(cg, pn);
-            pn = emit_divsd(BUF(cg), 0, 1); EMIT(cg, pn);
-            uint64_t one_bits = 0x3FF0000000000000ULL;
-            pn = emit_mov_reg_imm64(BUF(cg), REG_RCX, one_bits); EMIT(cg, pn);
-            b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xC9; EMIT(cg, 5);
-            pn = emit_addsd(BUF(cg), 0, 1); EMIT(cg, pn);
-            for (int sq = 0; sq < squarings; sq++) {
-                pn = emit_mulsd(BUF(cg), 0, 0); EMIT(cg, pn);
-            }
-            b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x7E; b[4]=0xC0; EMIT(cg, 5);
+            b = BUF(cg); b[0]=0x48; b[1]=0x83; b[2]=0xEC; b[3]=16; EMIT(cg, 4); /* sub rsp,16 */
+            b = BUF(cg); b[0]=0x48; b[1]=0x89; b[2]=0x04; b[3]=0x24; EMIT(cg, 4); /* mov [rsp],rax */
+            /* fld [rsp]          ; ST(0) = x */
+            b = BUF(cg); b[0]=0xDD; b[1]=0x04; b[2]=0x24; EMIT(cg, 3);
+            /* fldl2e             ; ST(0) = log2(e), ST(1) = x */
+            b = BUF(cg); b[0]=0xD9; b[1]=0xEA; EMIT(cg, 2);
+            /* fmulp              ; ST(0) = x * log2(e) */
+            b = BUF(cg); b[0]=0xDE; b[1]=0xC9; EMIT(cg, 2);
+            /* fld st(0)          ; ST(0) = ST(1) = x*log2e */
+            b = BUF(cg); b[0]=0xD9; b[1]=0xC0; EMIT(cg, 2);
+            /* frndint            ; ST(0) = n = round(x*log2e), ST(1) = x*log2e */
+            b = BUF(cg); b[0]=0xD9; b[1]=0xFC; EMIT(cg, 2);
+            /* fsub st(1), st(0)  ; ST(1) = x*log2e - n = f, ST(0) = n */
+            b = BUF(cg); b[0]=0xDC; b[1]=0xE9; EMIT(cg, 2);
+            /* fxch               ; ST(0) = f, ST(1) = n */
+            b = BUF(cg); b[0]=0xD9; b[1]=0xC9; EMIT(cg, 2);
+            /* f2xm1              ; ST(0) = 2^f - 1 */
+            b = BUF(cg); b[0]=0xD9; b[1]=0xF0; EMIT(cg, 2);
+            /* fld1               ; ST(0) = 1, ST(1) = 2^f-1, ST(2) = n */
+            b = BUF(cg); b[0]=0xD9; b[1]=0xE8; EMIT(cg, 2);
+            /* faddp              ; ST(0) = 2^f, ST(1) = n */
+            b = BUF(cg); b[0]=0xDE; b[1]=0xC1; EMIT(cg, 2);
+            /* fscale             ; ST(0) = 2^f * 2^n = exp(x), ST(1) = n */
+            b = BUF(cg); b[0]=0xD9; b[1]=0xFD; EMIT(cg, 2);
+            /* fstp qword [rsp]   ; store result, pop */
+            b = BUF(cg); b[0]=0xDD; b[1]=0x1C; b[2]=0x24; EMIT(cg, 3);
+            /* fstp st(0)         ; pop remaining n */
+            b = BUF(cg); b[0]=0xDD; b[1]=0xD8; EMIT(cg, 2);
+            /* mov rax, [rsp] */
+            b = BUF(cg); b[0]=0x48; b[1]=0x8B; b[2]=0x04; b[3]=0x24; EMIT(cg, 4);
+            b = BUF(cg); b[0]=0x48; b[1]=0x83; b[2]=0xC4; b[3]=16; EMIT(cg, 4); /* add rsp,16 */
             return 1;
         }
         if (strcmp(name, "math_log") == 0 && argc == 1) {
-            /* ln(x) = 2 * atanh((x-1)/(x+1))
-             * atanh(y) = y + y^3/3 + y^5/5 + y^7/7 + ...
-             * Precision-aware: number of terms controlled by --precision.
-             *   --precision=6:  3 terms (y, y^3/3, y^5/5)           ~4 digits
-             *   --precision=8:  5 terms (+y^7/7, y^9/9)             ~8 digits
-             *   --precision=15: 8 terms (+y^11/11..y^15/15)         ~14 digits
-             */
-            int terms = 3; /* default (precision=8 uses 5) */
-            if (cg->precision == 6) terms = 3;
-            else if (cg->precision == 8) terms = 5;
-            else if (cg->precision == 15) terms = 8;
-
-            /* Odd denominators for atanh series: 1, 3, 5, 7, 9, 11, 13, 15 */
-            static const uint64_t denom_bits[8] = {
-                0x3FF0000000000000ULL, /* 1.0 */
-                0x4008000000000000ULL, /* 3.0 */
-                0x4014000000000000ULL, /* 5.0 */
-                0x401C000000000000ULL, /* 7.0 */
-                0x4022000000000000ULL, /* 9.0 */
-                0x4026000000000000ULL, /* 11.0 */
-                0x402A000000000000ULL, /* 13.0 */
-                0x402E000000000000ULL, /* 15.0 */
-            };
-
+            /* ln(x) via x87 FPU — IEEE 754 full precision.
+             * Algorithm: ln(x) = log2(x) * ln(2)
+             *   FYL2X computes ST(1) * log2(ST(0)) */
+            emit_expression(cg, node->children[1]); /* x → RAX */
+            int pn; uint8_t *b;
+            b = BUF(cg); b[0]=0x48; b[1]=0x83; b[2]=0xEC; b[3]=16; EMIT(cg, 4); /* sub rsp, 16 */
+            b = BUF(cg); b[0]=0x48; b[1]=0x89; b[2]=0x04; b[3]=0x24; EMIT(cg, 4); /* mov [rsp], rax */
+            /* fldln2 — push ln(2) to ST(0) */
+            b = BUF(cg); b[0]=0xD9; b[1]=0xED; EMIT(cg, 2);
+            /* fld qword [rsp] — push x to ST(0), ln(2) moves to ST(1) */
+            b = BUF(cg); b[0]=0xDD; b[1]=0x04; b[2]=0x24; EMIT(cg, 3);
+            /* fyl2x — ST(1) = ST(1) * log2(ST(0)) = ln(2) * log2(x) = ln(x), pop */
+            b = BUF(cg); b[0]=0xD9; b[1]=0xF1; EMIT(cg, 2);
+            /* fstp qword [rsp] — store result */
+            b = BUF(cg); b[0]=0xDD; b[1]=0x1C; b[2]=0x24; EMIT(cg, 3);
+            /* mov rax, [rsp] */
+            b = BUF(cg); b[0]=0x48; b[1]=0x8B; b[2]=0x04; b[3]=0x24; EMIT(cg, 4);
+            b = BUF(cg); b[0]=0x48; b[1]=0x83; b[2]=0xC4; b[3]=16; EMIT(cg, 4); /* add rsp, 16 */
+            return 1;
+        }
+        if (strcmp(name, "math_sin") == 0 && argc == 1) {
+            /* sin(x) via x87 FSIN — IEEE 754 full precision */
             emit_expression(cg, node->children[1]);
             int pn; uint8_t *b;
-            /* movq xmm0, rax (x) */
-            b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xC0; EMIT(cg, 5);
-            /* xmm1 = 1.0 */
-            pn = emit_mov_reg_imm64(BUF(cg), REG_RCX, 0x3FF0000000000000ULL); EMIT(cg, pn);
-            b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xC9; EMIT(cg, 5);
-            /* xmm2 = x-1, xmm3 = x+1 */
-            pn = emit_movsd_xmm_xmm(BUF(cg), 2, 0); EMIT(cg, pn);
-            pn = emit_subsd(BUF(cg), 2, 1); EMIT(cg, pn);
-            pn = emit_movsd_xmm_xmm(BUF(cg), 3, 0); EMIT(cg, pn);
-            pn = emit_addsd(BUF(cg), 3, 1); EMIT(cg, pn);
-            /* xmm0 = y = (x-1)/(x+1) */
-            pn = emit_movsd_xmm_xmm(BUF(cg), 0, 2); EMIT(cg, pn);
-            pn = emit_divsd(BUF(cg), 0, 3); EMIT(cg, pn);
-            /* xmm4 = y^2 */
-            pn = emit_movsd_xmm_xmm(BUF(cg), 4, 0); EMIT(cg, pn);
-            pn = emit_mulsd(BUF(cg), 4, 0); EMIT(cg, pn);
-            /* xmm5 = sum = y (first term, denominator 1) */
-            pn = emit_movsd_xmm_xmm(BUF(cg), 5, 0); EMIT(cg, pn);
-            /* Emit remaining terms: y^(2k+1) / (2k+1) */
-            for (int t = 1; t < terms; t++) {
-                /* xmm0 = xmm0 * y^2 (advance power) */
-                pn = emit_mulsd(BUF(cg), 0, 4); EMIT(cg, pn);
-                /* xmm6 = denominator */
-                pn = emit_mov_reg_imm64(BUF(cg), REG_RCX, denom_bits[t]); EMIT(cg, pn);
-                b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xF1; EMIT(cg, 5);
-                /* xmm7 = term / denom */
-                pn = emit_movsd_xmm_xmm(BUF(cg), 7, 0); EMIT(cg, pn);
-                pn = emit_divsd(BUF(cg), 7, 6); EMIT(cg, pn);
-                /* sum += term/denom */
-                pn = emit_addsd(BUF(cg), 5, 7); EMIT(cg, pn);
-            }
-            /* result = 2 * sum */
-            pn = emit_mov_reg_imm64(BUF(cg), REG_RCX, 0x4000000000000000ULL); EMIT(cg, pn);
-            b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xC1; EMIT(cg, 5);
-            pn = emit_mulsd(BUF(cg), 0, 5); EMIT(cg, pn);
-            b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x7E; b[4]=0xC0; EMIT(cg, 5);
+            b = BUF(cg); b[0]=0x48; b[1]=0x83; b[2]=0xEC; b[3]=16; EMIT(cg, 4);
+            b = BUF(cg); b[0]=0x48; b[1]=0x89; b[2]=0x04; b[3]=0x24; EMIT(cg, 4);
+            b = BUF(cg); b[0]=0xDD; b[1]=0x04; b[2]=0x24; EMIT(cg, 3); /* fld [rsp] */
+            b = BUF(cg); b[0]=0xD9; b[1]=0xFE; EMIT(cg, 2); /* fsin */
+            b = BUF(cg); b[0]=0xDD; b[1]=0x1C; b[2]=0x24; EMIT(cg, 3); /* fstp [rsp] */
+            b = BUF(cg); b[0]=0x48; b[1]=0x8B; b[2]=0x04; b[3]=0x24; EMIT(cg, 4);
+            b = BUF(cg); b[0]=0x48; b[1]=0x83; b[2]=0xC4; b[3]=16; EMIT(cg, 4);
+            return 1;
+        }
+        if (strcmp(name, "math_cos") == 0 && argc == 1) {
+            /* cos(x) via x87 FCOS — IEEE 754 full precision */
+            emit_expression(cg, node->children[1]);
+            int pn; uint8_t *b;
+            b = BUF(cg); b[0]=0x48; b[1]=0x83; b[2]=0xEC; b[3]=16; EMIT(cg, 4);
+            b = BUF(cg); b[0]=0x48; b[1]=0x89; b[2]=0x04; b[3]=0x24; EMIT(cg, 4);
+            b = BUF(cg); b[0]=0xDD; b[1]=0x04; b[2]=0x24; EMIT(cg, 3); /* fld [rsp] */
+            b = BUF(cg); b[0]=0xD9; b[1]=0xFF; EMIT(cg, 2); /* fcos */
+            b = BUF(cg); b[0]=0xDD; b[1]=0x1C; b[2]=0x24; EMIT(cg, 3); /* fstp [rsp] */
+            b = BUF(cg); b[0]=0x48; b[1]=0x8B; b[2]=0x04; b[3]=0x24; EMIT(cg, 4);
+            b = BUF(cg); b[0]=0x48; b[1]=0x83; b[2]=0xC4; b[3]=16; EMIT(cg, 4);
             return 1;
         }
         if (strcmp(name, "math_abs") == 0 && argc == 1) {

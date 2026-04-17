@@ -1545,29 +1545,148 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             return 1;
         }
         if (strcmp(name, "math_sin") == 0 && argc == 1) {
-            /* sin(x) via x87 FSIN — IEEE 754 full precision */
             emit_expression(cg, node->children[1]);
             int pn; uint8_t *b;
-            b = BUF(cg); b[0]=0x48; b[1]=0x83; b[2]=0xEC; b[3]=16; EMIT(cg, 4);
-            b = BUF(cg); b[0]=0x48; b[1]=0x89; b[2]=0x04; b[3]=0x24; EMIT(cg, 4);
-            b = BUF(cg); b[0]=0xDD; b[1]=0x04; b[2]=0x24; EMIT(cg, 3); /* fld [rsp] */
-            b = BUF(cg); b[0]=0xD9; b[1]=0xFE; EMIT(cg, 2); /* fsin */
-            b = BUF(cg); b[0]=0xDD; b[1]=0x1C; b[2]=0x24; EMIT(cg, 3); /* fstp [rsp] */
-            b = BUF(cg); b[0]=0x48; b[1]=0x8B; b[2]=0x04; b[3]=0x24; EMIT(cg, 4);
-            b = BUF(cg); b[0]=0x48; b[1]=0x83; b[2]=0xC4; b[3]=16; EMIT(cg, 4);
+            if (cg->precision == 15) {
+                /* sin(x) via x87 FSIN — IEEE 754 full precision */
+                b = BUF(cg); b[0]=0x48; b[1]=0x83; b[2]=0xEC; b[3]=16; EMIT(cg, 4);
+                b = BUF(cg); b[0]=0x48; b[1]=0x89; b[2]=0x04; b[3]=0x24; EMIT(cg, 4);
+                b = BUF(cg); b[0]=0xDD; b[1]=0x04; b[2]=0x24; EMIT(cg, 3); /* fld [rsp] */
+                b = BUF(cg); b[0]=0xD9; b[1]=0xFE; EMIT(cg, 2); /* fsin */
+                b = BUF(cg); b[0]=0xDD; b[1]=0x1C; b[2]=0x24; EMIT(cg, 3); /* fstp [rsp] */
+                b = BUF(cg); b[0]=0x48; b[1]=0x8B; b[2]=0x04; b[3]=0x24; EMIT(cg, 4);
+                b = BUF(cg); b[0]=0x48; b[1]=0x83; b[2]=0xC4; b[3]=16; EMIT(cg, 4);
+            } else {
+                /* SSE2 minimax polynomial: sin(x) for |x| <= pi/4
+                 * sin(x) = x + x^3*(S1 + x^2*(S2 + x^2*(S3 + x^2*(S4 + x^2*S5))))
+                 * Horner evaluation from inside out. */
+
+                /* movq xmm0, rax  — load x into xmm0 */
+                b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xC0; EMIT(cg, 5);
+
+                /* xmm1 = x*x (x squared) */
+                /* movapd xmm1, xmm0 */
+                b = BUF(cg); b[0]=0x66; b[1]=0x0F; b[2]=0x28; b[3]=0xC8; EMIT(cg, 4);
+                /* mulsd xmm1, xmm1 */
+                b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x59; b[3]=0xC9; EMIT(cg, 4);
+
+                /* Load S5 into xmm2 (innermost coefficient) */
+                pn = emit_mov_reg_imm64(BUF(cg), REG_RCX, 0xBE5AE5E68A2B9CEBULL); EMIT(cg, pn);
+                b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xD1; EMIT(cg, 5); /* movq xmm2, rcx */
+
+                /* xmm2 = S4 + x^2*S5: mulsd xmm2,xmm1; load S4->xmm3; addsd xmm2,xmm3 */
+                b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x59; b[3]=0xD1; EMIT(cg, 4); /* mulsd xmm2, xmm1 */
+                pn = emit_mov_reg_imm64(BUF(cg), REG_RCX, 0x3EC71DE357B1FE7DULL); EMIT(cg, pn);
+                b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xD9; EMIT(cg, 5); /* movq xmm3, rcx */
+                b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x58; b[3]=0xD3; EMIT(cg, 4); /* addsd xmm2, xmm3 */
+
+                /* xmm2 = S3 + x^2*(S4 + x^2*S5) */
+                b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x59; b[3]=0xD1; EMIT(cg, 4); /* mulsd xmm2, xmm1 */
+                pn = emit_mov_reg_imm64(BUF(cg), REG_RCX, 0xBF2A01A019C161D5ULL); EMIT(cg, pn);
+                b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xD9; EMIT(cg, 5); /* movq xmm3, rcx */
+                b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x58; b[3]=0xD3; EMIT(cg, 4); /* addsd xmm2, xmm3 */
+
+                /* xmm2 = S2 + x^2*(...) */
+                b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x59; b[3]=0xD1; EMIT(cg, 4); /* mulsd xmm2, xmm1 */
+                pn = emit_mov_reg_imm64(BUF(cg), REG_RCX, 0x3F8111111110F8A6ULL); EMIT(cg, pn);
+                b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xD9; EMIT(cg, 5); /* movq xmm3, rcx */
+                b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x58; b[3]=0xD3; EMIT(cg, 4); /* addsd xmm2, xmm3 */
+
+                /* xmm2 = S1 + x^2*(...) */
+                b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x59; b[3]=0xD1; EMIT(cg, 4); /* mulsd xmm2, xmm1 */
+                pn = emit_mov_reg_imm64(BUF(cg), REG_RCX, 0xBFC5555555555549ULL); EMIT(cg, pn);
+                b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xD9; EMIT(cg, 5); /* movq xmm3, rcx */
+                b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x58; b[3]=0xD3; EMIT(cg, 4); /* addsd xmm2, xmm3 */
+
+                /* xmm2 now holds the polynomial tail: S1 + x^2*(S2 + ...)
+                 * We need: sin(x) = x + x^3 * xmm2
+                 * xmm3 = x^3 = x * x^2 */
+                /* movapd xmm3, xmm0 */
+                b = BUF(cg); b[0]=0x66; b[1]=0x0F; b[2]=0x28; b[3]=0xD8; EMIT(cg, 4);
+                /* mulsd xmm3, xmm1  (x * x^2 = x^3) */
+                b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x59; b[3]=0xD9; EMIT(cg, 4);
+                /* mulsd xmm3, xmm2  (x^3 * poly) */
+                b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x59; b[3]=0xDA; EMIT(cg, 4);
+                /* addsd xmm0, xmm3  (x + x^3*poly) */
+                b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x58; b[3]=0xC3; EMIT(cg, 4);
+
+                /* movq rax, xmm0 — result back to RAX */
+                b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x7E; b[4]=0xC0; EMIT(cg, 5);
+            }
             return 1;
         }
         if (strcmp(name, "math_cos") == 0 && argc == 1) {
-            /* cos(x) via x87 FCOS — IEEE 754 full precision */
             emit_expression(cg, node->children[1]);
             int pn; uint8_t *b;
-            b = BUF(cg); b[0]=0x48; b[1]=0x83; b[2]=0xEC; b[3]=16; EMIT(cg, 4);
-            b = BUF(cg); b[0]=0x48; b[1]=0x89; b[2]=0x04; b[3]=0x24; EMIT(cg, 4);
-            b = BUF(cg); b[0]=0xDD; b[1]=0x04; b[2]=0x24; EMIT(cg, 3); /* fld [rsp] */
-            b = BUF(cg); b[0]=0xD9; b[1]=0xFF; EMIT(cg, 2); /* fcos */
-            b = BUF(cg); b[0]=0xDD; b[1]=0x1C; b[2]=0x24; EMIT(cg, 3); /* fstp [rsp] */
-            b = BUF(cg); b[0]=0x48; b[1]=0x8B; b[2]=0x04; b[3]=0x24; EMIT(cg, 4);
-            b = BUF(cg); b[0]=0x48; b[1]=0x83; b[2]=0xC4; b[3]=16; EMIT(cg, 4);
+            if (cg->precision == 15) {
+                /* cos(x) via x87 FCOS — IEEE 754 full precision */
+                b = BUF(cg); b[0]=0x48; b[1]=0x83; b[2]=0xEC; b[3]=16; EMIT(cg, 4);
+                b = BUF(cg); b[0]=0x48; b[1]=0x89; b[2]=0x04; b[3]=0x24; EMIT(cg, 4);
+                b = BUF(cg); b[0]=0xDD; b[1]=0x04; b[2]=0x24; EMIT(cg, 3); /* fld [rsp] */
+                b = BUF(cg); b[0]=0xD9; b[1]=0xFF; EMIT(cg, 2); /* fcos */
+                b = BUF(cg); b[0]=0xDD; b[1]=0x1C; b[2]=0x24; EMIT(cg, 3); /* fstp [rsp] */
+                b = BUF(cg); b[0]=0x48; b[1]=0x8B; b[2]=0x04; b[3]=0x24; EMIT(cg, 4);
+                b = BUF(cg); b[0]=0x48; b[1]=0x83; b[2]=0xC4; b[3]=16; EMIT(cg, 4);
+            } else {
+                /* SSE2 minimax polynomial: cos(x) for |x| <= pi/4
+                 * cos(x) = 1 + x^2*(C1 + x^2*(C2 + x^2*(C3 + x^2*(C4 + x^2*C5))))
+                 * Horner evaluation from inside out. */
+
+                /* movq xmm0, rax  — load x into xmm0 */
+                b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xC0; EMIT(cg, 5);
+
+                /* xmm1 = x*x (x squared) */
+                /* movapd xmm1, xmm0 */
+                b = BUF(cg); b[0]=0x66; b[1]=0x0F; b[2]=0x28; b[3]=0xC8; EMIT(cg, 4);
+                /* mulsd xmm1, xmm1 */
+                b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x59; b[3]=0xC9; EMIT(cg, 4);
+
+                /* Load C5 into xmm2 (innermost coefficient) */
+                pn = emit_mov_reg_imm64(BUF(cg), REG_RCX, 0xBE927E4F809C52ADULL); EMIT(cg, pn);
+                b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xD1; EMIT(cg, 5); /* movq xmm2, rcx */
+
+                /* xmm2 = C4 + x^2*C5 */
+                b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x59; b[3]=0xD1; EMIT(cg, 4); /* mulsd xmm2, xmm1 */
+                pn = emit_mov_reg_imm64(BUF(cg), REG_RCX, 0x3EFA01A019CB1590ULL); EMIT(cg, pn);
+                b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xD9; EMIT(cg, 5); /* movq xmm3, rcx */
+                b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x58; b[3]=0xD3; EMIT(cg, 4); /* addsd xmm2, xmm3 */
+
+                /* xmm2 = C3 + x^2*(C4 + x^2*C5) */
+                b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x59; b[3]=0xD1; EMIT(cg, 4); /* mulsd xmm2, xmm1 */
+                pn = emit_mov_reg_imm64(BUF(cg), REG_RCX, 0xBF56C16C16C15177ULL); EMIT(cg, pn);
+                b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xD9; EMIT(cg, 5); /* movq xmm3, rcx */
+                b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x58; b[3]=0xD3; EMIT(cg, 4); /* addsd xmm2, xmm3 */
+
+                /* xmm2 = C2 + x^2*(...) */
+                b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x59; b[3]=0xD1; EMIT(cg, 4); /* mulsd xmm2, xmm1 */
+                pn = emit_mov_reg_imm64(BUF(cg), REG_RCX, 0x3FA555555555554CULL); EMIT(cg, pn);
+                b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xD9; EMIT(cg, 5); /* movq xmm3, rcx */
+                b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x58; b[3]=0xD3; EMIT(cg, 4); /* addsd xmm2, xmm3 */
+
+                /* xmm2 = C1 + x^2*(...) */
+                b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x59; b[3]=0xD1; EMIT(cg, 4); /* mulsd xmm2, xmm1 */
+                pn = emit_mov_reg_imm64(BUF(cg), REG_RCX, 0xBFE0000000000000ULL); EMIT(cg, pn);
+                b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xD9; EMIT(cg, 5); /* movq xmm3, rcx */
+                b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x58; b[3]=0xD3; EMIT(cg, 4); /* addsd xmm2, xmm3 */
+
+                /* xmm2 now holds C1 + x^2*(C2 + ...)
+                 * cos(x) = 1 + x^2 * xmm2
+                 * xmm3 = x^2 * poly */
+                /* movapd xmm3, xmm1 */
+                b = BUF(cg); b[0]=0x66; b[1]=0x0F; b[2]=0x28; b[3]=0xD9; EMIT(cg, 4);
+                /* mulsd xmm3, xmm2  (x^2 * poly) */
+                b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x59; b[3]=0xDA; EMIT(cg, 4);
+
+                /* Load 1.0 into xmm0 */
+                pn = emit_mov_reg_imm64(BUF(cg), REG_RCX, 0x3FF0000000000000ULL); EMIT(cg, pn);
+                b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xC1; EMIT(cg, 5); /* movq xmm0, rcx */
+
+                /* addsd xmm0, xmm3  (1.0 + x^2*poly) */
+                b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x58; b[3]=0xC3; EMIT(cg, 4);
+
+                /* movq rax, xmm0 — result back to RAX */
+                b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x7E; b[4]=0xC0; EMIT(cg, 5);
+            }
             return 1;
         }
         if (strcmp(name, "math_abs") == 0 && argc == 1) {

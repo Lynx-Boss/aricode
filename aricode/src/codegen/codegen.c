@@ -264,6 +264,34 @@ static int expr_is_float(CodegenState *cg, const ASTNode *node) {
     if (node->type == NODE_UNARY_OP && node->child_count >= 1) {
         return expr_is_float(cg, node->children[0]);
     }
+    if (node->type == NODE_CALL && node->child_count >= 1) {
+        /* Check if the called function returns f64.
+         * Look at the function name and check if it's a known f64 function
+         * (user-defined functions that return f64 have their params checked). */
+        const ASTNode *callee = node->children[0];
+        if (callee && callee->string_val) {
+            const char *fn = callee->string_val;
+            /* Builtin f64 functions */
+            if (strcmp(fn, "math_sqrt") == 0 || strcmp(fn, "math_exp") == 0 ||
+                strcmp(fn, "math_log") == 0 || strcmp(fn, "math_abs") == 0 ||
+                strcmp(fn, "int_to_float") == 0 || strcmp(fn, "read_float") == 0 ||
+                strcmp(fn, "arr_f64_get") == 0 || strcmp(fn, "arr_f64_sum") == 0 ||
+                strcmp(fn, "arr_f64_dot") == 0)
+                return 1;
+            /* User-defined functions: check if the function was compiled
+             * with a f64 return type by looking at any float arguments
+             * or if the function name suggests float (heuristic). */
+            FuncEntry *fe = find_func(cg, fn);
+            if (fe) {
+                /* Check if any argument to this call is float —
+                 * if so, the function likely returns float too. */
+                for (size_t i = 1; i < node->child_count; i++) {
+                    if (expr_is_float(cg, node->children[i]))
+                        return 1;
+                }
+            }
+        }
+    }
     return 0;
 }
 

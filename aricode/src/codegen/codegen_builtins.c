@@ -1451,6 +1451,21 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             pn = emit_pop(BUF(cg), REG_RCX); EMIT(cg, pn);
             return 1;
         }
+        if (strcmp(name, "print_char") == 0 && argc == 1) {
+            /* print_char(c: i32) — print a single ASCII character, no newline.
+             * push char byte to stack, write(1, rsp, 1), pop */
+            emit_expression(cg, node->children[1]); /* char code → RAX */
+            int pn; uint8_t *b;
+            pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
+            pn = emit_mov_reg_imm32(BUF(cg), REG_RAX, 1); EMIT(cg, pn); /* __NR_write */
+            pn = emit_mov_reg_imm32(BUF(cg), REG_RDI, 1); EMIT(cg, pn); /* stdout */
+            pn = emit_mov_reg_reg(BUF(cg), REG_RSI, REG_RSP); EMIT(cg, pn); /* buf=rsp */
+            pn = emit_mov_reg_imm32(BUF(cg), REG_RDX, 1); EMIT(cg, pn); /* len=1 */
+            pn = emit_syscall(BUF(cg)); EMIT(cg, pn);
+            pn = emit_pop(BUF(cg), REG_RAX); EMIT(cg, pn);
+            return 1;
+        }
+
         /*
          * MATH BUILTINS — f64 math functions via SSE2
          *

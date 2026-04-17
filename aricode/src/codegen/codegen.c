@@ -1365,6 +1365,29 @@ static void emit_if(CodegenState *cg, const ASTNode *node) {
  *     jmp loop_start
  *   loop_end:
  */
+/*
+ * Check if a block contains break, continue, or return statements.
+ * Used to determine if a loop body is safe for unrolling.
+ */
+static int block_has_flow_control(const ASTNode *block) {
+    if (!block) return 0;
+    for (size_t i = 0; i < block->child_count; i++) {
+        ASTNode *child = block->children[i];
+        if (!child) continue;
+        if (child->type == NODE_BREAK || child->type == NODE_CONTINUE ||
+            child->type == NODE_RETURN)
+            return 1;
+        /* Check nested blocks (if/else, etc.) */
+        if (child->type == NODE_IF || child->type == NODE_BLOCK) {
+            for (size_t j = 0; j < child->child_count; j++) {
+                if (child->children[j] && block_has_flow_control(child->children[j]))
+                    return 1;
+            }
+        }
+    }
+    return 0;
+}
+
 static void emit_while(CodegenState *cg, const ASTNode *node) {
     if (node->child_count < 2) {
         cg_error(cg, "malformed while at %d:%d", node->line, node->col);
@@ -1379,6 +1402,11 @@ static void emit_while(CodegenState *cg, const ASTNode *node) {
         cg->loop_is_for[ld] = 0; /* while loop */
         cg->loop_depth++;
     }
+
+    /* OPTIMIZATION: Unroll 2x if body has no break/continue/return.
+     * Emit body twice per iteration, with condition check in between.
+     * This halves the number of branch instructions. */
+    int can_unroll = !block_has_flow_control(node->children[1]);
 
     /* loop_start label */
     size_t loop_start = cg->code_size;
@@ -1396,8 +1424,23 @@ static void emit_while(CodegenState *cg, const ASTNode *node) {
     n = emit_je(BUF(cg), 0);
     EMIT(cg, n);
 
-    /* Body */
+    /* Body (first copy) */
     emit_block(cg, node->children[1]);
+
+    size_t je_pos2 = 0;
+    if (can_unroll) {
+        /* Re-check condition before second body copy */
+        emit_expression(cg, node->children[0]);
+        n = emit_cmp_reg_imm(BUF(cg), REG_RAX, 0);
+        EMIT(cg, n);
+        /* JE to loop_end (placeholder) */
+        je_pos2 = cg->code_size;
+        n = emit_je(BUF(cg), 0);
+        EMIT(cg, n);
+
+        /* Body (second copy — unrolled) */
+        emit_block(cg, node->children[1]);
+    }
 
     /* JMP back to loop_start */
     int32_t back_rel = (int32_t)((int64_t)loop_start - (int64_t)(cg->code_size + 5));
@@ -1407,6 +1450,12 @@ static void emit_while(CodegenState *cg, const ASTNode *node) {
     /* Patch JE to point here (loop_end) */
     int32_t je_off = (int32_t)(cg->code_size - (je_pos + 6));
     memcpy(cg->code + je_pos + 2, &je_off, 4);
+
+    /* Patch unrolled JE */
+    if (can_unroll && je_pos2 > 0) {
+        int32_t je_off2 = (int32_t)(cg->code_size - (je_pos2 + 6));
+        memcpy(cg->code + je_pos2 + 2, &je_off2, 4);
+    }
 
     /* Patch all break JMPs to point here */
     if (ld < 32) {

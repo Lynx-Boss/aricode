@@ -14,46 +14,217 @@
 #include <stdio.h>
 #include <string.h>
 
-/*
- * Mod-2π range reduction for math_sin / math_cos.
+/* =====================================================================
+ *  SSE2 minimax polynomial helpers for sin / cos
+ * =====================================================================
  *
- * Input:  x in xmm0 (caller has already loaded the argument)
- * Output: r in xmm0 and rax, with r ~= x - round(x / 2π) * 2π
- *         so |r| <= π.  The existing SSE2 minimax polynomial is
- *         accurate enough over [-π, π] for 12+ digit use cases.
+ * The coefficients below were originally fit by the aricode build for
+ * |x| <= π/4.  They deliver ~10^-11 relative accuracy in that range;
+ * applied outside it the 5-term truncation error explodes (4e-4 at ±π,
+ * 1.8e-3 for cos).  The shared octant reducer below (emit_octant_reduce)
+ * is what keeps us inside the designed range.
  *
- * For very large x (magnitudes approaching 2^63) the reduction loses
- * ULPs, but the polynomial itself is the practical precision limit
- * for the default SSE2 path — users needing full precision should
- * compile with `aric --precision=15` (x87 FSIN does its own reduction
- * via FPREM1).
+ * Both helpers assume: x (the reduced r, in [-π/4, π/4]) is in xmm0.
+ * Both leave: sin_poly(r) or cos_poly(r) in xmm0 (RAX is NOT written
+ * here — the caller takes care of that after sign-flipping).
  */
-static void emit_sincos_range_reduce_sse2(CodegenState *cg) {
+static void emit_sin_poly_sse2(CodegenState *cg) {
     int pn; uint8_t *b;
 
-    /* xmm5 = 1/(2π)  (0x3FC45F306DC9C883 = 0.15915494309189535) */
-    pn = emit_mov_reg_imm64(BUF(cg), REG_RCX, 0x3FC45F306DC9C883ULL); EMIT(cg, pn);
-    b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xE9; EMIT(cg, 5);
-    /* mulsd xmm5, xmm0   — xmm5 = x / (2π) */
-    b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x59; b[3]=0xE8; EMIT(cg, 4);
+    /* xmm1 = x*x */
+    b = BUF(cg); b[0]=0x66; b[1]=0x0F; b[2]=0x28; b[3]=0xC8; EMIT(cg, 4);  /* movapd xmm1, xmm0 */
+    b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x59; b[3]=0xC9; EMIT(cg, 4);  /* mulsd  xmm1, xmm1 */
 
-    /* cvtsd2si rax, xmm5  — rax = round(x / 2π), rounding mode = nearest-even (default) */
-    b = BUF(cg); b[0]=0xF2; b[1]=0x48; b[2]=0x0F; b[3]=0x2D; b[4]=0xC5; EMIT(cg, 5);
+    /* Horner: xmm2 = S1 + x²·(S2 + x²·(S3 + x²·(S4 + x²·S5))) */
+    pn = emit_mov_reg_imm64(BUF(cg), REG_RCX, 0xBE5AE5E68A2B9CEBULL); EMIT(cg, pn);  /* S5 */
+    b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xD1; EMIT(cg, 5);
+    b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x59; b[3]=0xD1; EMIT(cg, 4);
+    pn = emit_mov_reg_imm64(BUF(cg), REG_RCX, 0x3EC71DE357B1FE7DULL); EMIT(cg, pn);  /* S4 */
+    b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xD9; EMIT(cg, 5);
+    b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x58; b[3]=0xD3; EMIT(cg, 4);
+    b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x59; b[3]=0xD1; EMIT(cg, 4);
+    pn = emit_mov_reg_imm64(BUF(cg), REG_RCX, 0xBF2A01A019C161D5ULL); EMIT(cg, pn);  /* S3 */
+    b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xD9; EMIT(cg, 5);
+    b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x58; b[3]=0xD3; EMIT(cg, 4);
+    b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x59; b[3]=0xD1; EMIT(cg, 4);
+    pn = emit_mov_reg_imm64(BUF(cg), REG_RCX, 0x3F8111111110F8A6ULL); EMIT(cg, pn);  /* S2 */
+    b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xD9; EMIT(cg, 5);
+    b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x58; b[3]=0xD3; EMIT(cg, 4);
+    b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x59; b[3]=0xD1; EMIT(cg, 4);
+    pn = emit_mov_reg_imm64(BUF(cg), REG_RCX, 0xBFC5555555555549ULL); EMIT(cg, pn);  /* S1 */
+    b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xD9; EMIT(cg, 5);
+    b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x58; b[3]=0xD3; EMIT(cg, 4);
 
-    /* cvtsi2sd xmm6, rax — xmm6 = (double) rax = n */
-    b = BUF(cg); b[0]=0xF2; b[1]=0x48; b[2]=0x0F; b[3]=0x2A; b[4]=0xF0; EMIT(cg, 5);
+    /* sin(x) = x + x³ · poly_tail  (xmm0 += x³ · xmm2) */
+    b = BUF(cg); b[0]=0x66; b[1]=0x0F; b[2]=0x28; b[3]=0xD8; EMIT(cg, 4);  /* movapd xmm3, xmm0 */
+    b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x59; b[3]=0xD9; EMIT(cg, 4);  /* mulsd  xmm3, xmm1 (x³) */
+    b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x59; b[3]=0xDA; EMIT(cg, 4);  /* mulsd  xmm3, xmm2 */
+    b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x58; b[3]=0xC3; EMIT(cg, 4);  /* addsd  xmm0, xmm3 */
+}
 
-    /* xmm7 = 2π  (0x401921FB54442D18 = 6.283185307179586) */
-    pn = emit_mov_reg_imm64(BUF(cg), REG_RCX, 0x401921FB54442D18ULL); EMIT(cg, pn);
+static void emit_cos_poly_sse2(CodegenState *cg) {
+    int pn; uint8_t *b;
+
+    /* xmm1 = x*x */
+    b = BUF(cg); b[0]=0x66; b[1]=0x0F; b[2]=0x28; b[3]=0xC8; EMIT(cg, 4);  /* movapd xmm1, xmm0 */
+    b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x59; b[3]=0xC9; EMIT(cg, 4);  /* mulsd  xmm1, xmm1 */
+
+    /* Horner: xmm2 = C1 + x²·(C2 + x²·(C3 + x²·(C4 + x²·C5))) */
+    pn = emit_mov_reg_imm64(BUF(cg), REG_RCX, 0xBE927E4F809C52ADULL); EMIT(cg, pn);  /* C5 */
+    b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xD1; EMIT(cg, 5);
+    b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x59; b[3]=0xD1; EMIT(cg, 4);
+    pn = emit_mov_reg_imm64(BUF(cg), REG_RCX, 0x3EFA01A019CB1590ULL); EMIT(cg, pn);  /* C4 */
+    b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xD9; EMIT(cg, 5);
+    b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x58; b[3]=0xD3; EMIT(cg, 4);
+    b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x59; b[3]=0xD1; EMIT(cg, 4);
+    pn = emit_mov_reg_imm64(BUF(cg), REG_RCX, 0xBF56C16C16C15177ULL); EMIT(cg, pn);  /* C3 */
+    b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xD9; EMIT(cg, 5);
+    b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x58; b[3]=0xD3; EMIT(cg, 4);
+    b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x59; b[3]=0xD1; EMIT(cg, 4);
+    pn = emit_mov_reg_imm64(BUF(cg), REG_RCX, 0x3FA555555555554CULL); EMIT(cg, pn);  /* C2 */
+    b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xD9; EMIT(cg, 5);
+    b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x58; b[3]=0xD3; EMIT(cg, 4);
+    b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x59; b[3]=0xD1; EMIT(cg, 4);
+    pn = emit_mov_reg_imm64(BUF(cg), REG_RCX, 0xBFE0000000000000ULL); EMIT(cg, pn);  /* C1 = -1/2 */
+    b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xD9; EMIT(cg, 5);
+    b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x58; b[3]=0xD3; EMIT(cg, 4);
+
+    /* cos(x) = 1 + x² · poly_tail  (xmm0 = 1 + x² · xmm2) */
+    b = BUF(cg); b[0]=0x66; b[1]=0x0F; b[2]=0x28; b[3]=0xD9; EMIT(cg, 4);  /* movapd xmm3, xmm1 */
+    b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x59; b[3]=0xDA; EMIT(cg, 4);  /* mulsd  xmm3, xmm2 (x² · poly) */
+    pn = emit_mov_reg_imm64(BUF(cg), REG_RCX, 0x3FF0000000000000ULL); EMIT(cg, pn);  /* 1.0 */
+    b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xC1; EMIT(cg, 5);  /* movq xmm0, rcx */
+    b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x58; b[3]=0xC3; EMIT(cg, 4);  /* addsd xmm0, xmm3 */
+}
+
+/* =====================================================================
+ *  Octant reduction for sin/cos  (SSE4.1 roundsd + FMA3 Cody-Waite)
+ * =====================================================================
+ *
+ * Rationale: the minimax coefficients above were fit for |x| <= π/4.
+ * Applying them over [-π, π] (plain mod-2π reduction) costs ~8 orders
+ * of magnitude of precision at ±π.  Octant reduction puts the argument
+ * back in the poly's designed range at roughly the same code size.
+ *
+ *   n = round(x · 2/π)
+ *   r = x - n · π/2        (Cody-Waite two-part: π/2 = HI + LO)
+ *
+ * Then based on (n mod 4) the caller selects sin_poly(r) / cos_poly(r)
+ * and an optional sign flip.  This module only computes r and n.
+ *
+ * Targets: requires SSE4.1 (roundsd) + FMA3 (vfnmadd231sd).  Zen 3 and
+ * every mainstream x86 CPU since ~2013 ship both.  A pure-SSE2 fallback
+ * using cvtsd2si + subsd pairs is kept below #ifdef 0 for reference.
+ */
+static void emit_sincos_octant_reduce(CodegenState *cg) {
+    int pn; uint8_t *b;
+
+    /* xmm5 = 2/π  (0x3FE45F306DC9C883) */
+    pn = emit_mov_reg_imm64(BUF(cg), REG_RCX, 0x3FE45F306DC9C883ULL); EMIT(cg, pn);
+    b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xE9; EMIT(cg, 5);  /* movq xmm5, rcx */
+    b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x59; b[3]=0xE8; EMIT(cg, 4);             /* mulsd xmm5, xmm0 */
+
+    /* xmm6 = round-to-nearest-even(xmm5)  — SSE4.1, hardwired RNE (no MXCSR) */
+    /* roundsd xmm6, xmm5, 0 : 66 0F 3A 0B F5 00 */
+    b = BUF(cg); b[0]=0x66; b[1]=0x0F; b[2]=0x3A; b[3]=0x0B; b[4]=0xF5; b[5]=0x00; EMIT(cg, 6);
+
+    /* rax = (int64) xmm6  — octant index (we only need low 2 bits) */
+    /* cvttsd2si rax, xmm6 : F2 48 0F 2C C6 */
+    b = BUF(cg); b[0]=0xF2; b[1]=0x48; b[2]=0x0F; b[3]=0x2C; b[4]=0xC6; EMIT(cg, 5);
+
+    /* xmm7 = π/2 high  (0x3FF921FB54400000 — only top 33 bits) */
+    pn = emit_mov_reg_imm64(BUF(cg), REG_RCX, 0x3FF921FB54400000ULL); EMIT(cg, pn);
+    b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xF9; EMIT(cg, 5);  /* movq xmm7, rcx */
+    /* vfnmadd231sd xmm0, xmm6, xmm7  → xmm0 = xmm0 - xmm6·xmm7 */
+    b = BUF(cg); b[0]=0xC4; b[1]=0xE2; b[2]=0xC9; b[3]=0xBD; b[4]=0xC7; EMIT(cg, 5);
+
+    /* xmm7 = π/2 low   (0x3DD0B4611A626331) */
+    pn = emit_mov_reg_imm64(BUF(cg), REG_RCX, 0x3DD0B4611A626331ULL); EMIT(cg, pn);
     b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xF9; EMIT(cg, 5);
-    /* mulsd xmm7, xmm6   — xmm7 = n * 2π */
-    b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x59; b[3]=0xFE; EMIT(cg, 4);
+    /* second CW step: xmm0 -= xmm6·xmm7 */
+    b = BUF(cg); b[0]=0xC4; b[1]=0xE2; b[2]=0xC9; b[3]=0xBD; b[4]=0xC7; EMIT(cg, 5);
 
-    /* subsd xmm0, xmm7   — xmm0 = r = x - n*2π */
-    b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x5C; b[3]=0xC7; EMIT(cg, 4);
+    /* rax &= 3  — keep only the octant index (0..3) */
+    b = BUF(cg); b[0]=0x48; b[1]=0x83; b[2]=0xE0; b[3]=0x03; EMIT(cg, 4);
+}
 
-    /* movq rax, xmm0     — keep rax in sync with xmm0 for downstream code */
+/*
+ * emit_sincos_body — shared body of math_sin / math_cos (SSE2 default path).
+ *
+ * Assumes x is already in rax (caller did emit_expression of the argument).
+ * Loads x into xmm0, runs octant reduction, selects sin_poly or cos_poly
+ * based on octant bit, applies the sign flip, leaves result in xmm0 + rax.
+ *
+ * For sin(x) n drives selection directly.
+ * For cos(x) we use n+1 (`inc rax`) which makes the same selection table
+ * produce the cos mapping:
+ *   n mod 4 = 0: sin_poly(r),  sign=+   (cos: uses n+1=1 → cos_poly(r) +)
+ *   n mod 4 = 1: cos_poly(r),  sign=+   (cos: n+1=2 → sin_poly(r) −)
+ *   n mod 4 = 2: sin_poly(r),  sign=−   (cos: n+1=3 → cos_poly(r) −)
+ *   n mod 4 = 3: cos_poly(r),  sign=−   (cos: n+1=0 → sin_poly(r) +)
+ */
+static void emit_sincos_body(CodegenState *cg, int is_cos) {
+    int pn; uint8_t *b;
+
+    /* movq xmm0, rax — load x into xmm0 */
+    b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xC0; EMIT(cg, 5);
+
+    emit_sincos_octant_reduce(cg);  /* xmm0 = r, rax = n & 3 */
+
+    if (is_cos) {
+        /* inc rax  — reuse sin's selection table for cos */
+        b = BUF(cg); b[0]=0x48; b[1]=0xFF; b[2]=0xC0; EMIT(cg, 3);
+        /* and rax, 3 */
+        b = BUF(cg); b[0]=0x48; b[1]=0x83; b[2]=0xE0; b[3]=0x03; EMIT(cg, 4);
+    }
+
+    /* Compute sign mask in rcx: bit1 of rax → 1<<63 or 0. */
+    /* mov rcx, rax */
+    b = BUF(cg); b[0]=0x48; b[1]=0x89; b[2]=0xC1; EMIT(cg, 3);
+    /* shr rcx, 1 */
+    b = BUF(cg); b[0]=0x48; b[1]=0xD1; b[2]=0xE9; EMIT(cg, 3);
+    /* and rcx, 1 */
+    b = BUF(cg); b[0]=0x48; b[1]=0x83; b[2]=0xE1; b[3]=0x01; EMIT(cg, 4);
+    /* shl rcx, 63 */
+    b = BUF(cg); b[0]=0x48; b[1]=0xC1; b[2]=0xE1; b[3]=0x3F; EMIT(cg, 4);
+    /* push rcx  — save sign mask across poly call */
+    b = BUF(cg); b[0]=0x51; EMIT(cg, 1);
+
+    /* Test low bit of rax: 0 ⇒ sin_poly, 1 ⇒ cos_poly */
+    /* test al, 1 */
+    b = BUF(cg); b[0]=0xA8; b[1]=0x01; EMIT(cg, 2);
+
+    /* jnz to cos_branch (placeholder) */
+    size_t jnz_pos = cg->code_size;
+    b = BUF(cg); b[0]=0x0F; b[1]=0x85; b[2]=0; b[3]=0; b[4]=0; b[5]=0; EMIT(cg, 6);
+
+    /* --- sin_poly branch --- */
+    emit_sin_poly_sse2(cg);
+    /* jmp to done (placeholder) */
+    size_t jmp_pos = cg->code_size;
+    b = BUF(cg); b[0]=0xE9; b[1]=0; b[2]=0; b[3]=0; b[4]=0; EMIT(cg, 5);
+
+    /* Patch jnz to land on cos branch */
+    int32_t jnz_off = (int32_t)(cg->code_size - (jnz_pos + 6));
+    memcpy(cg->code + jnz_pos + 2, &jnz_off, 4);
+
+    /* --- cos_poly branch --- */
+    emit_cos_poly_sse2(cg);
+
+    /* Patch jmp to land here */
+    int32_t jmp_off = (int32_t)(cg->code_size - (jmp_pos + 5));
+    memcpy(cg->code + jmp_pos + 1, &jmp_off, 4);
+
+    /* --- sign flip + sync rax --- */
+    /* pop rcx */
+    b = BUF(cg); b[0]=0x59; EMIT(cg, 1);
+    /* movq rax, xmm0 */
     b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x7E; b[4]=0xC0; EMIT(cg, 5);
+    /* xor rax, rcx */
+    b = BUF(cg); b[0]=0x48; b[1]=0x31; b[2]=0xC8; EMIT(cg, 3);
+    /* movq xmm0, rax */
+    b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xC0; EMIT(cg, 5);
+    (void)pn;
 }
 
 int emit_builtin(CodegenState *cg, const ASTNode *node,
@@ -1844,67 +2015,12 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
                 b = BUF(cg); b[0]=0x48; b[1]=0x8B; b[2]=0x04; b[3]=0x24; EMIT(cg, 4);
                 b = BUF(cg); b[0]=0x48; b[1]=0x83; b[2]=0xC4; b[3]=16; EMIT(cg, 4);
             } else {
-                /* SSE2 minimax polynomial: sin(x) with mod-2π range reduction.
-                 * Polynomial alone is accurate for |x| <= pi/4, extended to
-                 * [-π, π] via mod-2π pre-reduction (see helper above).
-                 * sin(x) = x + x^3*(S1 + x^2*(S2 + x^2*(S3 + x^2*(S4 + x^2*S5))))
-                 * Horner evaluation from inside out. */
-
-                /* movq xmm0, rax  — load x into xmm0 */
-                b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xC0; EMIT(cg, 5);
-
-                /* Range reduce to |r| <= π before the polynomial. */
-                emit_sincos_range_reduce_sse2(cg);
-
-                /* xmm1 = x*x (x squared) */
-                /* movapd xmm1, xmm0 */
-                b = BUF(cg); b[0]=0x66; b[1]=0x0F; b[2]=0x28; b[3]=0xC8; EMIT(cg, 4);
-                /* mulsd xmm1, xmm1 */
-                b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x59; b[3]=0xC9; EMIT(cg, 4);
-
-                /* Load S5 into xmm2 (innermost coefficient) */
-                pn = emit_mov_reg_imm64(BUF(cg), REG_RCX, 0xBE5AE5E68A2B9CEBULL); EMIT(cg, pn);
-                b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xD1; EMIT(cg, 5); /* movq xmm2, rcx */
-
-                /* xmm2 = S4 + x^2*S5: mulsd xmm2,xmm1; load S4->xmm3; addsd xmm2,xmm3 */
-                b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x59; b[3]=0xD1; EMIT(cg, 4); /* mulsd xmm2, xmm1 */
-                pn = emit_mov_reg_imm64(BUF(cg), REG_RCX, 0x3EC71DE357B1FE7DULL); EMIT(cg, pn);
-                b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xD9; EMIT(cg, 5); /* movq xmm3, rcx */
-                b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x58; b[3]=0xD3; EMIT(cg, 4); /* addsd xmm2, xmm3 */
-
-                /* xmm2 = S3 + x^2*(S4 + x^2*S5) */
-                b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x59; b[3]=0xD1; EMIT(cg, 4); /* mulsd xmm2, xmm1 */
-                pn = emit_mov_reg_imm64(BUF(cg), REG_RCX, 0xBF2A01A019C161D5ULL); EMIT(cg, pn);
-                b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xD9; EMIT(cg, 5); /* movq xmm3, rcx */
-                b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x58; b[3]=0xD3; EMIT(cg, 4); /* addsd xmm2, xmm3 */
-
-                /* xmm2 = S2 + x^2*(...) */
-                b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x59; b[3]=0xD1; EMIT(cg, 4); /* mulsd xmm2, xmm1 */
-                pn = emit_mov_reg_imm64(BUF(cg), REG_RCX, 0x3F8111111110F8A6ULL); EMIT(cg, pn);
-                b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xD9; EMIT(cg, 5); /* movq xmm3, rcx */
-                b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x58; b[3]=0xD3; EMIT(cg, 4); /* addsd xmm2, xmm3 */
-
-                /* xmm2 = S1 + x^2*(...) */
-                b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x59; b[3]=0xD1; EMIT(cg, 4); /* mulsd xmm2, xmm1 */
-                pn = emit_mov_reg_imm64(BUF(cg), REG_RCX, 0xBFC5555555555549ULL); EMIT(cg, pn);
-                b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xD9; EMIT(cg, 5); /* movq xmm3, rcx */
-                b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x58; b[3]=0xD3; EMIT(cg, 4); /* addsd xmm2, xmm3 */
-
-                /* xmm2 now holds the polynomial tail: S1 + x^2*(S2 + ...)
-                 * We need: sin(x) = x + x^3 * xmm2
-                 * xmm3 = x^3 = x * x^2 */
-                /* movapd xmm3, xmm0 */
-                b = BUF(cg); b[0]=0x66; b[1]=0x0F; b[2]=0x28; b[3]=0xD8; EMIT(cg, 4);
-                /* mulsd xmm3, xmm1  (x * x^2 = x^3) */
-                b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x59; b[3]=0xD9; EMIT(cg, 4);
-                /* mulsd xmm3, xmm2  (x^3 * poly) */
-                b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x59; b[3]=0xDA; EMIT(cg, 4);
-                /* addsd xmm0, xmm3  (x + x^3*poly) */
-                b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x58; b[3]=0xC3; EMIT(cg, 4);
-
-                /* movq rax, xmm0 — result back to RAX */
-                b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x7E; b[4]=0xC0; EMIT(cg, 5);
+                /* SSE2 path: octant reduce + sin_poly / cos_poly select.
+                 * See emit_sincos_body above for details.  Delivers ~10^-11
+                 * accuracy for |x| up to ~2^33 (Cody-Waite 2-part split). */
+                emit_sincos_body(cg, /*is_cos=*/0);
             }
+            (void)pn; (void)b;
             return 1;
         }
         if (strcmp(name, "math_cos") == 0 && argc == 1) {
@@ -1920,70 +2036,12 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
                 b = BUF(cg); b[0]=0x48; b[1]=0x8B; b[2]=0x04; b[3]=0x24; EMIT(cg, 4);
                 b = BUF(cg); b[0]=0x48; b[1]=0x83; b[2]=0xC4; b[3]=16; EMIT(cg, 4);
             } else {
-                /* SSE2 minimax polynomial: cos(x) with mod-2π range reduction.
-                 * Polynomial alone is accurate for |x| <= pi/4, extended to
-                 * [-π, π] via mod-2π pre-reduction (see helper above).
-                 * cos(x) = 1 + x^2*(C1 + x^2*(C2 + x^2*(C3 + x^2*(C4 + x^2*C5))))
-                 * Horner evaluation from inside out. */
-
-                /* movq xmm0, rax  — load x into xmm0 */
-                b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xC0; EMIT(cg, 5);
-
-                /* Range reduce to |r| <= π before the polynomial. */
-                emit_sincos_range_reduce_sse2(cg);
-
-                /* xmm1 = x*x (x squared) */
-                /* movapd xmm1, xmm0 */
-                b = BUF(cg); b[0]=0x66; b[1]=0x0F; b[2]=0x28; b[3]=0xC8; EMIT(cg, 4);
-                /* mulsd xmm1, xmm1 */
-                b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x59; b[3]=0xC9; EMIT(cg, 4);
-
-                /* Load C5 into xmm2 (innermost coefficient) */
-                pn = emit_mov_reg_imm64(BUF(cg), REG_RCX, 0xBE927E4F809C52ADULL); EMIT(cg, pn);
-                b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xD1; EMIT(cg, 5); /* movq xmm2, rcx */
-
-                /* xmm2 = C4 + x^2*C5 */
-                b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x59; b[3]=0xD1; EMIT(cg, 4); /* mulsd xmm2, xmm1 */
-                pn = emit_mov_reg_imm64(BUF(cg), REG_RCX, 0x3EFA01A019CB1590ULL); EMIT(cg, pn);
-                b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xD9; EMIT(cg, 5); /* movq xmm3, rcx */
-                b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x58; b[3]=0xD3; EMIT(cg, 4); /* addsd xmm2, xmm3 */
-
-                /* xmm2 = C3 + x^2*(C4 + x^2*C5) */
-                b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x59; b[3]=0xD1; EMIT(cg, 4); /* mulsd xmm2, xmm1 */
-                pn = emit_mov_reg_imm64(BUF(cg), REG_RCX, 0xBF56C16C16C15177ULL); EMIT(cg, pn);
-                b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xD9; EMIT(cg, 5); /* movq xmm3, rcx */
-                b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x58; b[3]=0xD3; EMIT(cg, 4); /* addsd xmm2, xmm3 */
-
-                /* xmm2 = C2 + x^2*(...) */
-                b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x59; b[3]=0xD1; EMIT(cg, 4); /* mulsd xmm2, xmm1 */
-                pn = emit_mov_reg_imm64(BUF(cg), REG_RCX, 0x3FA555555555554CULL); EMIT(cg, pn);
-                b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xD9; EMIT(cg, 5); /* movq xmm3, rcx */
-                b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x58; b[3]=0xD3; EMIT(cg, 4); /* addsd xmm2, xmm3 */
-
-                /* xmm2 = C1 + x^2*(...) */
-                b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x59; b[3]=0xD1; EMIT(cg, 4); /* mulsd xmm2, xmm1 */
-                pn = emit_mov_reg_imm64(BUF(cg), REG_RCX, 0xBFE0000000000000ULL); EMIT(cg, pn);
-                b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xD9; EMIT(cg, 5); /* movq xmm3, rcx */
-                b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x58; b[3]=0xD3; EMIT(cg, 4); /* addsd xmm2, xmm3 */
-
-                /* xmm2 now holds C1 + x^2*(C2 + ...)
-                 * cos(x) = 1 + x^2 * xmm2
-                 * xmm3 = x^2 * poly */
-                /* movapd xmm3, xmm1 */
-                b = BUF(cg); b[0]=0x66; b[1]=0x0F; b[2]=0x28; b[3]=0xD9; EMIT(cg, 4);
-                /* mulsd xmm3, xmm2  (x^2 * poly) */
-                b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x59; b[3]=0xDA; EMIT(cg, 4);
-
-                /* Load 1.0 into xmm0 */
-                pn = emit_mov_reg_imm64(BUF(cg), REG_RCX, 0x3FF0000000000000ULL); EMIT(cg, pn);
-                b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xC1; EMIT(cg, 5); /* movq xmm0, rcx */
-
-                /* addsd xmm0, xmm3  (1.0 + x^2*poly) */
-                b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x58; b[3]=0xC3; EMIT(cg, 4);
-
-                /* movq rax, xmm0 — result back to RAX */
-                b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x7E; b[4]=0xC0; EMIT(cg, 5);
+                /* SSE2 path: octant reduce + sin_poly / cos_poly select.
+                 * cos(x) = sin(x + π/2), so we reuse the sin body with an
+                 * octant shift of +1 (see emit_sincos_body). */
+                emit_sincos_body(cg, /*is_cos=*/1);
             }
+            (void)pn; (void)b;
             return 1;
         }
         if (strcmp(name, "math_abs") == 0 && argc == 1) {

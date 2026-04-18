@@ -305,6 +305,20 @@ fn main() -> i32 {
 EOF
 run_test "enums"          "/tmp/aritest_enum.ari" "" "30"
 
+cat > /tmp/aritest_neg_float.ari << 'EOF'
+fn main() -> i32 {
+    let a: f64 = -0.5;
+    let b: f64 = -1.5;
+    print_float(a + b);           // -2.0
+    print_float(0.0 - a);         // 0.5  (variable path, sign flip)
+    let v: i32 = arr_f64_new(2);
+    arr_f64_set(v, 0, -0.2);
+    print_float(arr_f64_get(v, 0));  // -0.2
+    return 0;
+}
+EOF
+run_test "neg_float"      "/tmp/aritest_neg_float.ari" "" "0.500000"
+
 # ── Error Handling ──
 echo -e "${BOLD}--- Error Handling ---${RESET}"
 run_test "try_catch"      "$EXAMPLES/error_handling.ari" "" "ERROR caught!"

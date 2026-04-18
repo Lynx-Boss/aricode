@@ -872,11 +872,39 @@ static void emit_unary_op(CodegenState *cg, const ASTNode *node) {
         return;
     }
 
+    /* Constant-fold unary minus on a float literal so we don't have to
+     * negate at runtime (NEG RAX would corrupt the IEEE 754 bit pattern). */
+    if (strcmp(node->op, "-") == 0 &&
+        node->children[0]->type == NODE_FLOAT_LITERAL) {
+        ASTNode tmp = *node->children[0];
+        tmp.float_val = -tmp.float_val;
+        emit_float_literal(cg, &tmp);
+        return;
+    }
+
+    int operand_is_float = expr_is_float(cg, node->children[0]);
     emit_expression(cg, node->children[0]);
 
     if (strcmp(node->op, "-") == 0) {
-        int n = emit_neg_reg(BUF(cg), REG_RAX);
-        EMIT(cg, n);
+        if (operand_is_float) {
+            /* Flip the f64 sign bit: xor rax, 1<<63; movq xmm0, rax. */
+            uint8_t *b = BUF(cg);
+            /* mov rcx, 0x8000000000000000 */
+            b[0] = 0x48; b[1] = 0xB9;
+            uint64_t sign_bit = 0x8000000000000000ULL;
+            memcpy(b + 2, &sign_bit, 8);
+            EMIT(cg, 10);
+            /* xor rax, rcx */
+            b = BUF(cg);
+            b[0] = 0x48; b[1] = 0x31; b[2] = 0xC8;
+            EMIT(cg, 3);
+            /* movq xmm0, rax */
+            int n = emit_movq_xmm_reg(BUF(cg), 0, REG_RAX);
+            EMIT(cg, n);
+        } else {
+            int n = emit_neg_reg(BUF(cg), REG_RAX);
+            EMIT(cg, n);
+        }
     } else if (strcmp(node->op, "!") == 0) {
         /* Logical not: compare with 0, sete */
         int n = emit_cmp_reg_imm(BUF(cg), REG_RAX, 0);

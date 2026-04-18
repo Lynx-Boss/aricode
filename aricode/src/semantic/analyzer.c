@@ -266,6 +266,8 @@ static AriType *builtin_return_type(const char *name) {
         {"math_sqrt",       TYPE_F64},
         {"math_exp",        TYPE_F64},
         {"math_log",        TYPE_F64},
+        {"math_expm1",      TYPE_F64},
+        {"math_log1p",      TYPE_F64},
         {"math_sin",        TYPE_F64},
         {"math_cos",        TYPE_F64},
         {"math_abs",        TYPE_F64},
@@ -276,6 +278,7 @@ static AriType *builtin_return_type(const char *name) {
         /* f64 — f64 array ops that return f64 */
         {"arr_f64_get",     TYPE_F64},
         {"arr_f64_sum",     TYPE_F64},
+        {"arr_f64_sum_kahan", TYPE_F64},
         {"arr_f64_dot",     TYPE_F64},
         {"arr_f64_scale",   TYPE_I32},
         /* i32 — threading */

@@ -275,6 +275,8 @@ static int expr_is_float(CodegenState *cg, const ASTNode *node) {
             if (strcmp(fn, "math_sqrt") == 0 || strcmp(fn, "math_exp") == 0 ||
                 strcmp(fn, "math_log") == 0 || strcmp(fn, "math_abs") == 0 ||
                 strcmp(fn, "math_sin") == 0 || strcmp(fn, "math_cos") == 0 ||
+                strcmp(fn, "math_expm1") == 0 || strcmp(fn, "math_log1p") == 0 ||
+                strcmp(fn, "arr_f64_sum_kahan") == 0 ||
                 strcmp(fn, "int_to_float") == 0 || strcmp(fn, "read_float") == 0 ||
                 strcmp(fn, "arr_f64_get") == 0 || strcmp(fn, "arr_f64_sum") == 0 ||
                 strcmp(fn, "arr_f64_dot") == 0)

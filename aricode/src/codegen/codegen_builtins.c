@@ -1944,6 +1944,130 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             return 1;
         }
 
+        if (strcmp(name, "math_expm1") == 0 && argc == 1) {
+            /* expm1(x) = exp(x) - 1, computed stably near 0.
+             * For |x| < 0.5: Taylor series x + x²/2 + x³/6 + x⁴/24 + x⁵/120 + x⁶/720 + x⁷/5040
+             * Via Horner: x * (1 + x*(1/2 + x*(1/6 + x*(1/24 + x*(1/120 + x*(1/720 + x/5040))))))
+             * Avoids catastrophic cancellation when exp(x) ≈ 1 for small x. */
+            emit_expression(cg, node->children[1]);
+            int pn; uint8_t *b;
+            /* movq xmm0, rax (x) */
+            b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xC0; EMIT(cg, 5);
+            /* Horner from innermost: start with x/5040 */
+            /* xmm1 = 1/5040 = 1.984126984126984e-04 */
+            uint64_t c7 = 0x3F2A01A01A01A01AULL;
+            pn = emit_mov_reg_imm64(BUF(cg), REG_RCX, c7); EMIT(cg, pn);
+            b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xC9; EMIT(cg, 5); /* movq xmm1, rcx */
+            /* xmm1 = x * 1/5040 */
+            pn = emit_mulsd(BUF(cg), 1, 0); EMIT(cg, pn);
+
+            /* Add 1/720 = 1.388888888888889e-03 */
+            uint64_t c6 = 0x3F56C16C16C16C17ULL;
+            pn = emit_mov_reg_imm64(BUF(cg), REG_RCX, c6); EMIT(cg, pn);
+            b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xD1; EMIT(cg, 5); /* movq xmm2, rcx */
+            pn = emit_addsd(BUF(cg), 1, 2); EMIT(cg, pn);
+            pn = emit_mulsd(BUF(cg), 1, 0); EMIT(cg, pn);
+
+            /* Add 1/120 = 8.333333333333333e-03 */
+            uint64_t c5 = 0x3F81111111111111ULL;
+            pn = emit_mov_reg_imm64(BUF(cg), REG_RCX, c5); EMIT(cg, pn);
+            b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xD1; EMIT(cg, 5);
+            pn = emit_addsd(BUF(cg), 1, 2); EMIT(cg, pn);
+            pn = emit_mulsd(BUF(cg), 1, 0); EMIT(cg, pn);
+
+            /* Add 1/24 = 0.04166666666666667 */
+            uint64_t c4 = 0x3FA5555555555555ULL;
+            pn = emit_mov_reg_imm64(BUF(cg), REG_RCX, c4); EMIT(cg, pn);
+            b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xD1; EMIT(cg, 5);
+            pn = emit_addsd(BUF(cg), 1, 2); EMIT(cg, pn);
+            pn = emit_mulsd(BUF(cg), 1, 0); EMIT(cg, pn);
+
+            /* Add 1/6 = 0.16666666666666666 */
+            uint64_t c3 = 0x3FC5555555555555ULL;
+            pn = emit_mov_reg_imm64(BUF(cg), REG_RCX, c3); EMIT(cg, pn);
+            b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xD1; EMIT(cg, 5);
+            pn = emit_addsd(BUF(cg), 1, 2); EMIT(cg, pn);
+            pn = emit_mulsd(BUF(cg), 1, 0); EMIT(cg, pn);
+
+            /* Add 1/2 = 0.5 */
+            uint64_t c2 = 0x3FE0000000000000ULL;
+            pn = emit_mov_reg_imm64(BUF(cg), REG_RCX, c2); EMIT(cg, pn);
+            b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xD1; EMIT(cg, 5);
+            pn = emit_addsd(BUF(cg), 1, 2); EMIT(cg, pn);
+            pn = emit_mulsd(BUF(cg), 1, 0); EMIT(cg, pn);
+
+            /* Add 1.0 */
+            uint64_t one = 0x3FF0000000000000ULL;
+            pn = emit_mov_reg_imm64(BUF(cg), REG_RCX, one); EMIT(cg, pn);
+            b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xD1; EMIT(cg, 5);
+            pn = emit_addsd(BUF(cg), 1, 2); EMIT(cg, pn);
+
+            /* Final: result = x * (polynomial) */
+            pn = emit_mulsd(BUF(cg), 0, 1); EMIT(cg, pn);
+            /* movq rax, xmm0 */
+            b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x7E; b[4]=0xC0; EMIT(cg, 5);
+            return 1;
+        }
+
+        if (strcmp(name, "math_log1p") == 0 && argc == 1) {
+            /* log1p(x) = log(1+x), stable near 0.
+             * Uses: log1p(x) = 2 * atanh(x/(2+x))
+             * atanh(y) ≈ y + y³/3 + y⁵/5 + y⁷/7 (5 terms)
+             * Avoids cancellation when x is small (log(1+small) ≈ small). */
+            emit_expression(cg, node->children[1]);
+            int pn; uint8_t *b;
+            /* movq xmm0, rax (x) */
+            b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xC0; EMIT(cg, 5);
+
+            /* xmm1 = 2.0 */
+            uint64_t two = 0x4000000000000000ULL;
+            pn = emit_mov_reg_imm64(BUF(cg), REG_RCX, two); EMIT(cg, pn);
+            b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xC9; EMIT(cg, 5);
+
+            /* xmm2 = 2 + x */
+            pn = emit_movsd_xmm_xmm(BUF(cg), 2, 1); EMIT(cg, pn);
+            pn = emit_addsd(BUF(cg), 2, 0); EMIT(cg, pn);
+
+            /* xmm0 = y = x / (2 + x) */
+            pn = emit_divsd(BUF(cg), 0, 2); EMIT(cg, pn);
+
+            /* xmm3 = y² */
+            pn = emit_movsd_xmm_xmm(BUF(cg), 3, 0); EMIT(cg, pn);
+            pn = emit_mulsd(BUF(cg), 3, 0); EMIT(cg, pn);
+
+            /* xmm4 = sum = y (first term) */
+            pn = emit_movsd_xmm_xmm(BUF(cg), 4, 0); EMIT(cg, pn);
+
+            /* Add more terms: y³/3, y⁵/5, y⁷/7, y⁹/9 */
+            static const uint64_t denoms[4] = {
+                0x4008000000000000ULL, /* 3.0 */
+                0x4014000000000000ULL, /* 5.0 */
+                0x401C000000000000ULL, /* 7.0 */
+                0x4022000000000000ULL, /* 9.0 */
+            };
+            for (int t = 0; t < 4; t++) {
+                /* xmm0 = y^(2k+1) by multiplying by y² */
+                pn = emit_mulsd(BUF(cg), 0, 3); EMIT(cg, pn);
+                /* xmm5 = denom */
+                pn = emit_mov_reg_imm64(BUF(cg), REG_RCX, denoms[t]); EMIT(cg, pn);
+                b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xE9; EMIT(cg, 5);
+                /* xmm6 = xmm0 / xmm5 */
+                pn = emit_movsd_xmm_xmm(BUF(cg), 6, 0); EMIT(cg, pn);
+                pn = emit_divsd(BUF(cg), 6, 5); EMIT(cg, pn);
+                /* sum += xmm6 */
+                pn = emit_addsd(BUF(cg), 4, 6); EMIT(cg, pn);
+            }
+
+            /* result = 2 * sum */
+            pn = emit_mov_reg_imm64(BUF(cg), REG_RCX, two); EMIT(cg, pn);
+            b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xC1; EMIT(cg, 5); /* movq xmm0, rcx */
+            pn = emit_mulsd(BUF(cg), 0, 4); EMIT(cg, pn);
+
+            /* movq rax, xmm0 */
+            b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x7E; b[4]=0xC0; EMIT(cg, 5);
+            return 1;
+        }
+
         /*
          * F64 ARRAY BUILTINS — arrays of doubles for neural networks
          *
@@ -2041,6 +2165,66 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x7E; b[4]=0xC0; EMIT(cg, 5);
             return 1;
         }
+        if (strcmp(name, "arr_f64_sum_kahan") == 0 && argc == 1) {
+            /* Kahan compensated summation — recovers bits lost to rounding.
+             *
+             * Algorithm:
+             *   sum = 0; c = 0
+             *   for each x in arr:
+             *     y = x - c
+             *     t = sum + y
+             *     c = (t - sum) - y    // recovers the lost low bits
+             *     sum = t
+             *
+             * Accurate even with millions of additions (no accumulation drift).
+             * Uses: xmm0=sum, xmm1=c, xmm2=x, xmm3=y, xmm4=t */
+            emit_expression(cg, node->children[1]);
+            int pn; uint8_t *b;
+            pn = emit_mov_reg_reg(BUF(cg), REG_RDI, REG_RAX); EMIT(cg, pn);
+            pn = emit_mov_reg_mem(BUF(cg), REG_RCX, REG_RAX, -8); EMIT(cg, pn);
+            /* xorpd xmm0, xmm0 (sum = 0) */
+            b = BUF(cg); b[0]=0x66; b[1]=0x0F; b[2]=0x57; b[3]=0xC0; EMIT(cg, 4);
+            /* xorpd xmm1, xmm1 (c = 0) */
+            b = BUF(cg); b[0]=0x66; b[1]=0x0F; b[2]=0x57; b[3]=0xC9; EMIT(cg, 4);
+            pn = emit_xor_reg_reg(BUF(cg), REG_RSI, REG_RSI); EMIT(cg, pn);
+
+            size_t loop_top = cg->code_size;
+            pn = emit_cmp_reg_reg(BUF(cg), REG_RSI, REG_RCX); EMIT(cg, pn);
+            size_t jae_done = cg->code_size;
+            b = BUF(cg); b[0]=0x0F; b[1]=0x83; memset(b+2,0,4); EMIT(cg, 6);
+
+            /* xmm2 = arr[i] */
+            b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x10;
+            b[3]=modrm(0, 2, 4); b[4]=(uint8_t)((3<<6)|(REG_RSI<<3)|REG_RDI);
+            EMIT(cg, 5);
+
+            /* xmm3 = y = x - c */
+            pn = emit_movsd_xmm_xmm(BUF(cg), 3, 2); EMIT(cg, pn);
+            pn = emit_subsd(BUF(cg), 3, 1); EMIT(cg, pn);
+
+            /* xmm4 = t = sum + y */
+            pn = emit_movsd_xmm_xmm(BUF(cg), 4, 0); EMIT(cg, pn);
+            pn = emit_addsd(BUF(cg), 4, 3); EMIT(cg, pn);
+
+            /* xmm1 = c = (t - sum) - y */
+            pn = emit_movsd_xmm_xmm(BUF(cg), 1, 4); EMIT(cg, pn);
+            pn = emit_subsd(BUF(cg), 1, 0); EMIT(cg, pn);
+            pn = emit_subsd(BUF(cg), 1, 3); EMIT(cg, pn);
+
+            /* xmm0 = sum = t */
+            pn = emit_movsd_xmm_xmm(BUF(cg), 0, 4); EMIT(cg, pn);
+
+            pn = emit_inc_reg(BUF(cg), REG_RSI); EMIT(cg, pn);
+            int32_t back = (int32_t)((int64_t)loop_top - (int64_t)(cg->code_size + 5));
+            pn = emit_jmp(BUF(cg), back); EMIT(cg, pn);
+            int32_t jae_off = (int32_t)(cg->code_size - (jae_done + 6));
+            memcpy(cg->code + jae_done + 2, &jae_off, 4);
+
+            /* movq rax, xmm0 */
+            b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x7E; b[4]=0xC0; EMIT(cg, 5);
+            return 1;
+        }
+
         if (strcmp(name, "arr_f64_dot") == 0 && argc == 2) {
             /* SSE2 dot product: sum(a[i]*b[i]) with MULSD+ADDSD */
             emit_expression(cg, node->children[2]); /* b */

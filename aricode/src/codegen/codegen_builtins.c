@@ -1411,11 +1411,35 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
         }
 
         /*
-         * print_float(x): Print f64 with 6 decimal places.
-         * Strategy: print integer part, ".", then fractional part.
-         * Uses the integer print_int mechanism for each part.
+         * print_float(x):        print f64 with 6 fractional digits.
+         * print_f64(x, digits):  same, but `digits` is a compile-time
+         *                        i32 literal in [1, 17].  17 gives
+         *                        round-trippable precision.
+         *
+         * Both paths share the body below; the second arg is stashed
+         * into `digits` at codegen time so the entire loop structure
+         * (digit count, scale factor, write length) is baked in.
          */
-        if (strcmp(name, "print_float") == 0 && argc == 1) {
+        if ((strcmp(name, "print_float") == 0 && argc == 1) ||
+            (strcmp(name, "print_f64")   == 0 && argc == 2)) {
+            int digits = 6;
+            if (argc == 2) {
+                ASTNode *dn = node->children[2];
+                if (dn->type != NODE_INT_LITERAL ||
+                    dn->int_val < 1 || dn->int_val > 17) {
+                    fprintf(stderr,
+                            "print_f64: `digits` must be an integer "
+                            "literal in [1, 17]\n");
+                    return 1;
+                }
+                digits = (int)dn->int_val;
+            }
+            /* Precompute scale = 10^digits as an f64 bit pattern.
+             * 10^17 fits exactly in an f64 mantissa, so no rounding. */
+            double scale = 1.0;
+            for (int k = 0; k < digits; k++) scale *= 10.0;
+            uint64_t scale_bits; memcpy(&scale_bits, &scale, 8);
+
             emit_expression(cg, node->children[1]); /* x -> RAX (f64 bits) */
             int pn; uint8_t *b;
 
@@ -1535,22 +1559,20 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             pn = emit_cvtsi2sd(BUF(cg), 1, REG_RCX); EMIT(cg, pn);
             /* subsd xmm0, xmm1 (fractional part) */
             pn = emit_subsd(BUF(cg), 0, 1); EMIT(cg, pn);
-            /* Load 1000000.0 into xmm1 */
-            pn = emit_mov_reg_imm32(BUF(cg), REG_RAX, 1000000); EMIT(cg, pn);
-            pn = emit_cvtsi2sd(BUF(cg), 1, REG_RAX); EMIT(cg, pn);
+            /* Load scale (10^digits) into xmm1 via RCX. */
+            pn = emit_mov_reg_imm64(BUF(cg), REG_RCX, scale_bits); EMIT(cg, pn);
+            b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xC9; EMIT(cg, 5);
             /* mulsd xmm0, xmm1 */
             pn = emit_mulsd(BUF(cg), 0, 1); EMIT(cg, pn);
-            /* cvttsd2si rax, xmm0 */
+            /* cvttsd2si rax, xmm0 — up to 17 digits fits in int64 */
             pn = emit_cvttsd2si(BUF(cg), REG_RAX, 0); EMIT(cg, pn);
 
-            /* Print 6 digits with leading zeros */
+            /* Allocate stack for `digits` fractional chars + newline,
+             * rounded up to the next 8-byte slot (max 24 for 17 digits). */
+            int scratch = (digits + 1 + 7) & ~7;
             pn = emit_sub_reg_imm(BUF(cg), REG_RSP, 8); EMIT(cg, pn);
-
-            /* Generate 6 digits right-to-left */
-            /* We'll store them at rsp[0..5] then write all 6 + newline */
-            pn = emit_sub_reg_imm(BUF(cg), REG_RSP, 8); EMIT(cg, pn);
-            int di;
-            for (di = 5; di >= 0; di--) {
+            pn = emit_sub_reg_imm(BUF(cg), REG_RSP, scratch); EMIT(cg, pn);
+            for (int di = digits - 1; di >= 0; di--) {
                 pn = emit_mov_reg_imm32(BUF(cg), REG_RCX, 10); EMIT(cg, pn);
                 pn = emit_xor_reg_reg(BUF(cg), REG_RDX, REG_RDX); EMIT(cg, pn);
                 b = BUF(cg); b[0]=rex(1,0,0,0); b[1]=0xF7; b[2]=modrm(3,6,REG_RCX);
@@ -1560,18 +1582,18 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
                 b = BUF(cg); b[0]=0x88; b[1]=modrm(1,REG_RDX,REG_RSP);
                 b[2]=0x24; b[3]=(uint8_t)di; EMIT(cg,4);
             }
-            /* Put newline at [rsp+6] */
+            /* Newline at [rsp + digits] */
             b = BUF(cg); b[0]=0xC6; b[1]=modrm(1,0,REG_RSP);
-            b[2]=0x24; b[3]=6; b[4]=0x0A; EMIT(cg,5);
+            b[2]=0x24; b[3]=(uint8_t)digits; b[4]=0x0A; EMIT(cg,5);
 
-            /* write(1, rsp, 7) -- 6 digits + newline */
+            /* write(1, rsp, digits + 1) */
             pn = emit_mov_reg_imm32(BUF(cg), REG_RAX, 1); EMIT(cg, pn);
             pn = emit_mov_reg_imm32(BUF(cg), REG_RDI, 1); EMIT(cg, pn);
             pn = emit_mov_reg_reg(BUF(cg), REG_RSI, REG_RSP); EMIT(cg, pn);
-            pn = emit_mov_reg_imm32(BUF(cg), REG_RDX, 7); EMIT(cg, pn);
+            pn = emit_mov_reg_imm32(BUF(cg), REG_RDX, digits + 1); EMIT(cg, pn);
             pn = emit_syscall(BUF(cg)); EMIT(cg, pn);
 
-            pn = emit_add_reg_imm(BUF(cg), REG_RSP, 16); EMIT(cg, pn);
+            pn = emit_add_reg_imm(BUF(cg), REG_RSP, scratch + 8); EMIT(cg, pn);
 
             /* Pop saved xmm0 bits */
             pn = emit_pop(BUF(cg), REG_RAX); EMIT(cg, pn);

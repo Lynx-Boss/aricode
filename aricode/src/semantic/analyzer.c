@@ -329,6 +329,7 @@ static AriType *builtin_return_type(const char *name) {
         {"mem_free",        TYPE_I32},
         /* void — print helpers (side-effect only) */
         {"print_dec",       TYPE_VOID},
+        {"print_f64",       TYPE_VOID},
         {"print_float",     TYPE_VOID},
         {"print_int",       TYPE_VOID},
         {"print_str",       TYPE_VOID},

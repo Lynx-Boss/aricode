@@ -54,6 +54,11 @@ typedef enum {
     NODE_NONE,              /* None                         */
     NODE_MEMBER_ACCESS,     /* error.raise, log.error       */
 
+    /* Structs */
+    NODE_STRUCT_DECL,       /* struct Name { field: type, ... }   */
+    NODE_STRUCT_INIT,       /* Name { x: val, y: val }            */
+    NODE_FIELD_ACCESS,      /* p.x  (reads/writes struct field)   */
+
     /* Types */
     NODE_TYPE_ANNOTATION,   /* : i32, : str, : Option<i32>  */
 

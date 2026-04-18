@@ -23,6 +23,7 @@ SRCS = \
 	$(LEXER_DIR)/lexer.c \
 	$(PARSER_DIR)/parser.c \
 	$(PARSER_DIR)/ast.c \
+	$(PARSER_DIR)/struct_registry.c \
 	$(ERRORS_DIR)/error_system.c \
 	$(ERRORS_DIR)/error_registry.c \
 	$(ERRORS_DIR)/podium.c \

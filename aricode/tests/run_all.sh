@@ -244,6 +244,31 @@ run_test "str_concat"     "/tmp/aritest_concat.ari" "" "Hello World!"
 run_test "sort"           "$EXAMPLES/sort.ari" "" "93"
 run_test "structs"        "$EXAMPLES/structs.ari" "" "25"
 
+cat > /tmp/aritest_struct_fc.ari << 'EOF'
+struct Point {
+    x: i32,
+    y: i32,
+}
+
+struct Rect {
+    w: i32,
+    h: i32,
+}
+
+fn main() -> i32 {
+    let p: Point = Point { x: 10, y: 20 };
+    print_int(p.x);
+    print_int(p.y);
+    p.x = 30;
+    print_int(p.x);
+
+    let r: Rect = Rect { w: 4, h: 5 };
+    print_int(r.w * r.h);
+    return 0;
+}
+EOF
+run_test "first_class_struct" "/tmp/aritest_struct_fc.ari" "" "20"
+
 # ── Error Handling ──
 echo -e "${BOLD}--- Error Handling ---${RESET}"
 run_test "try_catch"      "$EXAMPLES/error_handling.ari" "" "ERROR caught!"

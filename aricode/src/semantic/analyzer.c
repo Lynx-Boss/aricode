@@ -8,6 +8,7 @@
  */
 
 #include "analyzer.h"
+#include "../parser/struct_registry.h"
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -79,6 +80,11 @@ static AriType *resolve_type_annotation(Analyzer *a, ASTNode *node) {
 
     AriType *t = type_from_name(name);
     if (!t) {
+        /* Allow user-defined struct types: if it appears in the struct
+         * registry, treat it like an i32 (struct handle is a heap ptr). */
+        if (struct_registry_get(name)) {
+            return type_create(TYPE_I32);
+        }
         emit_error(a, ARI_LEVEL_LOGIC, ARI_L006_CODE, ARI_L006_FIX,
                    node->line, node->col,
                    "Unknown type '%s'", name);
@@ -507,6 +513,63 @@ static AriType *analyze_expr(Analyzer *a, ASTNode *node) {
         if (node->child_count > 0)
             type_free(analyze_expr(a, node->children[0]));
         return type_create(TYPE_UNKNOWN);
+    }
+
+    case NODE_STRUCT_INIT: {
+        /* Validate: all fields present, no unknown fields.
+         * Structs are represented as heap pointers (i32) at runtime. */
+        const char *sname = node->string_val;
+        const StructDef *sdef = struct_registry_get(sname);
+        if (!sdef) {
+            emit_error(a, ARI_LEVEL_LOGIC, ARI_L006_CODE, ARI_L006_FIX,
+                       node->line, node->col,
+                       "Unknown struct type '%s'", sname ? sname : "?");
+            return type_create(TYPE_I32);
+        }
+
+        /* Check each initializer field is known, and analyze its value. */
+        for (size_t i = 0; i < node->child_count; i++) {
+            ASTNode *fnode = node->children[i];
+            if (!fnode || !fnode->string_val) continue;
+            int idx = struct_registry_field_index(sname, fnode->string_val);
+            if (idx < 0) {
+                emit_error(a, ARI_LEVEL_LOGIC, ARI_L006_CODE, ARI_L006_FIX,
+                           fnode->line, fnode->col,
+                           "Struct '%s' has no field named '%s'",
+                           sname, fnode->string_val);
+            }
+            /* Analyze the value expression */
+            if (fnode->child_count > 0)
+                type_free(analyze_expr(a, fnode->children[0]));
+        }
+
+        /* Warn if not every declared field was initialized. */
+        for (size_t i = 0; i < sdef->field_count; i++) {
+            int found = 0;
+            for (size_t j = 0; j < node->child_count; j++) {
+                ASTNode *fn = node->children[j];
+                if (fn && fn->string_val && sdef->fields[i].name &&
+                    strcmp(fn->string_val, sdef->fields[i].name) == 0) {
+                    found = 1;
+                    break;
+                }
+            }
+            if (!found) {
+                emit_error(a, ARI_LEVEL_LOGIC, ARI_L006_CODE, ARI_L006_FIX,
+                           node->line, node->col,
+                           "Struct '%s' literal missing field '%s'",
+                           sname, sdef->fields[i].name);
+            }
+        }
+        return type_create(TYPE_I32);
+    }
+
+    case NODE_FIELD_ACCESS: {
+        /* Analyze the object; the result is (for now) always i32 at the
+         * semantic level because struct fields are i32 only. */
+        if (node->child_count > 0)
+            type_free(analyze_expr(a, node->children[0]));
+        return type_create(TYPE_I32);
     }
 
     default:
@@ -1042,6 +1105,11 @@ static void analyze_stmt(Analyzer *a, ASTNode *node) {
         /* Analyze the error expression */
         for (size_t i = 0; i < node->child_count; i++)
             type_free(analyze_expr(a, node->children[i]));
+        break;
+
+    case NODE_STRUCT_DECL:
+        /* Struct decls are registered at parse time; nothing to check
+         * at semantic level beyond what the parser already did. */
         break;
 
     default:

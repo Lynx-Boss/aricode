@@ -42,6 +42,7 @@
  */
 
 #include "parser.h"
+#include "struct_registry.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -372,10 +373,64 @@ static ASTNode *parse_primary(Parser *p) {
     return ast_create_node(NODE_IDENTIFIER, t->line, t->col);
 }
 
-/* --- Postfix: calls and member access ----------------------------- */
+/* --- Postfix: calls, struct init, field / member access ----------- */
+
+/*
+ * If the previous expression is a bare identifier naming a registered
+ * struct, and the next token is '{', parse a struct literal:
+ *     Name { field: value, field: value, ... }
+ *
+ * The AST node layout for NODE_STRUCT_INIT:
+ *   string_val = struct type name
+ *   children[i] (NODE_VAR_DECL) :
+ *       string_val = field name
+ *       children[0] = value expression
+ *
+ * Returns the new STRUCT_INIT node, or NULL if `expr` is not a struct
+ * name (caller should treat this as a regular identifier reference).
+ */
+static ASTNode *try_parse_struct_init(Parser *p, ASTNode *expr) {
+    if (!expr || expr->type != NODE_IDENTIFIER || !expr->string_val)
+        return NULL;
+    if (!struct_registry_get(expr->string_val))
+        return NULL;
+    if (!check(p, TOKEN_LBRACE))
+        return NULL;
+
+    advance(p); /* consume '{' */
+
+    ASTNode *init = ast_create_node(NODE_STRUCT_INIT, expr->line, expr->col);
+    init->string_val = str_dup(expr->string_val);
+
+    if (!check(p, TOKEN_RBRACE)) {
+        do {
+            const ParserToken *fname = expect(p, TOKEN_IDENTIFIER, "field name");
+            expect(p, TOKEN_COLON, "':' after field name");
+            ASTNode *val = parse_expression(p);
+
+            ASTNode *field = ast_create_node(NODE_VAR_DECL,
+                                             fname ? fname->line : expr->line,
+                                             fname ? fname->col  : expr->col);
+            field->string_val = fname ? str_dup(fname->lexeme) : str_dup("");
+            ast_add_child(field, val);
+            ast_add_child(init, field);
+        } while (match(p, TOKEN_COMMA) && !check(p, TOKEN_RBRACE));
+    }
+    expect(p, TOKEN_RBRACE, "'}' to close struct literal");
+
+    /* We no longer need the plain identifier node — free it. */
+    ast_free(expr);
+    return init;
+}
 
 static ASTNode *parse_call(Parser *p) {
     ASTNode *expr = parse_primary(p);
+
+    /* Struct literal: Name { x: 1, y: 2 } */
+    {
+        ASTNode *sinit = try_parse_struct_init(p, expr);
+        if (sinit) expr = sinit;
+    }
 
     for (;;) {
         if (match(p, TOKEN_LPAREN)) {
@@ -392,9 +447,21 @@ static ASTNode *parse_call(Parser *p) {
             expr = call;
 
         } else if (match(p, TOKEN_DOT)) {
-            /* Member access */
+            /* Dotted access:
+             *   - If followed by `identifier (` it is a namespaced call
+             *     (log.error, etc.) — represented via NODE_MEMBER_ACCESS.
+             *   - Otherwise, it is a struct field access — NODE_FIELD_ACCESS.
+             * Both nodes carry the member/field name in string_val and the
+             * object in children[0]. */
             const ParserToken *member = expect(p, TOKEN_IDENTIFIER, "member name after '.'");
-            ASTNode *access = ast_create_node(NODE_MEMBER_ACCESS,
+
+            NodeType access_type = NODE_FIELD_ACCESS;
+            /* Namespaced calls (e.g. log.error(...)) keep the legacy
+             * NODE_MEMBER_ACCESS node so existing codegen works. */
+            if (check(p, TOKEN_LPAREN))
+                access_type = NODE_MEMBER_ACCESS;
+
+            ASTNode *access = ast_create_node(access_type,
                                               expr->line, expr->col);
             ast_add_child(access, expr);
             access->string_val = member ? str_dup(member->lexeme) : str_dup("");
@@ -1051,6 +1118,72 @@ static ASTNode *parse_fn_declaration(Parser *p) {
     return fn;
 }
 
+/* --- Struct declaration ------------------------------------------- */
+
+/*
+ * struct Name {
+ *     field1: type1,
+ *     field2: type2,
+ * }
+ *
+ * AST layout for NODE_STRUCT_DECL:
+ *   string_val = struct name
+ *   children[i] = NODE_VAR_DECL  (field declaration)
+ *       string_val = field name
+ *       children[0] = NODE_TYPE_ANNOTATION
+ *
+ * The declaration is also registered in the global struct registry
+ * so that later expressions can recognise `Name { ... }` literals and
+ * `p.x` field accesses.
+ */
+static ASTNode *parse_struct_declaration(Parser *p) {
+    const ParserToken *kw = previous(p);           /* `struct` already eaten */
+    const ParserToken *name = expect(p, TOKEN_IDENTIFIER, "struct name");
+
+    ASTNode *node = ast_create_node(NODE_STRUCT_DECL, kw->line, kw->col);
+    node->string_val = name ? str_dup(name->lexeme) : str_dup("");
+
+    /* Register in the global registry BEFORE parsing the body so that
+     * the body can theoretically reference other structs (and so that
+     * duplicate names are caught early). */
+    if (name && name->lexeme) {
+        if (!struct_registry_add(name->lexeme)) {
+            parser_error(p, name->line, name->col,
+                         "duplicate struct declaration '%s'", name->lexeme);
+        }
+    }
+
+    expect(p, TOKEN_LBRACE, "'{' to open struct body");
+
+    while (!check(p, TOKEN_RBRACE) && !check(p, TOKEN_EOF)) {
+        const ParserToken *fname = expect(p, TOKEN_IDENTIFIER, "field name");
+        expect(p, TOKEN_COLON, "':' after field name");
+        ASTNode *ftype = parse_type(p);
+
+        ASTNode *field = ast_create_node(NODE_VAR_DECL,
+                                         fname ? fname->line : kw->line,
+                                         fname ? fname->col  : kw->col);
+        field->string_val = fname ? str_dup(fname->lexeme) : str_dup("");
+        ast_add_child(field, ftype);
+        ast_add_child(node, field);
+
+        /* Register field */
+        if (name && name->lexeme && fname && fname->lexeme) {
+            const char *tname = ftype->string_val ? ftype->string_val : "i32";
+            struct_registry_add_field(name->lexeme, fname->lexeme, tname);
+        }
+
+        /* Trailing comma optional */
+        if (!match(p, TOKEN_COMMA) && !check(p, TOKEN_RBRACE)) {
+            /* Accept semicolons too, defensively */
+            match(p, TOKEN_SEMICOLON);
+        }
+    }
+
+    expect(p, TOKEN_RBRACE, "'}' to close struct body");
+    return node;
+}
+
 /* --- Top-level declaration dispatcher ----------------------------- */
 
 static ASTNode *parse_declaration(Parser *p) {
@@ -1062,6 +1195,8 @@ static ASTNode *parse_declaration(Parser *p) {
         node = parse_var_declaration(p, false);
     } else if (match(p, TOKEN_CONST)) {
         node = parse_var_declaration(p, true);
+    } else if (match(p, TOKEN_STRUCT)) {
+        node = parse_struct_declaration(p);
     } else {
         node = parse_statement(p);
     }

@@ -40,6 +40,9 @@ static const char *_node_type_names[] = {
     [NODE_SOME]            = "SOME",
     [NODE_NONE]            = "NONE",
     [NODE_MEMBER_ACCESS]   = "MEMBER_ACCESS",
+    [NODE_STRUCT_DECL]     = "STRUCT_DECL",
+    [NODE_STRUCT_INIT]     = "STRUCT_INIT",
+    [NODE_FIELD_ACCESS]    = "FIELD_ACCESS",
     [NODE_TYPE_ANNOTATION] = "TYPE_ANNOTATION",
 };
 
@@ -134,6 +137,15 @@ void ast_print(const ASTNode *node, int indent) {
     case NODE_MEMBER_ACCESS:
         if (node->string_val)
             printf(" member='%s'", node->string_val);
+        break;
+    case NODE_STRUCT_DECL:
+    case NODE_STRUCT_INIT:
+        if (node->string_val)
+            printf(" struct='%s'", node->string_val);
+        break;
+    case NODE_FIELD_ACCESS:
+        if (node->string_val)
+            printf(" field='%s'", node->string_val);
         break;
     case NODE_ERROR_RAISE:
         if (node->string_val)

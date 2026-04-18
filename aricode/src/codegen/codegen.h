@@ -41,6 +41,8 @@ typedef struct {
     const char *name;      /* variable name (borrowed from AST)       */
     int32_t     rbp_off;   /* offset from RBP (negative = locals)     */
     int         is_float;  /* 1 if f64/f32, 0 if integer/bool        */
+    const char *struct_type; /* if not NULL, this variable is a struct
+                              * (borrowed name of the struct type) */
 } LocalVar;
 
 typedef struct {

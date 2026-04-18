@@ -23,6 +23,7 @@
 #include "codegen_builtins.h"
 #include "optimizer.h"
 #include "x86_64.h"
+#include "../parser/struct_registry.h"
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -155,10 +156,227 @@ LocalVar *add_local(CodegenState *cg, const char *name) {
     }
     cg->stack_offset -= 8; /* each local takes 8 bytes */
     LocalVar *v = &cg->locals[cg->local_count++];
-    v->name     = name;
-    v->rbp_off  = cg->stack_offset;
-    v->is_float = 0;  /* default to integer — set to 1 by caller if f64 */
+    v->name        = name;
+    v->rbp_off     = cg->stack_offset;
+    v->is_float    = 0;  /* default to integer — set to 1 by caller if f64 */
+    v->struct_type = NULL;
     return v;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Struct support helpers                                             */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Make a synthetic NODE_CALL to a builtin (e.g. arr_new, arr_set,
+ * arr_get).  Children must be appended by the caller.  The returned
+ * node owns all freshly-allocated strings so ast_free() works safely.
+ */
+static ASTNode *make_builtin_call(const char *fn_name, int line, int col) {
+    ASTNode *call = ast_create_node(NODE_CALL, line, col);
+    ASTNode *callee = ast_create_node(NODE_IDENTIFIER, line, col);
+    size_t n = strlen(fn_name);
+    callee->string_val = (char *)malloc(n + 1);
+    memcpy(callee->string_val, fn_name, n + 1);
+    ast_add_child(call, callee);
+    return call;
+}
+
+static ASTNode *make_int_literal(int64_t val, int line, int col) {
+    ASTNode *n = ast_create_node(NODE_INT_LITERAL, line, col);
+    n->int_val = val;
+    return n;
+}
+
+static ASTNode *make_identifier_node(const char *name, int line, int col) {
+    ASTNode *n = ast_create_node(NODE_IDENTIFIER, line, col);
+    size_t len = strlen(name);
+    n->string_val = (char *)malloc(len + 1);
+    memcpy(n->string_val, name, len + 1);
+    return n;
+}
+
+/*
+ * Determine the struct type of `expr` if it denotes a struct value.
+ * Only plain identifiers referencing declared struct-typed locals are
+ * supported (no nested structs, no struct-returning calls).
+ */
+static const char *expr_struct_type(CodegenState *cg, const ASTNode *expr) {
+    if (!expr) return NULL;
+    if (expr->type == NODE_IDENTIFIER && expr->string_val) {
+        LocalVar *v = find_local(cg, expr->string_val);
+        if (v && v->struct_type) return v->struct_type;
+    }
+    if (expr->type == NODE_STRUCT_INIT && expr->string_val) {
+        return expr->string_val;
+    }
+    return NULL;
+}
+
+/*
+ * Emit a NODE_STRUCT_INIT expression.  Leaves the heap pointer to the
+ * newly-allocated struct in RAX.
+ */
+static void emit_struct_init(CodegenState *cg, const ASTNode *node) {
+    const char *sname = node->string_val;
+    const StructDef *sdef = sname ? struct_registry_get(sname) : NULL;
+    if (!sdef) {
+        cg_error(cg, "unknown struct '%s' at %d:%d",
+                 sname ? sname : "?", node->line, node->col);
+        return;
+    }
+
+    /* 1. Allocate: call arr_new(field_count). */
+    ASTNode *alloc = make_builtin_call("arr_new", node->line, node->col);
+    ast_add_child(alloc, make_int_literal((int64_t)sdef->field_count,
+                                          node->line, node->col));
+    emit_expression(cg, alloc);
+    ast_free(alloc);
+
+    /* 2. Reserve a hidden temp local to hold the allocated pointer
+     * across the field-assignment calls (each call trashes RAX). */
+    static int tmp_counter = 0;
+    char tmp_name[48];
+    snprintf(tmp_name, sizeof(tmp_name), "__struct_tmp_%d", tmp_counter++);
+    /* We must give add_local a string that lives as long as the function.
+     * The simplest way is to malloc and deliberately leak it — the code
+     * buffer only lives for one compilation and there are very few
+     * struct literals per program. */
+    char *persistent = (char *)malloc(strlen(tmp_name) + 1);
+    strcpy(persistent, tmp_name);
+
+    LocalVar *tmp = add_local(cg, persistent);
+    if (!tmp) return;
+    tmp->struct_type = sdef->name;
+
+    /* Store RAX into the temp slot. */
+    int n = emit_mov_mem_reg(BUF(cg), REG_RBP, tmp->rbp_off, REG_RAX);
+    EMIT(cg, n);
+
+    /* 3. For each field initializer, emit arr_set(tmp, field_idx, val). */
+    for (size_t i = 0; i < node->child_count; i++) {
+        const ASTNode *fnode = node->children[i];
+        if (!fnode || !fnode->string_val || fnode->child_count < 1) continue;
+
+        int idx = struct_registry_field_index(sname, fnode->string_val);
+        if (idx < 0) {
+            cg_error(cg, "struct '%s' has no field '%s' at %d:%d",
+                     sname, fnode->string_val, fnode->line, fnode->col);
+            return;
+        }
+
+        ASTNode *setcall = make_builtin_call("arr_set",
+                                             fnode->line, fnode->col);
+        ast_add_child(setcall, make_identifier_node(persistent,
+                                                    fnode->line, fnode->col));
+        ast_add_child(setcall, make_int_literal(idx,
+                                                fnode->line, fnode->col));
+        /* Reuse the original value expression: deep-copy it since
+         * the synthetic tree will be ast_free()'d and we don't want to
+         * double-free the original. */
+        ASTNode *val = fnode->children[0];
+        /* Do NOT transfer ownership — emit_expression just reads it.
+         * We attach the original pointer but must detach before free. */
+        ast_add_child(setcall, val);
+        emit_expression(cg, setcall);
+
+        /* Detach val from setcall before freeing so that ast_free on
+         * the synthetic call doesn't free the original value subtree. */
+        setcall->children[setcall->child_count - 1] = NULL;
+        /* ast_add_child doesn't decrement count on NULL, so just free. */
+        setcall->child_count--; /* remove NULL slot */
+        ast_free(setcall);
+    }
+
+    /* 4. Result: load temp back into RAX. */
+    n = emit_mov_reg_mem(BUF(cg), REG_RAX, REG_RBP, tmp->rbp_off);
+    EMIT(cg, n);
+}
+
+/*
+ * Free a synthetic AST call created in codegen, but NULL out the child
+ * at `borrowed_index` first so that ast_free() doesn't traverse into a
+ * borrowed subtree we don't own.  ast_free() tolerates NULL children.
+ */
+static void free_synthetic_call(ASTNode *call, int borrowed_index) {
+    if (!call) return;
+    if (borrowed_index >= 0 && (size_t)borrowed_index < call->child_count)
+        call->children[borrowed_index] = NULL;
+    ast_free(call);
+}
+
+/*
+ * Emit a NODE_FIELD_ACCESS read: lowers to arr_get(obj, field_idx).
+ * Leaves the field value in RAX.
+ */
+static void emit_field_access(CodegenState *cg, const ASTNode *node) {
+    if (node->child_count < 1 || !node->string_val) {
+        cg_error(cg, "malformed field access at %d:%d",
+                 node->line, node->col);
+        return;
+    }
+
+    const ASTNode *obj = node->children[0];
+    const char *sname = expr_struct_type(cg, obj);
+    if (!sname) {
+        cg_error(cg, "field access '.%s' on non-struct value at %d:%d",
+                 node->string_val, node->line, node->col);
+        return;
+    }
+
+    int idx = struct_registry_field_index(sname, node->string_val);
+    if (idx < 0) {
+        cg_error(cg, "struct '%s' has no field '%s' at %d:%d",
+                 sname, node->string_val, node->line, node->col);
+        return;
+    }
+
+    /* Synthetic: arr_get(obj, idx).  The `obj` subtree is borrowed. */
+    ASTNode *call = make_builtin_call("arr_get", node->line, node->col);
+    ast_add_child(call, (ASTNode *)obj);                                /* idx 1 */
+    ast_add_child(call, make_int_literal(idx, node->line, node->col)); /* idx 2 */
+    emit_expression(cg, call);
+    free_synthetic_call(call, 1);
+}
+
+/*
+ * Emit a NODE_FIELD_ACCESS assignment: lowers to arr_set(obj, idx, val).
+ */
+static void emit_field_assignment(CodegenState *cg,
+                                   const ASTNode *lhs,
+                                   ASTNode *rhs) {
+    if (!lhs || lhs->type != NODE_FIELD_ACCESS ||
+        lhs->child_count < 1 || !lhs->string_val) {
+        cg_error(cg, "malformed field assignment at %d:%d",
+                 lhs ? lhs->line : 0, lhs ? lhs->col : 0);
+        return;
+    }
+    const ASTNode *obj = lhs->children[0];
+    const char *sname = expr_struct_type(cg, obj);
+    if (!sname) {
+        cg_error(cg, "field assignment '.%s' on non-struct value at %d:%d",
+                 lhs->string_val, lhs->line, lhs->col);
+        return;
+    }
+
+    int idx = struct_registry_field_index(sname, lhs->string_val);
+    if (idx < 0) {
+        cg_error(cg, "struct '%s' has no field '%s' at %d:%d",
+                 sname, lhs->string_val, lhs->line, lhs->col);
+        return;
+    }
+
+    /* Synthetic: arr_set(obj, idx, rhs).  obj and rhs are borrowed. */
+    ASTNode *call = make_builtin_call("arr_set", lhs->line, lhs->col);
+    ast_add_child(call, (ASTNode *)obj);                              /* idx 1 */
+    ast_add_child(call, make_int_literal(idx, lhs->line, lhs->col)); /* idx 2 */
+    ast_add_child(call, rhs);                                         /* idx 3 */
+    emit_expression(cg, call);
+
+    /* Null out both borrowed slots before freeing. */
+    if (call->child_count > 3) call->children[3] = NULL;
+    if (call->child_count > 1) call->children[1] = NULL;
+    ast_free(call);
 }
 
 /* ------------------------------------------------------------------ */
@@ -1176,6 +1394,12 @@ int emit_expression(CodegenState *cg, const ASTNode *node) {
         /* Ternary expression: if used as expression, result in RAX */
         emit_if(cg, node);
         return 0;
+    case NODE_STRUCT_INIT:
+        emit_struct_init(cg, node);
+        return 0;
+    case NODE_FIELD_ACCESS:
+        emit_field_access(cg, node);
+        return 0;
     default:
         cg_error(cg, "unsupported expression node type %s at %d:%d",
                  node_type_name(node->type), node->line, node->col);
@@ -1266,13 +1490,18 @@ static void emit_var_decl(CodegenState *cg, const ASTNode *node) {
     LocalVar *v = add_local(cg, node->string_val);
     if (!v) return;
 
-    /* Check type annotation for float */
+    /* Check type annotation for float or struct */
     if (node->child_count >= 1 && node->children[0] &&
         node->children[0]->type == NODE_TYPE_ANNOTATION &&
         node->children[0]->string_val) {
         const char *tname = node->children[0]->string_val;
         if (strcmp(tname, "f64") == 0 || strcmp(tname, "f32") == 0) {
             v->is_float = 1;
+        }
+        /* Struct-typed variable: record the type so field access works. */
+        const StructDef *sdef = struct_registry_get(tname);
+        if (sdef) {
+            v->struct_type = sdef->name;
         }
     }
 
@@ -1483,6 +1712,13 @@ static void emit_assignment(CodegenState *cg, const ASTNode *node) {
     }
 
     ASTNode *lhs = node->children[0];
+
+    /* Struct field assignment: lower to arr_set. */
+    if (lhs->type == NODE_FIELD_ACCESS) {
+        emit_field_assignment(cg, lhs, node->children[1]);
+        return;
+    }
+
     if (lhs->type != NODE_IDENTIFIER || !lhs->string_val) {
         cg_error(cg, "left side of assignment must be a variable at %d:%d",
                  node->line, node->col);
@@ -1911,12 +2147,17 @@ static void emit_function(CodegenState *cg, const ASTNode *node) {
         LocalVar *v = add_local(cg, param->string_val);
         if (!v) return;
 
-        /* Check if parameter is float type */
+        /* Check if parameter is float type or a struct type */
         if (param->child_count > 0 && param->children[0] &&
-            param->children[0]->string_val &&
-            (strcmp(param->children[0]->string_val, "f64") == 0 ||
-             strcmp(param->children[0]->string_val, "f32") == 0)) {
-            v->is_float = 1;
+            param->children[0]->string_val) {
+            const char *ptname = param->children[0]->string_val;
+            if (strcmp(ptname, "f64") == 0 || strcmp(ptname, "f32") == 0) {
+                v->is_float = 1;
+            }
+            const StructDef *psdef = struct_registry_get(ptname);
+            if (psdef) {
+                v->struct_type = psdef->name;
+            }
         }
 
         /* Store from GPR — f64 bits are carried in the integer register */

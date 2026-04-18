@@ -1896,6 +1896,29 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             return 1;
         }
 
+        if (strcmp(name, "byte_at") == 0 && argc == 2) {
+            /* byte_at(ptr, offset) → unsigned byte at ptr[offset].
+             *
+             * Unchecked — caller owns bounds.  Primary use: byte-level
+             * access into file_read buffers where the underlying array
+             * length (in i64 slots) is 8x smaller than the byte count,
+             * so str_char_at's bounds check trips too early.
+             *
+             *   movzx rax, byte [rax + rcx] */
+            emit_expression(cg, node->children[2]);          /* offset */
+            int pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
+            emit_expression(cg, node->children[1]);          /* ptr */
+            pn = emit_pop(BUF(cg), REG_RCX); EMIT(cg, pn);
+
+            uint8_t *b = BUF(cg);
+            b[0] = rex(1, reg_ext(REG_RAX), reg_ext(REG_RCX), reg_ext(REG_RAX));
+            b[1] = 0x0F; b[2] = 0xB6;
+            b[3] = modrm(0, REG_RAX & 7, 4);                 /* SIB */
+            b[4] = (uint8_t)((0 << 6) | ((REG_RCX & 7) << 3) | (REG_RAX & 7));
+            EMIT(cg, 5);
+            return 1;
+        }
+
         if (strcmp(name, "str_println") == 0 && argc == 1) {
             /* Print heap string + newline */
             emit_expression(cg, node->children[1]); /* base -> RAX */

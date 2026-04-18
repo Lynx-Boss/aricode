@@ -323,6 +323,8 @@ static AriType *builtin_return_type(const char *name) {
         {"float_to_int",    TYPE_I32},
         /* f64 — conversion */
         {"int_to_float",    TYPE_F64},
+        /* i32 — byte-level access */
+        {"byte_at",         TYPE_I32},
         /* i32 — network */
         {"ip4",             TYPE_I32},
         /* i32 — memory */

@@ -82,53 +82,151 @@ static void emit_fma_add(CodegenState *cg, int dst, int src1, int src2) {
     EMIT(cg, 5);
 }
 
-static void emit_sin_poly_sse2(CodegenState *cg) {
-    uint8_t *b;
-
-    /* xmm1 = y = x*x */
-    b = BUF(cg); b[0]=0x66; b[1]=0x0F; b[2]=0x28; b[3]=0xC8; EMIT(cg, 4);  /* movapd xmm1, xmm0 */
-    b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x59; b[3]=0xC9; EMIT(cg, 4);  /* mulsd  xmm1, xmm1 */
-
-    /* Seed accumulator with S5.  xmm2 = S5. */
-    int pn = emit_mov_reg_imm64(BUF(cg), REG_RCX, 0xBE5AE5E68A2B9CEBULL); EMIT(cg, pn);
-    b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xD1; EMIT(cg, 5);
-
-    /* Horner steps via FMA3: xmm2 = xmm2·y + Sk for k = 4..1.
-     * Critical path 4 steps × 4c = 16c (vs 4 × 6c = 24c without FMA). */
-    emit_fma_horner_step(cg, 2, 1, 3, 0x3EC71DE357B1FE7DULL);  /* + S4 */
-    emit_fma_horner_step(cg, 2, 1, 3, 0xBF2A01A019C161D5ULL);  /* + S3 */
-    emit_fma_horner_step(cg, 2, 1, 3, 0x3F8111111110F8A6ULL);  /* + S2 */
-    emit_fma_horner_step(cg, 2, 1, 3, 0xBFC5555555555549ULL);  /* + S1 */
-
-    /* Final: sin(x) = x + x³ · poly_tail.
-     *   xmm3 = x³ = x · y
-     *   xmm0 += xmm3 · xmm2      (vfmadd231sd) */
-    b = BUF(cg); b[0]=0x66; b[1]=0x0F; b[2]=0x28; b[3]=0xD8; EMIT(cg, 4);  /* movapd xmm3, xmm0 */
-    b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x59; b[3]=0xD9; EMIT(cg, 4);  /* mulsd  xmm3, xmm1 */
-    emit_fma_add(cg, 0, 3, 2);                                             /* xmm0 += xmm3·xmm2 */
+/* vfmadd213sd dst, src1, src2  →  dst = dst·src1 + src2.
+ * Used inside Estrin's scheme to build parallel "pair = Ck·y + Ck-1"
+ * accumulators from existing register values (no constant load). */
+static void emit_fma213_reg(CodegenState *cg, int dst, int src1, int src2) {
+    uint8_t *b = BUF(cg);
+    b[0] = 0xC4;
+    b[1] = 0xE2;
+    b[2] = 0x81 | ((~src1 & 0xF) << 3);
+    b[3] = 0xA9;                                 /* 213 form opcode */
+    b[4] = 0xC0 | ((dst & 7) << 3) | (src2 & 7);
+    EMIT(cg, 5);
 }
 
+/* Load a 64-bit immediate (IEEE 754 double bits) into xmm_dst via RCX.
+ *   mov rcx, imm64            (10 B)
+ *   movq xmm_dst, rcx         ( 5 B)
+ * The current codegen has no rodata-pool infrastructure, so we stay
+ * with the imm64 path — costs a few more bytes than `movsd xmm, [rip]`
+ * but keeps the emitter self-contained.
+ */
+static void emit_load_f64(CodegenState *cg, int xmm, uint64_t bits) {
+    int pn; uint8_t *b;
+    pn = emit_mov_reg_imm64(BUF(cg), REG_RCX, bits); EMIT(cg, pn);
+    b = BUF(cg);
+    b[0] = 0x66; b[1] = 0x48; b[2] = 0x0F; b[3] = 0x6E;
+    b[4] = 0xC0 | ((xmm & 7) << 3) | (REG_RCX & 7);   /* movq xmm, rcx */
+    EMIT(cg, 5);
+}
+
+/* movapd xmm_dst, xmm_src  — zero-latency register copy (renamed). */
+static void emit_mov_xmm(CodegenState *cg, int dst, int src) {
+    uint8_t *b = BUF(cg);
+    b[0] = 0x66; b[1] = 0x0F; b[2] = 0x28;
+    b[3] = 0xC0 | ((dst & 7) << 3) | (src & 7);
+    EMIT(cg, 4);
+}
+
+/* mulsd xmm_dst, xmm_src  —  dst = dst · src. */
+static void cg_mulsd(CodegenState *cg, int dst, int src) {
+    uint8_t *b = BUF(cg);
+    b[0] = 0xF2; b[1] = 0x0F; b[2] = 0x59;
+    b[3] = 0xC0 | ((dst & 7) << 3) | (src & 7);
+    EMIT(cg, 4);
+}
+
+/*
+ * Estrin's scheme — splits a serial Horner chain into parallel
+ * sub-chains that can dispatch to the two FMA pipes on Zen 3 simultaneously.
+ *
+ * For P(y) = S1 + S2·y + S3·y² + S4·y³ + S5·y⁴  (our sin tail):
+ *   Level 1  (parallel):
+ *     A  = S2·y + S1
+ *     B  = S4·y + S3
+ *     y² = y·y
+ *   Level 2:
+ *     Lower = A + y²·B          (covers S1..S4)
+ *     y⁴    = y²·y²              (parallel)
+ *   Level 3:
+ *     P = Lower + y⁴·S5          (adds the tail S5)
+ *
+ * Critical path: 3 dependent FMAs ≈ 12c, versus serial Horner's 4 × 4c
+ * = 16c.  The asymmetric split (A/B plus a standalone S5) is only
+ * mildly suboptimal for n=5; log2(5) ≈ 2.3.
+ *
+ * Register convention for sin/cos:
+ *   xmm0: x (preserved for the outer x + x³·P recombination)
+ *   xmm1: y = x²                 (kept across the poly)
+ *   xmm2: A → Lower → P          (the running accumulator)
+ *   xmm3: B then x³              (reused after B is consumed)
+ *   xmm4: y²
+ *   xmm5: y⁴
+ *   xmm6: scratch for coefficient loads
+ */
+static void emit_sin_poly_sse2(CodegenState *cg) {
+    /* xmm1 = y = x·x */
+    emit_mov_xmm(cg, 1, 0);
+    cg_mulsd    (cg, 1, 1);
+
+    /* ── Level 1: three operations in parallel ─────────────────────── */
+    /* xmm2 = S2·y + S1 */
+    emit_load_f64   (cg, 2, 0x3F8111111110F8A6ULL);  /* S2 */
+    emit_load_f64   (cg, 6, 0xBFC5555555555549ULL);  /* S1 */
+    emit_fma213_reg (cg, 2, 1, 6);                   /* xmm2 = xmm2·y + xmm6 */
+
+    /* xmm3 = S4·y + S3 */
+    emit_load_f64   (cg, 3, 0x3EC71DE357B1FE7DULL);  /* S4 */
+    emit_load_f64   (cg, 6, 0xBF2A01A019C161D5ULL);  /* S3 */
+    emit_fma213_reg (cg, 3, 1, 6);                   /* xmm3 = xmm3·y + xmm6 */
+
+    /* xmm4 = y² */
+    emit_mov_xmm (cg, 4, 1);
+    cg_mulsd     (cg, 4, 1);
+
+    /* ── Level 2: xmm2 += y²·B  (Lower = A + y²·B) ─────────────────── */
+    emit_fma_add (cg, 2, 4, 3);                      /* xmm2 += xmm4·xmm3 */
+
+    /* xmm5 = y²·y² = y⁴ */
+    emit_mov_xmm (cg, 5, 4);
+    cg_mulsd     (cg, 5, 4);
+
+    /* ── Level 3: xmm2 += y⁴·S5  (P = Lower + y⁴·S5) ───────────────── */
+    emit_load_f64 (cg, 6, 0xBE5AE5E68A2B9CEBULL);    /* S5 */
+    emit_fma_add  (cg, 2, 5, 6);                     /* xmm2 += xmm5·xmm6 */
+
+    /* ── Final: sin(x) = x + x³·P ──────────────────────────────────── */
+    /* xmm3 = x·y = x³  (xmm3 is free — B was consumed in Level 2) */
+    emit_mov_xmm (cg, 3, 0);
+    cg_mulsd     (cg, 3, 1);
+    emit_fma_add (cg, 0, 3, 2);                      /* xmm0 += xmm3·xmm2 */
+}
+
+/*
+ * Estrin for the cos tail C(y) = C1 + C2·y + C3·y² + C4·y³ + C5·y⁴
+ * with the usual cos(x) = 1 + y · C(y) recombination.  Same shape as
+ * sin_poly but the coefficients start at C1 (no "S1" odd term).
+ */
 static void emit_cos_poly_sse2(CodegenState *cg) {
-    uint8_t *b;
+    /* xmm1 = y = x·x */
+    emit_mov_xmm(cg, 1, 0);
+    cg_mulsd    (cg, 1, 1);
 
-    /* xmm1 = y = x*x */
-    b = BUF(cg); b[0]=0x66; b[1]=0x0F; b[2]=0x28; b[3]=0xC8; EMIT(cg, 4);
-    b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x59; b[3]=0xC9; EMIT(cg, 4);
+    /* Level 1 */
+    emit_load_f64   (cg, 2, 0x3FA555555555554CULL);  /* C2 */
+    emit_load_f64   (cg, 6, 0xBFE0000000000000ULL);  /* C1 = -1/2 */
+    emit_fma213_reg (cg, 2, 1, 6);                   /* xmm2 = C2·y + C1 = A */
 
-    /* Seed with C5. */
-    int pn = emit_mov_reg_imm64(BUF(cg), REG_RCX, 0xBE927E4F809C52ADULL); EMIT(cg, pn);
-    b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xD1; EMIT(cg, 5);
+    emit_load_f64   (cg, 3, 0x3EFA01A019CB1590ULL);  /* C4 */
+    emit_load_f64   (cg, 6, 0xBF56C16C16C15177ULL);  /* C3 */
+    emit_fma213_reg (cg, 3, 1, 6);                   /* xmm3 = C4·y + C3 = B */
 
-    emit_fma_horner_step(cg, 2, 1, 3, 0x3EFA01A019CB1590ULL);  /* + C4 */
-    emit_fma_horner_step(cg, 2, 1, 3, 0xBF56C16C16C15177ULL);  /* + C3 */
-    emit_fma_horner_step(cg, 2, 1, 3, 0x3FA555555555554CULL);  /* + C2 */
-    emit_fma_horner_step(cg, 2, 1, 3, 0xBFE0000000000000ULL);  /* + C1 = -1/2 */
+    emit_mov_xmm (cg, 4, 1);
+    cg_mulsd     (cg, 4, 1);                         /* xmm4 = y² */
 
-    /* cos(x) = 1 + x² · poly_tail.  Seed xmm0 with 1.0 and FMA in
-     * xmm1·xmm2  (vfmadd231sd). */
-    pn = emit_mov_reg_imm64(BUF(cg), REG_RCX, 0x3FF0000000000000ULL); EMIT(cg, pn);
-    b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xC1; EMIT(cg, 5);  /* movq xmm0, rcx */
-    emit_fma_add(cg, 0, 1, 2);                                                         /* xmm0 += xmm1·xmm2 */
+    /* Level 2 */
+    emit_fma_add (cg, 2, 4, 3);                      /* xmm2 = A + y²·B */
+    emit_mov_xmm (cg, 5, 4);
+    cg_mulsd     (cg, 5, 4);                         /* xmm5 = y⁴ */
+
+    /* Level 3 */
+    emit_load_f64 (cg, 6, 0xBE927E4F809C52ADULL);    /* C5 */
+    emit_fma_add  (cg, 2, 5, 6);                     /* xmm2 = Lower + y⁴·C5 = C(y) */
+
+    /* Final: cos(x) = 1 + y·C(y).  Seed xmm0 with 1.0 and FMA. */
+    emit_load_f64 (cg, 0, 0x3FF0000000000000ULL);
+    emit_fma_add  (cg, 0, 1, 2);                     /* xmm0 += y·xmm2 */
 }
 
 /* =====================================================================
@@ -1848,33 +1946,61 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
                 b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x5C; b[3]=0xC2; EMIT(cg, 4);
                 /* xmm0 = r, xmm1 = k */
 
-                /* === Step 3: Horner evaluation of Taylor series (FMA3) ===
-                 * exp(r) = 1 + r*(1 + r*(1/2 + r*(1/6 + r*(1/24 + r*(1/120
-                 *   + r*(1/720 + r*(1/5040 + r*(1/40320 + r/362880))))))))
-                 * Seed with C8 = 1/362880, then 9 FMA3 Horner steps down
-                 * to C0 = 1.0.  Critical path 9 × 4c = 36c (was 9 × 6c = 54c). */
+                /* === Step 3: Estrin evaluation of Taylor series (FMA3) ===
+                 * P(r) = C0 + C1·r + C2·r² + C3·r³ + … + C8·r⁸
+                 *   Ck = 1/(k+1)!   (since exp(r) = 1 + r·P(r))
+                 *
+                 *   L1: A = C1·r+C0   B = C3·r+C2   C = C5·r+C4   D = C7·r+C6
+                 *       r² = r·r                                 (all parallel)
+                 *   L2: AB = A + r²·B       CD = C + r²·D        (parallel)
+                 *       r⁴ = r²·r²
+                 *   L3: ABCD = AB + r⁴·CD
+                 *       r⁸ = r⁴·r⁴
+                 *   L4: P = ABCD + r⁸·C8
+                 *
+                 * Critical path: 4 dependent FMAs ≈ 16c (was Horner 9 × 4c = 36c).
+                 * Registers: xmm0=r, xmm1=k, xmm2=A→AB→ABCD→P,
+                 *   xmm3=B, xmm4=C→CD, xmm5=D, xmm6=r²/scratch, xmm7=r⁴→r⁸.
+                 */
 
-                /* Seed xmm2 with C8 = 1/362880 */
-                pn = emit_mov_reg_imm64(BUF(cg), REG_RCX, 0x3EC71DE3A556C734ULL); EMIT(cg, pn);
-                b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xD1; EMIT(cg, 5);
+                /* ── Level 1: four parallel pairs + r² ──────────────── */
+                emit_load_f64   (cg, 2, 0x3FE0000000000000ULL);  /* C1 = 1/2 */
+                emit_load_f64   (cg, 6, 0x3FF0000000000000ULL);  /* C0 = 1   */
+                emit_fma213_reg (cg, 2, 0, 6);                   /* A = C1·r + C0 */
 
-                emit_fma_horner_step(cg, 2, 0, 3, 0x3EFA01A01A01A01AULL);  /* + C7 = 1/40320  */
-                emit_fma_horner_step(cg, 2, 0, 3, 0x3F2A01A01A01A01AULL);  /* + C6 = 1/5040   */
-                emit_fma_horner_step(cg, 2, 0, 3, 0x3F56C16C16C16C17ULL);  /* + C5 = 1/720    */
-                emit_fma_horner_step(cg, 2, 0, 3, 0x3F81111111111111ULL);  /* + C4 = 1/120    */
-                emit_fma_horner_step(cg, 2, 0, 3, 0x3FA5555555555555ULL);  /* + C3 = 1/24     */
-                emit_fma_horner_step(cg, 2, 0, 3, 0x3FC5555555555555ULL);  /* + C2 = 1/6      */
-                emit_fma_horner_step(cg, 2, 0, 3, 0x3FE0000000000000ULL);  /* + C1 = 1/2      */
-                emit_fma_horner_step(cg, 2, 0, 3, 0x3FF0000000000000ULL);  /* + C0 = 1.0      */
+                emit_load_f64   (cg, 3, 0x3FA5555555555555ULL);  /* C3 = 1/24  */
+                emit_load_f64   (cg, 6, 0x3FC5555555555555ULL);  /* C2 = 1/6   */
+                emit_fma213_reg (cg, 3, 0, 6);                   /* B = C3·r + C2 */
 
-                /* Final: exp(r) = 1 + r·xmm2.  Seed xmm3=1.0 and
-                 * FMA r·xmm2 into it → xmm3. */
-                pn = emit_mov_reg_imm64(BUF(cg), REG_RCX, 0x3FF0000000000000ULL); EMIT(cg, pn);
-                b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xD9; EMIT(cg, 5);  /* movq xmm3, rcx */
-                emit_fma_add(cg, 3, 0, 2);                                                       /* xmm3 += xmm0·xmm2 */
-                /* Move result back into xmm2 for step 4. */
-                b = BUF(cg); b[0]=0x66; b[1]=0x0F; b[2]=0x28; b[3]=0xD3; EMIT(cg, 4);  /* movapd xmm2, xmm3 */
-                /* xmm2 = exp(r) */
+                emit_load_f64   (cg, 4, 0x3F56C16C16C16C17ULL);  /* C5 = 1/720 */
+                emit_load_f64   (cg, 6, 0x3F81111111111111ULL);  /* C4 = 1/120 */
+                emit_fma213_reg (cg, 4, 0, 6);                   /* C = C5·r + C4 */
+
+                emit_load_f64   (cg, 5, 0x3EFA01A01A01A01AULL);  /* C7 = 1/40320 */
+                emit_load_f64   (cg, 6, 0x3F2A01A01A01A01AULL);  /* C6 = 1/5040  */
+                emit_fma213_reg (cg, 5, 0, 6);                   /* D = C7·r + C6 */
+
+                emit_mov_xmm (cg, 6, 0);
+                cg_mulsd     (cg, 6, 0);                         /* xmm6 = r² */
+
+                /* ── Level 2: AB, CD, r⁴ ────────────────────────────── */
+                emit_fma_add (cg, 2, 6, 3);                      /* xmm2 = A + r²·B */
+                emit_fma_add (cg, 4, 6, 5);                      /* xmm4 = C + r²·D */
+                emit_mov_xmm (cg, 7, 6);
+                cg_mulsd     (cg, 7, 6);                         /* xmm7 = r⁴ */
+
+                /* ── Level 3: ABCD, r⁸ ──────────────────────────────── */
+                emit_fma_add (cg, 2, 7, 4);                      /* xmm2 = AB + r⁴·CD */
+                cg_mulsd     (cg, 7, 7);                         /* xmm7 = r⁸ */
+
+                /* ── Level 4: P = ABCD + r⁸·C8 ──────────────────────── */
+                emit_load_f64 (cg, 6, 0x3EC71DE3A556C734ULL);    /* C8 = 1/362880 */
+                emit_fma_add  (cg, 2, 7, 6);                     /* xmm2 = P(r) */
+
+                /* Final: exp(r) = 1 + r·P.  Seed xmm3 = 1.0, fma r·xmm2. */
+                emit_load_f64 (cg, 3, 0x3FF0000000000000ULL);
+                emit_fma_add  (cg, 3, 0, 2);                     /* xmm3 = 1 + r·P */
+                emit_mov_xmm  (cg, 2, 3);                        /* xmm2 = exp(r) */
 
                 /* === Step 4: result = exp(r) * 2^k === */
                 /* Convert k (double in xmm1) to integer in rax */
@@ -1975,20 +2101,37 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
                 /* mulsd xmm4, xmm4 */
                 b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x59; b[3]=0xE4; EMIT(cg, 4);
 
-                /* Horner from innermost via FMA3: xmm2 = P(z) where y = z = s².
-                 * Each step: xmm2 = z·xmm2 + Ck.  7 steps × 4c = 28c crit
-                 * (vs 7 × 6c = 42c pre-FMA). */
+                /* Estrin for P(z) = 1 + z/3 + z²/5 + z³/7 + z⁴/9 + z⁵/11 + z⁶/13
+                 * where z = s².  7 terms, degree 6.  Factorize:
+                 *   A = C1·z + C0   (1/3·z + 1)
+                 *   B = C3·z + C2   (1/7·z + 1/5)
+                 *   C = C5·z + C4   (1/11·z + 1/9)
+                 *   D = C6 = 1/13
+                 *   P = (A + z²·B) + z⁴·(C + z²·D)
+                 * Critical path: 3 dependent FMAs ≈ 12c (was 7×4c = 28c).
+                 * Registers: xmm4=z, xmm2=A→AB→P, xmm3=B, xmm5=C→CD, xmm6=D/const, xmm7=z²→z⁴. */
 
-                /* Seed xmm2 with 1/13 */
-                pn = emit_mov_reg_imm64(BUF(cg), REG_RCX, 0x3FB3B13B13B13B14ULL); EMIT(cg, pn);
-                b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xD1; EMIT(cg, 5);
+                emit_load_f64   (cg, 2, 0x3FD5555555555555ULL);  /* C1 = 1/3 */
+                emit_load_f64   (cg, 6, 0x3FF0000000000000ULL);  /* C0 = 1   */
+                emit_fma213_reg (cg, 2, 4, 6);                   /* A = C1·z + C0 */
 
-                emit_fma_horner_step(cg, 2, 4, 3, 0x3FB745D1745D1746ULL);  /* + 1/11 */
-                emit_fma_horner_step(cg, 2, 4, 3, 0x3FBC71C71C71C71CULL);  /* + 1/9  */
-                emit_fma_horner_step(cg, 2, 4, 3, 0x3FC2492492492492ULL);  /* + 1/7  */
-                emit_fma_horner_step(cg, 2, 4, 3, 0x3FC999999999999AULL);  /* + 1/5  */
-                emit_fma_horner_step(cg, 2, 4, 3, 0x3FD5555555555555ULL);  /* + 1/3  */
-                emit_fma_horner_step(cg, 2, 4, 3, 0x3FF0000000000000ULL);  /* + 1.0  */
+                emit_load_f64   (cg, 3, 0x3FC2492492492492ULL);  /* C3 = 1/7 */
+                emit_load_f64   (cg, 6, 0x3FC999999999999AULL);  /* C2 = 1/5 */
+                emit_fma213_reg (cg, 3, 4, 6);                   /* B = C3·z + C2 */
+
+                emit_load_f64   (cg, 5, 0x3FB745D1745D1746ULL);  /* C5 = 1/11 */
+                emit_load_f64   (cg, 6, 0x3FBC71C71C71C71CULL);  /* C4 = 1/9  */
+                emit_fma213_reg (cg, 5, 4, 6);                   /* C = C5·z + C4 */
+
+                emit_load_f64 (cg, 6, 0x3FB3B13B13B13B14ULL);    /* D = C6 = 1/13 */
+                emit_mov_xmm  (cg, 7, 4);
+                cg_mulsd      (cg, 7, 4);                        /* xmm7 = z² */
+
+                emit_fma_add  (cg, 2, 7, 3);                     /* xmm2 = A + z²·B */
+                emit_fma_add  (cg, 5, 7, 6);                     /* xmm5 = C + z²·D */
+                cg_mulsd      (cg, 7, 7);                        /* xmm7 = z⁴ */
+
+                emit_fma_add  (cg, 2, 7, 5);                     /* xmm2 = AB + z⁴·CD = P(z) */
 
                 /* xmm0 = 2*s * xmm2 = log(1+f) */
                 /* mulsd xmm2, xmm0 — xmm2 *= s */

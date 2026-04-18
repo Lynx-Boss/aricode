@@ -62,6 +62,73 @@ static void emit_if(CodegenState *cg, const ASTNode *node);
  * If try/catch is active (R15==1), jump to catch handler instead.
  * Caller must emit a conditional jump OVER this block for the happy path.
  */
+/*
+ * Jump-patch helpers — wrap the offset arithmetic that caused more
+ * than one off-by-one bug during the initial codegen development.
+ *
+ * Conventions:
+ *   - `patch_pos` is the code-buffer index of the first byte of the
+ *     previously-emitted conditional/unconditional jump.
+ *   - All three helpers patch the displacement so the jump lands at
+ *     the CURRENT `cg->code_size` cursor.
+ */
+
+/* Patch a 2-byte short Jcc (opcode + disp8) emitted earlier.
+ * Caller is responsible for ensuring the offset fits in int8. */
+static void cg_patch_jcc_short(CodegenState *cg, size_t patch_pos) {
+    cg->code[patch_pos + 1] =
+        (uint8_t)(cg->code_size - (patch_pos + 2));
+}
+
+/* Patch a 6-byte near Jcc (0x0F 0x8X + disp32) emitted earlier. */
+static void cg_patch_jcc_near(CodegenState *cg, size_t patch_pos) {
+    int32_t off = (int32_t)(cg->code_size - (patch_pos + 6));
+    memcpy(cg->code + patch_pos + 2, &off, 4);
+}
+
+/* Patch a 5-byte rel32 JMP (0xE9 + disp32) emitted earlier. */
+static void cg_patch_jmp_rel32(CodegenState *cg, size_t patch_pos) {
+    int32_t off = (int32_t)(cg->code_size - (patch_pos + 5));
+    memcpy(cg->code + patch_pos + 1, &off, 4);
+}
+
+/*
+ * Emit the try/catch unwind-check tail:
+ *
+ *     test r15, r15
+ *     jz   .no_catch
+ *   (if set_rax_one) mov rax, 1
+ *     mov  rsp, r12
+ *     mov  rbp, r13
+ *     jmp  r14                ; jump to active catch handler
+ *   .no_catch:
+ *
+ * Falls through to `.no_catch` when R15 == 0 (no active handler);
+ * the caller then emits the uncaught-error path (syscall exit etc.).
+ *
+ * set_rax_one = 1 for runtime errors: RAX holds the error level 1.
+ *               0 for `error.raise(code)` where RAX already carries
+ *               the user-supplied code.
+ */
+static void cg_emit_catch_unwind_check(CodegenState *cg, int set_rax_one) {
+    uint8_t *b;
+    int n;
+    /* test r15, r15 */
+    b = BUF(cg); b[0]=0x4D; b[1]=0x85; b[2]=0xFF; EMIT(cg, 3);
+    /* jz .no_catch (placeholder) */
+    size_t je_pos = cg->code_size;
+    b = BUF(cg); b[0]=0x74; b[1]=0x00; EMIT(cg, 2);
+    if (set_rax_one) {
+        n = emit_mov_reg_imm32(BUF(cg), REG_RAX, 1); EMIT(cg, n);
+    }
+    /* mov rsp, r12 ; mov rbp, r13 ; jmp r14 */
+    b = BUF(cg); b[0]=0x4C; b[1]=0x89; b[2]=0xE4; EMIT(cg, 3);
+    b = BUF(cg); b[0]=0x4C; b[1]=0x89; b[2]=0xED; EMIT(cg, 3);
+    b = BUF(cg); b[0]=0x41; b[1]=0xFF; b[2]=0xE6; EMIT(cg, 3);
+    /* patch jz to land here */
+    cg_patch_jcc_short(cg, je_pos);
+}
+
 void emit_runtime_error(CodegenState *cg, const char *errmsg, size_t errmsg_len) {
     int n; uint8_t *b;
 
@@ -83,8 +150,7 @@ void emit_runtime_error(CodegenState *cg, const char *errmsg, size_t errmsg_len)
         str_pos = cg->code_size;
         memcpy(BUF(cg), errmsg, errmsg_len);
         cg->code_size += errmsg_len;
-        int32_t jo = (int32_t)(cg->code_size - (jmp_str + 5));
-        memcpy(cg->code + jmp_str + 1, &jo, 4);
+        cg_patch_jmp_rel32(cg, jmp_str);
         /* Cache it */
         if (cg->error_string_count < 16) {
             cg->error_strings[cg->error_string_count].text = errmsg;
@@ -107,17 +173,9 @@ void emit_runtime_error(CodegenState *cg, const char *errmsg, size_t errmsg_len)
     n = emit_mov_reg_imm32(BUF(cg), REG_RAX, 1); EMIT(cg, n); /* __NR_write */
     n = emit_syscall(BUF(cg)); EMIT(cg, n);
 
-    /* Check try/catch: if R15==1, jump to catch handler */
-    b = BUF(cg); b[0]=0x4D; b[1]=0x85; b[2]=0xFF; EMIT(cg, 3); /* test r15,r15 */
-    size_t je_pos = cg->code_size;
-    b = BUF(cg); b[0]=0x74; b[1]=0x00; EMIT(cg, 2); /* je .no_catch */
-    /* Catch active: mov rax,1; restore rsp/rbp; jmp r14 */
-    n = emit_mov_reg_imm32(BUF(cg), REG_RAX, 1); EMIT(cg, n);
-    b = BUF(cg); b[0]=0x4C; b[1]=0x89; b[2]=0xE4; EMIT(cg, 3); /* mov rsp, r12 */
-    b = BUF(cg); b[0]=0x4C; b[1]=0x89; b[2]=0xED; EMIT(cg, 3); /* mov rbp, r13 */
-    b = BUF(cg); b[0]=0x41; b[1]=0xFF; b[2]=0xE6; EMIT(cg, 3); /* jmp r14 */
-    /* .no_catch: */
-    cg->code[je_pos + 1] = (uint8_t)(cg->code_size - (je_pos + 2));
+    /* Check try/catch: if active, mov rax,1; restore; jmp r14.
+     * Falls through to .no_catch when R15 == 0. */
+    cg_emit_catch_unwind_check(cg, /*set_rax_one=*/1);
     /* Exit */
     n = emit_mov_reg_imm32(BUF(cg), REG_RDI, 1); EMIT(cg, n);
     n = emit_mov_reg_imm32(BUF(cg), REG_RAX, 60); EMIT(cg, n);
@@ -733,80 +791,17 @@ do_div_mod:
         n = emit_jne(BUF(cg), 0);
         EMIT(cg, n);
 
-        /* Emit error message: stderr write + exit */
-        {
-            const char *errmsg = "Runtime error: division by zero\n";
-            size_t errmsg_len = 32;
-
-            /* jmp over the embedded string data */
-            size_t jmp_str_pos = cg->code_size;
-            n = emit_jmp(BUF(cg), 0);
-            EMIT(cg, n);
-
-            /* Embed error string */
-            size_t str_data_pos = cg->code_size;
-            memcpy(BUF(cg), errmsg, errmsg_len);
-            cg->code_size += errmsg_len;
-
-            /* Patch jmp to land after string */
-            int32_t jmp_str_off = (int32_t)(cg->code_size - (jmp_str_pos + 5));
-            memcpy(cg->code + jmp_str_pos + 1, &jmp_str_off, 4);
-
-            /* lea rsi, [rip - offset_to_string] */
-            int32_t rip_off = (int32_t)((int64_t)str_data_pos - (int64_t)(cg->code_size + 7));
-            uint8_t *b = BUF(cg);
-            b[0] = rex(1, reg_ext(REG_RSI), 0, 0);
-            b[1] = 0x8D;
-            b[2] = modrm(0, REG_RSI, 5);
-            memcpy(b + 3, &rip_off, 4);
-            EMIT(cg, 7);
-
-            /* mov rdx, errmsg_len */
-            n = emit_mov_reg_imm32(BUF(cg), REG_RDX, (uint32_t)errmsg_len);
-            EMIT(cg, n);
-            /* mov rdi, 2 (stderr) */
-            n = emit_mov_reg_imm32(BUF(cg), REG_RDI, 2);
-            EMIT(cg, n);
-            /* mov rax, 1 (__NR_write) */
-            n = emit_mov_reg_imm32(BUF(cg), REG_RAX, 1);
-            EMIT(cg, n);
-            /* syscall (write to stderr) */
-            n = emit_syscall(BUF(cg));
-            EMIT(cg, n);
-
-            /* Check if try/catch is active (R15 == 1):
-             * if active, jump to catch handler instead of exit */
-            uint8_t *b2;
-            /* test r15, r15 */
-            b2 = BUF(cg); b2[0]=0x4D; b2[1]=0x85; b2[2]=0xFF; EMIT(cg, 3);
-            /* je .no_catch (if R15==0, no handler, do exit) */
-            size_t je_nocatch = cg->code_size;
-            b2 = BUF(cg); b2[0]=0x74; b2[1]=0x00; EMIT(cg, 2);
-
-            /* Catch is active: restore RSP/RBP from R12/R13 and jump to R14 */
-            /* mov rax, 1 (error code for catch) */
-            n = emit_mov_reg_imm32(BUF(cg), REG_RAX, 1); EMIT(cg, n);
-            b2 = BUF(cg); b2[0]=0x4C; b2[1]=0x89; b2[2]=0xE4; EMIT(cg, 3); /* mov rsp, r12 */
-            b2 = BUF(cg); b2[0]=0x4C; b2[1]=0x89; b2[2]=0xED; EMIT(cg, 3); /* mov rbp, r13 */
-            b2 = BUF(cg); b2[0]=0x41; b2[1]=0xFF; b2[2]=0xE6; EMIT(cg, 3); /* jmp r14 */
-
-            /* .no_catch: patch je */
-            cg->code[je_nocatch + 1] = (uint8_t)(cg->code_size - (je_nocatch + 2));
-
-            /* No catch handler: exit with code 1 */
-            n = emit_mov_reg_imm32(BUF(cg), REG_RDI, 1);
-            EMIT(cg, n);
-            /* mov rax, 60 (__NR_exit) */
-            n = emit_mov_reg_imm32(BUF(cg), REG_RAX, 60);
-            EMIT(cg, n);
-            /* syscall (exit) */
-            n = emit_syscall(BUF(cg));
-            EMIT(cg, n);
-        }
+        /* The error-block (stderr write + try/catch dispatch + exit)
+         * lives in emit_runtime_error.  Kept inline here historically
+         * but identical semantics; using the shared path now also
+         * deduplicates the error string when the source contains
+         * multiple divisions. */
+        emit_runtime_error(cg,
+                           "Runtime error: division by zero\n",
+                           32);
 
         /* .div_ok: patch the jne to jump here */
-        int32_t jne_off = (int32_t)(cg->code_size - (jne_pos + 6));
-        memcpy(cg->code + jne_pos + 2, &jne_off, 4);
+        cg_patch_jcc_near(cg, jne_pos);
 
         n = emit_cqo(BUF(cg));
         EMIT(cg, n);
@@ -955,8 +950,7 @@ void emit_builtin_print_str(CodegenState *cg, const ASTNode *arg) {
     cg->code_size += 1;
 
     /* Patch JMP to land here */
-    int32_t jmp_off = (int32_t)(cg->code_size - (jmp_pos + 5));
-    memcpy(cg->code + jmp_pos + 1, &jmp_off, 4);
+    cg_patch_jmp_rel32(cg, jmp_pos);
 
     /* lea rsi, [rip - offset]  -- point back to str_pos */
     /* RIP-relative: offset = current_pos + 7 (size of lea) - str_pos, negated */
@@ -1059,7 +1053,7 @@ void emit_builtin_print_int(CodegenState *cg, const ASTNode *arg) {
     EMIT(cg, 6);
 
     /* patch jns */
-    cg->code[jns_pos + 1] = (uint8_t)(cg->code_size - (jns_pos + 2));
+    cg_patch_jcc_short(cg, jns_pos);
 
     /* Handle zero specially */
     n = emit_test_reg_reg(BUF(cg), REG_RAX, REG_RAX);
@@ -1085,7 +1079,7 @@ void emit_builtin_print_int(CodegenState *cg, const ASTNode *arg) {
     EMIT(cg, 2);
 
     /* patch jnz (skip zero case) */
-    cg->code[jnz_pos + 1] = (uint8_t)(cg->code_size - (jnz_pos + 2));
+    cg_patch_jcc_short(cg, jnz_pos);
 
     /* Digit extraction loop: rax / 10, remainder + '0' -> buffer */
     size_t digit_loop = cg->code_size;
@@ -1143,8 +1137,8 @@ void emit_builtin_print_int(CodegenState *cg, const ASTNode *arg) {
     EMIT(cg, n);
 
     /* patch jz and jmp_write */
-    cg->code[jz_write + 1] = (uint8_t)(cg->code_size - (jz_write + 2));
-    cg->code[jmp_write_pos + 1] = (uint8_t)(cg->code_size - (jmp_write_pos + 2));
+    cg_patch_jcc_short(cg, jz_write);
+    cg_patch_jcc_short(cg, jmp_write_pos);
 
     /* sys_write(1, r10, r11) */
     n = emit_mov_reg_imm32(BUF(cg), REG_RAX, 1); EMIT(cg, n);  /* __NR_write */
@@ -1224,8 +1218,8 @@ void emit_builtin_read_int(CodegenState *cg) {
     b = BUF(cg); b[0] = 0xEB; b[1] = (uint8_t)rl_back; EMIT(cg, 2);
 
     /* done_read: patch jumps */
-    cg->code[jle_pos + 1] = (uint8_t)(cg->code_size - (jle_pos + 2));
-    cg->code[je_done + 1] = (uint8_t)(cg->code_size - (je_done + 2));
+    cg_patch_jcc_short(cg, jle_pos);
+    cg_patch_jcc_short(cg, je_done);
 
     /* Now parse: r10 = number of digit bytes in buffer at rsp */
     /* r11 = result = 0, r9 = sign, rcx = parse index */
@@ -1252,7 +1246,7 @@ void emit_builtin_read_int(CodegenState *cg) {
     b[0] = 0x49; b[1] = 0xC7; b[2] = 0xC1;
     int32_t one = 1; memcpy(b+3, &one, 4); EMIT(cg, 7);
     n = emit_mov_reg_imm32(BUF(cg), REG_RBX, 1); EMIT(cg, n);
-    cg->code[jne2 + 1] = (uint8_t)(cg->code_size - (jne2 + 2));
+    cg_patch_jcc_short(cg, jne2);
 
     /* Parse digit loop */
     size_t ploop = cg->code_size;
@@ -1292,8 +1286,8 @@ void emit_builtin_read_int(CodegenState *cg) {
     b = BUF(cg); b[0] = 0xEB; b[1] = (uint8_t)pb; EMIT(cg, 2);
 
     /* patch exits */
-    cg->code[jge_end + 1] = (uint8_t)(cg->code_size - (jge_end + 2));
-    cg->code[ja2 + 1] = (uint8_t)(cg->code_size - (ja2 + 2));
+    cg_patch_jcc_short(cg, jge_end);
+    cg_patch_jcc_short(cg, ja2);
 
     /* Restore rbx */
     n = emit_pop(BUF(cg), REG_RBX); EMIT(cg, n);
@@ -1305,7 +1299,7 @@ void emit_builtin_read_int(CodegenState *cg) {
     b = BUF(cg); b[0] = 0x74; b[1] = 0x00; EMIT(cg, 2);
     b = BUF(cg);
     b[0] = 0x49; b[1] = 0xF7; b[2] = 0xDB; EMIT(cg, 3); /* neg r11 */
-    cg->code[jz2 + 1] = (uint8_t)(cg->code_size - (jz2 + 2));
+    cg_patch_jcc_short(cg, jz2);
 
     /* mov rax, r11 */
     b = BUF(cg);
@@ -1606,19 +1600,16 @@ static void emit_if(CodegenState *cg, const ASTNode *node) {
         EMIT(cg, n);
 
         /* Patch JE to point here (else block start) */
-        int32_t je_off = (int32_t)(cg->code_size - (je_pos + 6));
-        memcpy(cg->code + je_pos + 2, &je_off, 4);
+        cg_patch_jcc_near(cg, je_pos);
 
         /* Else block */
         emit_block(cg, node->children[2]);
 
         /* Patch JMP to point here */
-        int32_t jmp_off = (int32_t)(cg->code_size - (jmp_pos + 5));
-        memcpy(cg->code + jmp_pos + 1, &jmp_off, 4);
+        cg_patch_jmp_rel32(cg, jmp_pos);
     } else {
         /* No else: patch JE to point here */
-        int32_t je_off = (int32_t)(cg->code_size - (je_pos + 6));
-        memcpy(cg->code + je_pos + 2, &je_off, 4);
+        cg_patch_jcc_near(cg, je_pos);
     }
 }
 
@@ -1719,21 +1710,18 @@ static void emit_while(CodegenState *cg, const ASTNode *node) {
     EMIT(cg, n);
 
     /* Patch JE to point here (loop_end) */
-    int32_t je_off = (int32_t)(cg->code_size - (je_pos + 6));
-    memcpy(cg->code + je_pos + 2, &je_off, 4);
+    cg_patch_jcc_near(cg, je_pos);
 
     /* Patch unrolled JE */
     if (can_unroll && je_pos2 > 0) {
-        int32_t je_off2 = (int32_t)(cg->code_size - (je_pos2 + 6));
-        memcpy(cg->code + je_pos2 + 2, &je_off2, 4);
+        cg_patch_jcc_near(cg, je_pos2);
     }
 
     /* Patch all break JMPs to point here */
     if (ld < 32) {
         for (int bi = 0; bi < cg->loop_end_count[ld]; bi++) {
             size_t brk = cg->loop_end_patches[ld][bi];
-            int32_t brk_off = (int32_t)(cg->code_size - (brk + 5));
-            memcpy(cg->code + brk + 1, &brk_off, 4);
+            cg_patch_jmp_rel32(cg, brk);
         }
         cg->loop_depth--;
     }
@@ -1828,8 +1816,7 @@ static void emit_for(CodegenState *cg, const ASTNode *node) {
     if (ld < 32) {
         for (int ci = 0; ci < cg->loop_cont_count[ld]; ci++) {
             size_t cont_jmp = cg->loop_cont_patches[ld][ci];
-            int32_t cont_off = (int32_t)(cg->code_size - (cont_jmp + 5));
-            memcpy(cg->code + cont_jmp + 1, &cont_off, 4);
+            cg_patch_jmp_rel32(cg, cont_jmp);
         }
     }
 
@@ -1847,15 +1834,13 @@ static void emit_for(CodegenState *cg, const ASTNode *node) {
     EMIT(cg, n);
 
     /* Patch JE */
-    int32_t je_off = (int32_t)(cg->code_size - (je_pos + 6));
-    memcpy(cg->code + je_pos + 2, &je_off, 4);
+    cg_patch_jcc_near(cg, je_pos);
 
     /* Patch break JMPs */
     if (ld < 32) {
         for (int bi = 0; bi < cg->loop_end_count[ld]; bi++) {
             size_t brk = cg->loop_end_patches[ld][bi];
-            int32_t brk_off = (int32_t)(cg->code_size - (brk + 5));
-            memcpy(cg->code + brk + 1, &brk_off, 4);
+            cg_patch_jmp_rel32(cg, brk);
         }
         cg->loop_depth--;
     }
@@ -1979,14 +1964,12 @@ static void emit_statement(CodegenState *cg, const ASTNode *node) {
             n = emit_jmp(BUF(cg), 0); EMIT(cg, n);
 
             /* Patch JNE to here */
-            int32_t jne_off = (int32_t)(cg->code_size - (jne_pos + 6));
-            memcpy(cg->code + jne_pos + 2, &jne_off, 4);
+            cg_patch_jcc_near(cg, jne_pos);
         }
 
         /* Patch all JMP-to-end */
         for (int ji = 0; ji < jmp_count; ji++) {
-            int32_t off = (int32_t)(cg->code_size - (jmp_ends[ji] + 5));
-            memcpy(cg->code + jmp_ends[ji] + 1, &off, 4);
+            cg_patch_jmp_rel32(cg, jmp_ends[ji]);
         }
         break;
     }
@@ -2063,8 +2046,7 @@ static void emit_statement(CodegenState *cg, const ASTNode *node) {
         }
 
         /* Patch JMP after try */
-        int32_t jmp_off = (int32_t)(cg->code_size - (jmp_after + 5));
-        memcpy(cg->code + jmp_after + 1, &jmp_off, 4);
+        cg_patch_jmp_rel32(cg, jmp_after);
 
         break;
     }
@@ -2083,21 +2065,10 @@ static void emit_statement(CodegenState *cg, const ASTNode *node) {
             emit_expression(cg, node->children[0]);
         }
 
-        /* test r15, r15 (is catch active?) */
-        b = BUF(cg); b[0]=0x4D; b[1]=0x85; b[2]=0xFF; EMIT(cg,3);
-
-        /* jz .no_catch */
-        size_t jz_pos = cg->code_size;
-        b = BUF(cg); b[0]=0x74; b[1]=0x00; EMIT(cg,2);
-
-        /* Catch is active: restore and jump */
-        b = BUF(cg); b[0]=0x4C; b[1]=0x89; b[2]=0xE4; EMIT(cg,3); /* mov rsp, r12 */
-        b = BUF(cg); b[0]=0x4C; b[1]=0x89; b[2]=0xED; EMIT(cg,3); /* mov rbp, r13 */
-        /* jmp r14 */
-        b = BUF(cg); b[0]=0x41; b[1]=0xFF; b[2]=0xE6; EMIT(cg,3);
-
-        /* .no_catch: exit with error code */
-        cg->code[jz_pos+1] = (uint8_t)(cg->code_size - (jz_pos+2));
+        /* Catch dispatch — RAX already carries the user error code,
+         * so set_rax_one=0 (don't overwrite with 1). */
+        cg_emit_catch_unwind_check(cg, /*set_rax_one=*/0);
+        /* .no_catch: exit with the user error code (still in RAX). */
         n = emit_mov_reg_reg(BUF(cg), REG_RDI, REG_RAX); EMIT(cg, n);
         n = emit_mov_reg_imm32(BUF(cg), REG_RAX, 60); EMIT(cg, n);
         n = emit_syscall(BUF(cg)); EMIT(cg, n);

@@ -217,6 +217,83 @@ static void cg_loop_end(CodegenState *cg, CgCountedLoop lp, int step) {
 }
 
 /* =====================================================================
+ *  SIB-addressed load/store helpers:  [base + idx*8] addressing
+ * =====================================================================
+ *
+ * Every AVX2 kernel load/stores through [base + idx*8] with i = rsi or
+ * r12.  Both `vmovupd ymm, [base+idx*8]` and its scalar `movsd xmm,
+ * [base+idx*8]` cousin have enough VEX / REX plumbing that inlining
+ * them at every call site is a readability trap.
+ *
+ * These helpers pick 2- vs 3-byte VEX (for vmovupd) or REX (for movsd)
+ * automatically, and handle the SIB-base=rbp/r13 quirk where mod=00
+ * silently means "absolute disp32" — any rbp/r13-based addressing
+ * must use mod=01 with a zero disp8.  Callers pass the register IDs;
+ * the encoding is fully derived. */
+
+/* vmovupd ymm, [base + idx*8]   (opcode 0x10)
+ * vmovupd [base + idx*8], ymm   (opcode 0x11) */
+static void cg_vmovupd_ymm_base_idx(CodegenState *cg, int ymm,
+                                    int base_reg, int idx_reg,
+                                    int opcode /*0x10 or 0x11*/) {
+    int R_high = (ymm      >= 8);
+    int X_high = (idx_reg  >= 8);
+    int B_high = (base_reg >= 8);
+    int needs_disp8 = ((base_reg & 7) == 5);   /* rbp/r13 SIB quirk */
+
+    uint8_t *b = BUF(cg);
+    int off = 0;
+    if (R_high || X_high || B_high) {
+        /* 3-byte VEX: C4 [R~X~B~.00001] [W=0.1111.L=1.pp=01] */
+        b[off++] = 0xC4;
+        b[off++] = (uint8_t)((R_high ? 0 : 0x80) |
+                             (X_high ? 0 : 0x40) |
+                             (B_high ? 0 : 0x20) | 0x01);
+        b[off++] = 0x7D;
+    } else {
+        /* 2-byte VEX: C5 [R~=1.vvvv=1111.L=1.pp=01] = C5 FD */
+        b[off++] = 0xC5;
+        b[off++] = 0xFD;
+    }
+    b[off++] = (uint8_t)opcode;
+    b[off++] = (uint8_t)(((needs_disp8 ? 1 : 0) << 6) |
+                         ((ymm & 7) << 3) | 4);          /* modrm: reg=ymm r/m=SIB */
+    b[off++] = (uint8_t)((3 << 6) | ((idx_reg & 7) << 3) |
+                         (base_reg & 7));                /* sib: scale=8 */
+    if (needs_disp8) b[off++] = 0;
+    EMIT(cg, off);
+}
+
+/* movsd xmm, [base + idx*8]   (opcode 0x10)
+ * movsd [base + idx*8], xmm   (opcode 0x11)
+ *
+ * Legacy SSE encoding with F2 prefix + optional REX, not VEX — matches
+ * what the existing builtins emit bit-for-bit. */
+static void cg_movsd_xmm_base_idx(CodegenState *cg, int xmm,
+                                  int base_reg, int idx_reg,
+                                  int opcode /*0x10 or 0x11*/) {
+    int R = (xmm      >= 8) ? 1 : 0;
+    int X = (idx_reg  >= 8) ? 1 : 0;
+    int B = (base_reg >= 8) ? 1 : 0;
+    int needs_disp8 = ((base_reg & 7) == 5);
+
+    uint8_t *b = BUF(cg);
+    int off = 0;
+    b[off++] = 0xF2;
+    if (R || X || B) {
+        b[off++] = (uint8_t)(0x40 | (R << 2) | (X << 1) | B);
+    }
+    b[off++] = 0x0F;
+    b[off++] = (uint8_t)opcode;
+    b[off++] = (uint8_t)(((needs_disp8 ? 1 : 0) << 6) |
+                         ((xmm & 7) << 3) | 4);
+    b[off++] = (uint8_t)((3 << 6) | ((idx_reg & 7) << 3) |
+                         (base_reg & 7));
+    if (needs_disp8) b[off++] = 0;
+    EMIT(cg, off);
+}
+
+/* =====================================================================
  *  Packed AVX2 helpers (ymm, 4 doubles per register)
  * =====================================================================
  *
@@ -2792,9 +2869,7 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             pn = emit_xor_reg_reg(BUF(cg), REG_RSI, REG_RSI); EMIT(cg, pn);
             CgCountedLoop lp = cg_loop_begin(cg, REG_RSI, REG_RCX);
             /* movsd xmm1, [rdi + rsi*8] */
-            b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x10;
-            b[3]=modrm(0, 1, 4); b[4]=(uint8_t)((3<<6)|(REG_RSI<<3)|REG_RDI);
-            EMIT(cg, 5);
+            cg_movsd_xmm_base_idx(cg, 1, REG_RDI, REG_RSI, 0x10);
             /* addsd xmm0, xmm1 */
             pn = emit_addsd(BUF(cg), 0, 1); EMIT(cg, pn);
             cg_loop_end(cg, lp, 1);
@@ -2828,9 +2903,7 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             CgCountedLoop lp = cg_loop_begin(cg, REG_RSI, REG_RCX);
 
             /* xmm2 = arr[i] */
-            b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x10;
-            b[3]=modrm(0, 2, 4); b[4]=(uint8_t)((3<<6)|(REG_RSI<<3)|REG_RDI);
-            EMIT(cg, 5);
+            cg_movsd_xmm_base_idx(cg, 2, REG_RDI, REG_RSI, 0x10);
 
             /* xmm3 = y = x - c */
             pn = emit_movsd_xmm_xmm(BUF(cg), 3, 2); EMIT(cg, pn);
@@ -2893,13 +2966,9 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             CgCountedLoop vec = cg_loop_begin(cg, REG_RSI, REG_RDX);
 
             /* vmovupd ymm1, [rdi + rsi*8] */
-            b = BUF(cg); b[0]=0xC5; b[1]=0xFD; b[2]=0x10;
-            b[3]=modrm(0, 1, 4); b[4]=(uint8_t)((3<<6)|(REG_RSI<<3)|REG_RDI);
-            EMIT(cg, 5);
+            cg_vmovupd_ymm_base_idx(cg, 1, REG_RDI, REG_RSI, 0x10);
             /* vmovupd ymm2, [rbx + rsi*8] */
-            b = BUF(cg); b[0]=0xC5; b[1]=0xFD; b[2]=0x10;
-            b[3]=modrm(0, 2, 4); b[4]=(uint8_t)((3<<6)|(REG_RSI<<3)|REG_RBX);
-            EMIT(cg, 5);
+            cg_vmovupd_ymm_base_idx(cg, 2, REG_RBX, REG_RSI, 0x10);
             /* vfmadd231pd ymm0, ymm1, ymm2  →  ymm0 += ymm1·ymm2 */
             b = BUF(cg); b[0]=0xC4; b[1]=0xE2; b[2]=0xF5; b[3]=0xB8; b[4]=0xC2; EMIT(cg, 5);
 
@@ -2917,13 +2986,9 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             CgCountedLoop tail = cg_loop_begin(cg, REG_RSI, REG_RCX);
 
             /* movsd xmm1, [rdi + rsi*8] */
-            b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x10;
-            b[3]=modrm(0, 1, 4); b[4]=(uint8_t)((3<<6)|(REG_RSI<<3)|REG_RDI);
-            EMIT(cg, 5);
+            cg_movsd_xmm_base_idx(cg, 1, REG_RDI, REG_RSI, 0x10);
             /* movsd xmm2, [rbx + rsi*8] */
-            b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x10;
-            b[3]=modrm(0, 2, 4); b[4]=(uint8_t)((3<<6)|(REG_RSI<<3)|REG_RBX);
-            EMIT(cg, 5);
+            cg_movsd_xmm_base_idx(cg, 2, REG_RBX, REG_RSI, 0x10);
             /* vfmadd231sd xmm0, xmm1, xmm2 */
             b = BUF(cg); b[0]=0xC4; b[1]=0xE2; b[2]=0xF1; b[3]=0xB9; b[4]=0xC2; EMIT(cg, 5);
 
@@ -2962,31 +3027,23 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
 
             CgCountedLoop vec = cg_loop_begin(cg, REG_RSI, REG_R8);
             /* vmovupd ymm0, [rbx + rsi*8] */
-            b = BUF(cg); b[0]=0xC5; b[1]=0xFD; b[2]=0x10;
-            b[3]=modrm(0, 0, 4); b[4]=(uint8_t)((3<<6)|(REG_RSI<<3)|REG_RBX);
-            EMIT(cg, 5);
+            cg_vmovupd_ymm_base_idx(cg, 0, REG_RBX, REG_RSI, 0x10);
             /* vsubpd ymm0, ymm0, [rdx + rsi*8]   (VEX.256.66.0F.WIG 5C /r). */
             b = BUF(cg); b[0]=0xC5; b[1]=0xFD; b[2]=0x5C;
             b[3]=modrm(0, 0, 4); b[4]=(uint8_t)((3<<6)|(REG_RSI<<3)|REG_RDX);
             EMIT(cg, 5);
             /* vmovupd [rdi + rsi*8], ymm0 */
-            b = BUF(cg); b[0]=0xC5; b[1]=0xFD; b[2]=0x11;
-            b[3]=modrm(0, 0, 4); b[4]=(uint8_t)((3<<6)|(REG_RSI<<3)|REG_RDI);
-            EMIT(cg, 5);
+            cg_vmovupd_ymm_base_idx(cg, 0, REG_RDI, REG_RSI, 0x11);
             cg_loop_end(cg, vec, 4);
 
             /* Scalar tail for rsi < rcx (n mod 4). */
             CgCountedLoop tail = cg_loop_begin(cg, REG_RSI, REG_RCX);
             /* movsd xmm0, [rbx + rsi*8] ; subsd xmm0, [rdx + rsi*8] ; movsd [rdi+rsi*8], xmm0 */
-            b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x10;
-            b[3]=modrm(0, 0, 4); b[4]=(uint8_t)((3<<6)|(REG_RSI<<3)|REG_RBX);
-            EMIT(cg, 5);
+            cg_movsd_xmm_base_idx(cg, 0, REG_RBX, REG_RSI, 0x10);
             b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x5C;
             b[3]=modrm(0, 0, 4); b[4]=(uint8_t)((3<<6)|(REG_RSI<<3)|REG_RDX);
             EMIT(cg, 5);
-            b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x11;
-            b[3]=modrm(0, 0, 4); b[4]=(uint8_t)((3<<6)|(REG_RSI<<3)|REG_RDI);
-            EMIT(cg, 5);
+            cg_movsd_xmm_base_idx(cg, 0, REG_RDI, REG_RSI, 0x11);
             cg_loop_end(cg, tail, 1);
 
             b = BUF(cg); b[0]=0xC5; b[1]=0xF8; b[2]=0x77; EMIT(cg, 3);  /* vzeroupper */
@@ -3016,16 +3073,12 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             pn = emit_xor_reg_reg(BUF(cg), REG_RSI, REG_RSI); EMIT(cg, pn);
 
             CgCountedLoop vec = cg_loop_begin(cg, REG_RSI, REG_R8);
-            b = BUF(cg); b[0]=0xC5; b[1]=0xFD; b[2]=0x10;
-            b[3]=modrm(0, 0, 4); b[4]=(uint8_t)((3<<6)|(REG_RSI<<3)|REG_RBX);
-            EMIT(cg, 5);
+            cg_vmovupd_ymm_base_idx(cg, 0, REG_RBX, REG_RSI, 0x10);
             /* vmulpd ymm0, ymm0, [rdx + rsi*8]   —  opcode 0x59. */
             b = BUF(cg); b[0]=0xC5; b[1]=0xFD; b[2]=0x59;
             b[3]=modrm(0, 0, 4); b[4]=(uint8_t)((3<<6)|(REG_RSI<<3)|REG_RDX);
             EMIT(cg, 5);
-            b = BUF(cg); b[0]=0xC5; b[1]=0xFD; b[2]=0x11;
-            b[3]=modrm(0, 0, 4); b[4]=(uint8_t)((3<<6)|(REG_RSI<<3)|REG_RDI);
-            EMIT(cg, 5);
+            cg_vmovupd_ymm_base_idx(cg, 0, REG_RDI, REG_RSI, 0x11);
             cg_loop_end(cg, vec, 4);
 
             b = BUF(cg); b[0]=0xC5; b[1]=0xF8; b[2]=0x77; EMIT(cg, 3);
@@ -3073,9 +3126,7 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
 
             CgCountedLoop mx = cg_loop_begin(cg, REG_RSI, REG_RDX);
             /* vmovupd ymm0, [rdi + rsi*8] */
-            b = BUF(cg); b[0]=0xC5; b[1]=0xFD; b[2]=0x10;
-            b[3]=modrm(0, 0, 4); b[4]=(uint8_t)((3<<6)|(REG_RSI<<3)|REG_RDI);
-            EMIT(cg, 5);
+            cg_vmovupd_ymm_base_idx(cg, 0, REG_RDI, REG_RSI, 0x10);
             /* vmaxpd ymm11, ymm11, ymm0 */
             cg_vex3(cg, /*dst=*/11, /*a=*/11, /*b_reg=*/0, 0, 1, 1, 1);
             b = BUF(cg); b[0]=0x5F; b[1]=0xC0 | ((11&7)<<3) | (0&7); EMIT(cg, 2);
@@ -3113,9 +3164,7 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             CgCountedLoop ex = cg_loop_begin(cg, REG_RSI, REG_RDX);
 
             /* vmovupd ymm0, [rdi + rsi*8] */
-            b = BUF(cg); b[0]=0xC5; b[1]=0xFD; b[2]=0x10;
-            b[3]=modrm(0, 0, 4); b[4]=(uint8_t)((3<<6)|(REG_RSI<<3)|REG_RDI);
-            EMIT(cg, 5);
+            cg_vmovupd_ymm_base_idx(cg, 0, REG_RDI, REG_RSI, 0x10);
             /* ymm0 -= ymm11  (shift by max)  —  vsubpd ymm0, ymm0, ymm11 */
             cg_vex3(cg, 0, 0, 11, 0, 1, 1, 1);
             b = BUF(cg); b[0]=0x5C; b[1]=0xC0 | (0<<3) | (11&7); EMIT(cg, 2);
@@ -3127,9 +3176,7 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             b = BUF(cg); b[0]=0x58; b[1]=0xC0 | ((12&7)<<3) | 0; EMIT(cg, 2);
 
             /* Store: vmovupd [rdi + rsi*8], ymm0 */
-            b = BUF(cg); b[0]=0xC5; b[1]=0xFD; b[2]=0x11;
-            b[3]=modrm(0, 0, 4); b[4]=(uint8_t)((3<<6)|(REG_RSI<<3)|REG_RDI);
-            EMIT(cg, 5);
+            cg_vmovupd_ymm_base_idx(cg, 0, REG_RDI, REG_RSI, 0x11);
 
             cg_loop_end(cg, ex, 4);
 
@@ -3158,16 +3205,12 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             pn = emit_xor_reg_reg(BUF(cg), REG_RSI, REG_RSI); EMIT(cg, pn);
             CgCountedLoop nm = cg_loop_begin(cg, REG_RSI, REG_RDX);
             /* vmovupd ymm0, [rdi + rsi*8] */
-            b = BUF(cg); b[0]=0xC5; b[1]=0xFD; b[2]=0x10;
-            b[3]=modrm(0, 0, 4); b[4]=(uint8_t)((3<<6)|(REG_RSI<<3)|REG_RDI);
-            EMIT(cg, 5);
+            cg_vmovupd_ymm_base_idx(cg, 0, REG_RDI, REG_RSI, 0x10);
             /* vmulpd ymm0, ymm0, ymm12 */
             cg_vex3(cg, 0, 0, 12, 0, 1, 1, 1);
             b = BUF(cg); b[0]=0x59; b[1]=0xC0 | (0<<3) | (12&7); EMIT(cg, 2);
             /* store */
-            b = BUF(cg); b[0]=0xC5; b[1]=0xFD; b[2]=0x11;
-            b[3]=modrm(0, 0, 4); b[4]=(uint8_t)((3<<6)|(REG_RSI<<3)|REG_RDI);
-            EMIT(cg, 5);
+            cg_vmovupd_ymm_base_idx(cg, 0, REG_RDI, REG_RSI, 0x11);
             cg_loop_end(cg, nm, 4);
 
             emit_exp_coeff_stack_teardown(cg);
@@ -3206,9 +3249,7 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             CgCountedLoop vec = cg_loop_begin(cg, REG_RSI, REG_RDX);
 
             /* Load ymm0 = x and compute ymm0 = -2·x. */
-            b = BUF(cg); b[0]=0xC5; b[1]=0xFD; b[2]=0x10;
-            b[3]=modrm(0, 0, 4); b[4]=(uint8_t)((3<<6)|(REG_RSI<<3)|REG_RDI);
-            EMIT(cg, 5);
+            cg_vmovupd_ymm_base_idx(cg, 0, REG_RDI, REG_RSI, 0x10);
             cg_vmulpd(cg, 0, 0, 13);
 
             /* exp(-2x). */
@@ -3227,9 +3268,7 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             b = BUF(cg); b[0] = 0x5C; b[1] = 0xC0 | (0 << 3) | (10 & 7); EMIT(cg, 2);
 
             /* Store. */
-            b = BUF(cg); b[0]=0xC5; b[1]=0xFD; b[2]=0x11;
-            b[3]=modrm(0, 0, 4); b[4]=(uint8_t)((3<<6)|(REG_RSI<<3)|REG_RDI);
-            EMIT(cg, 5);
+            cg_vmovupd_ymm_base_idx(cg, 0, REG_RDI, REG_RSI, 0x11);
 
             cg_loop_end(cg, vec, 4);
 
@@ -3269,9 +3308,7 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             CgCountedLoop vec = cg_loop_begin(cg, REG_RSI, REG_RDX);
 
             /* Load ymm0 = x. */
-            b = BUF(cg); b[0]=0xC5; b[1]=0xFD; b[2]=0x10;
-            b[3]=modrm(0, 0, 4); b[4]=(uint8_t)((3<<6)|(REG_RSI<<3)|REG_RDI);
-            EMIT(cg, 5);
+            cg_vmovupd_ymm_base_idx(cg, 0, REG_RDI, REG_RSI, 0x10);
 
             /* ymm0 = -x  via vxorpd ymm0, ymm0, ymm12. */
             cg_vex3(cg, 0, 0, 12, 0, 1, 1, 1);
@@ -3288,9 +3325,7 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             b = BUF(cg); b[0] = 0x5E; b[1] = 0xC0 | (0 << 3) | (0 & 7); EMIT(cg, 2);
 
             /* Store. */
-            b = BUF(cg); b[0]=0xC5; b[1]=0xFD; b[2]=0x11;
-            b[3]=modrm(0, 0, 4); b[4]=(uint8_t)((3<<6)|(REG_RSI<<3)|REG_RDI);
-            EMIT(cg, 5);
+            cg_vmovupd_ymm_base_idx(cg, 0, REG_RDI, REG_RSI, 0x11);
 
             cg_loop_end(cg, vec, 4);
 
@@ -3344,16 +3379,12 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             CgCountedLoop vec = cg_loop_begin(cg, REG_RSI, REG_RDX);
 
             /* ymm0 = x = load from [rdi + rsi*8] */
-            b = BUF(cg); b[0]=0xC5; b[1]=0xFD; b[2]=0x10;
-            b[3]=modrm(0, 0, 4); b[4]=(uint8_t)((3<<6)|(REG_RSI<<3)|REG_RDI);
-            EMIT(cg, 5);
+            cg_vmovupd_ymm_base_idx(cg, 0, REG_RDI, REG_RSI, 0x10);
 
             emit_vec_exp_body_avx2(cg);
 
             /* Store: vmovupd [rdi + rsi*8], ymm0 */
-            b = BUF(cg); b[0]=0xC5; b[1]=0xFD; b[2]=0x11;
-            b[3]=modrm(0, 0, 4); b[4]=(uint8_t)((3<<6)|(REG_RSI<<3)|REG_RDI);
-            EMIT(cg, 5);
+            cg_vmovupd_ymm_base_idx(cg, 0, REG_RDI, REG_RSI, 0x11);
 
             cg_loop_end(cg, vec, 4);
 
@@ -3392,15 +3423,11 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             CgCountedLoop vec = cg_loop_begin(cg, REG_RSI, REG_RDX);
 
             /* vmovupd ymm0, [rdi + rsi*8] */
-            b = BUF(cg); b[0]=0xC5; b[1]=0xFD; b[2]=0x10;
-            b[3]=modrm(0, 0, 4); b[4]=(uint8_t)((3<<6)|(REG_RSI<<3)|REG_RDI);
-            EMIT(cg, 5);
+            cg_vmovupd_ymm_base_idx(cg, 0, REG_RDI, REG_RSI, 0x10);
             /* vmaxpd ymm0, ymm0, ymm1   —  C5 FD 5F C1 */
             b = BUF(cg); b[0]=0xC5; b[1]=0xFD; b[2]=0x5F; b[3]=0xC1; EMIT(cg, 4);
             /* vmovupd [rdi + rsi*8], ymm0 */
-            b = BUF(cg); b[0]=0xC5; b[1]=0xFD; b[2]=0x11;
-            b[3]=modrm(0, 0, 4); b[4]=(uint8_t)((3<<6)|(REG_RSI<<3)|REG_RDI);
-            EMIT(cg, 5);
+            cg_vmovupd_ymm_base_idx(cg, 0, REG_RDI, REG_RSI, 0x11);
 
             cg_loop_end(cg, vec, 4);
 
@@ -3408,15 +3435,11 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             CgCountedLoop tail = cg_loop_begin(cg, REG_RSI, REG_RCX);
 
             /* movsd xmm0, [rdi + rsi*8] */
-            b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x10;
-            b[3]=modrm(0, 0, 4); b[4]=(uint8_t)((3<<6)|(REG_RSI<<3)|REG_RDI);
-            EMIT(cg, 5);
+            cg_movsd_xmm_base_idx(cg, 0, REG_RDI, REG_RSI, 0x10);
             /* maxsd xmm0, xmm1   —  F2 0F 5F C1 */
             b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x5F; b[3]=0xC1; EMIT(cg, 4);
             /* movsd [rdi + rsi*8], xmm0 */
-            b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x11;
-            b[3]=modrm(0, 0, 4); b[4]=(uint8_t)((3<<6)|(REG_RSI<<3)|REG_RDI);
-            EMIT(cg, 5);
+            cg_movsd_xmm_base_idx(cg, 0, REG_RDI, REG_RSI, 0x11);
 
             cg_loop_end(cg, tail, 1);
 
@@ -3468,19 +3491,13 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             CgCountedLoop vec = cg_loop_begin(cg, REG_RSI, REG_RDX);
 
             /* vmovupd ymm0, [rdi + rsi*8]  — y chunk */
-            b = BUF(cg); b[0]=0xC5; b[1]=0xFD; b[2]=0x10;
-            b[3]=modrm(0, 0, 4); b[4]=(uint8_t)((3<<6)|(REG_RSI<<3)|REG_RDI);
-            EMIT(cg, 5);
+            cg_vmovupd_ymm_base_idx(cg, 0, REG_RDI, REG_RSI, 0x10);
             /* vmovupd ymm1, [rbx + rsi*8]  — x chunk */
-            b = BUF(cg); b[0]=0xC5; b[1]=0xFD; b[2]=0x10;
-            b[3]=modrm(0, 1, 4); b[4]=(uint8_t)((3<<6)|(REG_RSI<<3)|REG_RBX);
-            EMIT(cg, 5);
+            cg_vmovupd_ymm_base_idx(cg, 1, REG_RBX, REG_RSI, 0x10);
             /* vfmadd231pd ymm0, ymm3, ymm1  → ymm0 += ymm3·ymm1 (alpha·x) */
             b = BUF(cg); b[0]=0xC4; b[1]=0xE2; b[2]=0xE5; b[3]=0xB8; b[4]=0xC1; EMIT(cg, 5);
             /* vmovupd [rdi + rsi*8], ymm0  — store updated y */
-            b = BUF(cg); b[0]=0xC5; b[1]=0xFD; b[2]=0x11;
-            b[3]=modrm(0, 0, 4); b[4]=(uint8_t)((3<<6)|(REG_RSI<<3)|REG_RDI);
-            EMIT(cg, 5);
+            cg_vmovupd_ymm_base_idx(cg, 0, REG_RDI, REG_RSI, 0x11);
 
             cg_loop_end(cg, vec, 4);
 
@@ -3488,19 +3505,13 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             CgCountedLoop tail = cg_loop_begin(cg, REG_RSI, REG_RCX);
 
             /* movsd xmm0, [rdi + rsi*8] */
-            b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x10;
-            b[3]=modrm(0, 0, 4); b[4]=(uint8_t)((3<<6)|(REG_RSI<<3)|REG_RDI);
-            EMIT(cg, 5);
+            cg_movsd_xmm_base_idx(cg, 0, REG_RDI, REG_RSI, 0x10);
             /* movsd xmm1, [rbx + rsi*8] */
-            b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x10;
-            b[3]=modrm(0, 1, 4); b[4]=(uint8_t)((3<<6)|(REG_RSI<<3)|REG_RBX);
-            EMIT(cg, 5);
+            cg_movsd_xmm_base_idx(cg, 1, REG_RBX, REG_RSI, 0x10);
             /* vfmadd231sd xmm0, xmm3, xmm1  — xmm0 += alpha·x */
             b = BUF(cg); b[0]=0xC4; b[1]=0xE2; b[2]=0xE1; b[3]=0xB9; b[4]=0xC1; EMIT(cg, 5);
             /* movsd [rdi + rsi*8], xmm0 */
-            b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x11;
-            b[3]=modrm(0, 0, 4); b[4]=(uint8_t)((3<<6)|(REG_RSI<<3)|REG_RDI);
-            EMIT(cg, 5);
+            cg_movsd_xmm_base_idx(cg, 0, REG_RDI, REG_RSI, 0x11);
 
             cg_loop_end(cg, tail, 1);
 
@@ -3569,33 +3580,27 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
 
             CgCountedLoop iv = cg_loop_begin(cg, 12 /* R12 */, 11 /* R11 */);
 
-            /* vmovupd ymm1, [r8 + r12*8]  — b chunk  (byte2: R~=1, X~=0, B~=0 = 0x81) */
-            b = BUF(cg); b[0]=0xC4; b[1]=0x81; b[2]=0x7D; b[3]=0x10;
-            b[4]=0x0C; b[5]=0xE0; EMIT(cg, 6);
-            /* vmovupd ymm2, [r13 + r12*8 + 0]  — G row chunk (r13 base → disp8=0) */
-            b = BUF(cg); b[0]=0xC4; b[1]=0x81; b[2]=0x7D; b[3]=0x10;
-            b[4]=0x54; b[5]=0xE5; b[6]=0x00; EMIT(cg, 7);
+            /* vmovupd ymm1, [r8 + r12*8]  — b chunk */
+            cg_vmovupd_ymm_base_idx(cg, 1, 8 /* R8 */, 12 /* R12 */, 0x10);
+            /* vmovupd ymm2, [r13 + r12*8 + 0]  — G row chunk */
+            cg_vmovupd_ymm_base_idx(cg, 2, 13 /* R13 */, 12 /* R12 */, 0x10);
             /* vfmadd231pd ymm2, ymm1, ymm0 */
             b = BUF(cg); b[0]=0xC4; b[1]=0xE2; b[2]=0xF5; b[3]=0xB8; b[4]=0xD0; EMIT(cg, 5);
             /* vmovupd [r13 + r12*8 + 0], ymm2 */
-            b = BUF(cg); b[0]=0xC4; b[1]=0x81; b[2]=0x7D; b[3]=0x11;
-            b[4]=0x54; b[5]=0xE5; b[6]=0x00; EMIT(cg, 7);
+            cg_vmovupd_ymm_base_idx(cg, 2, 13 /* R13 */, 12 /* R12 */, 0x11);
 
             cg_loop_end(cg, iv, 4);
 
             /* Scalar tail for i = n_vec..n, same FMA semantics on xmm. */
             CgCountedLoop it = cg_loop_begin(cg, 12 /* R12 */, 10 /* R10 */);
-            /* movsd xmm1, [r8 + r12*8]  — b[i]   (REX.X|B = 0x43 for r12 index + r8 base) */
-            b = BUF(cg); b[0]=0xF2; b[1]=0x43; b[2]=0x0F; b[3]=0x10;
-            b[4]=0x0C; b[5]=0xE0; EMIT(cg, 6);
+            /* movsd xmm1, [r8 + r12*8]  — b[i] */
+            cg_movsd_xmm_base_idx(cg, 1, 8 /* R8 */, 12 /* R12 */, 0x10);
             /* movsd xmm2, [r13 + r12*8 + 0]  — G[j,i] */
-            b = BUF(cg); b[0]=0xF2; b[1]=0x43; b[2]=0x0F; b[3]=0x10;
-            b[4]=0x54; b[5]=0xE5; b[6]=0x00; EMIT(cg, 7);
+            cg_movsd_xmm_base_idx(cg, 2, 13 /* R13 */, 12 /* R12 */, 0x10);
             /* vfmadd231sd xmm2, xmm1, xmm0 */
             b = BUF(cg); b[0]=0xC4; b[1]=0xE2; b[2]=0xF1; b[3]=0xB9; b[4]=0xD0; EMIT(cg, 5);
             /* movsd [r13 + r12*8 + 0], xmm2 */
-            b = BUF(cg); b[0]=0xF2; b[1]=0x43; b[2]=0x0F; b[3]=0x11;
-            b[4]=0x54; b[5]=0xE5; b[6]=0x00; EMIT(cg, 7);
+            cg_movsd_xmm_base_idx(cg, 2, 13 /* R13 */, 12 /* R12 */, 0x11);
             cg_loop_end(cg, it, 1);
 
             cg_loop_end(cg, outer, 1);
@@ -3666,14 +3671,12 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             b = BUF(cg); b[0]=0x66; b[1]=0x0F; b[2]=0x57; b[3]=0xD2; EMIT(cg, 4);
             b = BUF(cg); b[0]=0x4D; b[1]=0x31; b[2]=0xE4; EMIT(cg, 3);
             CgCountedLoop z = cg_loop_begin(cg, 12 /* R12 */, 11 /* R11 */);
-            b = BUF(cg); b[0]=0xC4; b[1]=0x81; b[2]=0x7D; b[3]=0x11;
-            b[4]=0x0C; b[5]=0xE0; EMIT(cg, 6);
+            cg_vmovupd_ymm_base_idx(cg, 1, 8 /* R8 */, 12 /* R12 */, 0x11);
             cg_loop_end(cg, z, 4);
             /* Scalar zero-init tail: r12 runs from n_vec to n. */
             CgCountedLoop zt = cg_loop_begin(cg, 12 /* R12 */, 10 /* R10 */);
-            /* movsd [r8 + r12*8], xmm2   (REX.X|B = 0x43) */
-            b = BUF(cg); b[0]=0xF2; b[1]=0x43; b[2]=0x0F; b[3]=0x11;
-            b[4]=0x14; b[5]=0xE0; EMIT(cg, 6);
+            /* movsd [r8 + r12*8], xmm2 */
+            cg_movsd_xmm_base_idx(cg, 2, 8 /* R8 */, 12 /* R12 */, 0x11);
             cg_loop_end(cg, zt, 1);
 
             /* ── Outer loop: j = 0 → m ───────────────────────────── */
@@ -3696,33 +3699,27 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
 
             CgCountedLoop iv = cg_loop_begin(cg, 12 /* R12 */, 11 /* R11 */);
 
-            /* vmovupd ymm1, [r13 + r12*8 + 0]   — row chunk (r13 base → disp8=0). */
-            b = BUF(cg); b[0]=0xC4; b[1]=0x81; b[2]=0x7D; b[3]=0x10;
-            b[4]=0x4C; b[5]=0xE5; b[6]=0x00; EMIT(cg, 7);
+            /* vmovupd ymm1, [r13 + r12*8 + 0]   — row chunk. */
+            cg_vmovupd_ymm_base_idx(cg, 1, 13 /* R13 */, 12 /* R12 */, 0x10);
             /* vmovupd ymm2, [r8 + r12*8]       — out chunk */
-            b = BUF(cg); b[0]=0xC4; b[1]=0x81; b[2]=0x7D; b[3]=0x10;
-            b[4]=0x14; b[5]=0xE0; EMIT(cg, 6);
+            cg_vmovupd_ymm_base_idx(cg, 2, 8 /* R8 */, 12 /* R12 */, 0x10);
             /* vfmadd231pd ymm2, ymm1, ymm0 */
             b = BUF(cg); b[0]=0xC4; b[1]=0xE2; b[2]=0xF5; b[3]=0xB8; b[4]=0xD0; EMIT(cg, 5);
             /* vmovupd [r8 + r12*8], ymm2 */
-            b = BUF(cg); b[0]=0xC4; b[1]=0x81; b[2]=0x7D; b[3]=0x11;
-            b[4]=0x14; b[5]=0xE0; EMIT(cg, 6);
+            cg_vmovupd_ymm_base_idx(cg, 2, 8 /* R8 */, 12 /* R12 */, 0x11);
 
             cg_loop_end(cg, iv, 4);
 
             /* ── Scalar tail for n mod 4 ─────────────────────────── */
             CgCountedLoop it = cg_loop_begin(cg, 12 /* R12 */, 10 /* R10 */);
-            /* movsd xmm1, [r13 + r12*8]   — W[j,i] */
-            b = BUF(cg); b[0]=0xF2; b[1]=0x43; b[2]=0x0F; b[3]=0x10;
-            b[4]=0x4C; b[5]=0xE5; b[6]=0x00; EMIT(cg, 7);
+            /* movsd xmm1, [r13 + r12*8] */
+            cg_movsd_xmm_base_idx(cg, 1, 13 /* R13 */, 12 /* R12 */, 0x10);
             /* movsd xmm2, [r8 + r12*8] */
-            b = BUF(cg); b[0]=0xF2; b[1]=0x43; b[2]=0x0F; b[3]=0x10;
-            b[4]=0x14; b[5]=0xE0; EMIT(cg, 6);
+            cg_movsd_xmm_base_idx(cg, 2, 8 /* R8 */, 12 /* R12 */, 0x10);
             /* vfmadd231sd xmm2, xmm1, xmm0 */
             b = BUF(cg); b[0]=0xC4; b[1]=0xE2; b[2]=0xF1; b[3]=0xB9; b[4]=0xD0; EMIT(cg, 5);
             /* movsd [r8 + r12*8], xmm2 */
-            b = BUF(cg); b[0]=0xF2; b[1]=0x43; b[2]=0x0F; b[3]=0x11;
-            b[4]=0x14; b[5]=0xE0; EMIT(cg, 6);
+            cg_movsd_xmm_base_idx(cg, 2, 8 /* R8 */, 12 /* R12 */, 0x11);
             cg_loop_end(cg, it, 1);
 
             cg_loop_end(cg, outer, 1);
@@ -3816,10 +3813,8 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             /* lea r13, [rdi + rax*8] */
             b = BUF(cg); b[0]=0x4C; b[1]=0x8D; b[2]=0x2C; b[3]=0xC7; EMIT(cg, 4);
 
-            /* Seed scalar acc xmm7 with bias[j]:
-             *   movsd xmm7, [r14 + rbx*8]   — F2 41 0F 10 3C DE */
-            b = BUF(cg); b[0]=0xF2; b[1]=0x41; b[2]=0x0F; b[3]=0x10;
-            b[4]=0x3C; b[5]=0xDE; EMIT(cg, 6);
+            /* Seed scalar acc xmm7 with bias[j]: movsd xmm7, [r14 + rbx*8] */
+            cg_movsd_xmm_base_idx(cg, 7, 14 /* R14 */, REG_RBX, 0x10);
 
             /* vxorpd ymm0, ymm0, ymm0 */
             b = BUF(cg); b[0]=0xC5; b[1]=0xFD; b[2]=0x57; b[3]=0xC0; EMIT(cg, 4);
@@ -3831,12 +3826,10 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             /* ── Vector inner loop: 4 doubles per iter ─────────────── */
             CgCountedLoop vloop = cg_loop_begin(cg, 12 /* R12 */, 11 /* R11 */);
 
-            /* vmovupd ymm1, [r13 + r12*8 + 0]  — W row chunk (r13 → disp8=0). */
-            b = BUF(cg); b[0]=0xC4; b[1]=0x81; b[2]=0x7D; b[3]=0x10;
-            b[4]=0x4C; b[5]=0xE5; b[6]=0x00; EMIT(cg, 7);
-            /* vmovupd ymm2, [rsi + r12*8]  — x chunk (rsi base is fine). */
-            b = BUF(cg); b[0]=0xC4; b[1]=0xA1; b[2]=0x7D; b[3]=0x10;
-            b[4]=0x14; b[5]=0xE6; EMIT(cg, 6);
+            /* vmovupd ymm1, [r13 + r12*8 + 0]  — W row chunk. */
+            cg_vmovupd_ymm_base_idx(cg, 1, 13 /* R13 */, 12 /* R12 */, 0x10);
+            /* vmovupd ymm2, [rsi + r12*8]  — x chunk. */
+            cg_vmovupd_ymm_base_idx(cg, 2, REG_RSI, 12 /* R12 */, 0x10);
             /* vfmadd231pd ymm0, ymm1, ymm2 */
             b = BUF(cg); b[0]=0xC4; b[1]=0xE2; b[2]=0xF5; b[3]=0xB8; b[4]=0xC2; EMIT(cg, 5);
 
@@ -3856,19 +3849,16 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             CgCountedLoop tloop = cg_loop_begin(cg, 12 /* R12 */, 10 /* R10 */);
 
             /* movsd xmm1, [r13 + r12*8 + 0] */
-            b = BUF(cg); b[0]=0xF2; b[1]=0x43; b[2]=0x0F; b[3]=0x10;
-            b[4]=0x4C; b[5]=0xE5; b[6]=0x00; EMIT(cg, 7);
+            cg_movsd_xmm_base_idx(cg, 1, 13 /* R13 */, 12 /* R12 */, 0x10);
             /* movsd xmm2, [rsi + r12*8] */
-            b = BUF(cg); b[0]=0xF2; b[1]=0x42; b[2]=0x0F; b[3]=0x10;
-            b[4]=0x14; b[5]=0xE6; EMIT(cg, 6);
+            cg_movsd_xmm_base_idx(cg, 2, REG_RSI, 12 /* R12 */, 0x10);
             /* vfmadd231sd xmm7, xmm1, xmm2 */
             b = BUF(cg); b[0]=0xC4; b[1]=0xE2; b[2]=0xF1; b[3]=0xB9; b[4]=0xFA; EMIT(cg, 5);
 
             cg_loop_end(cg, tloop, 1);
 
             /* y[j] = xmm7   →  movsd [r8 + rbx*8], xmm7 */
-            b = BUF(cg); b[0]=0xF2; b[1]=0x41; b[2]=0x0F; b[3]=0x11;
-            b[4]=0x3C; b[5]=0xD8; EMIT(cg, 6);
+            cg_movsd_xmm_base_idx(cg, 7, 8 /* R8 */, REG_RBX, 0x11);
 
             cg_loop_end(cg, outer, 1);
 
@@ -3904,15 +3894,11 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             pn = emit_xor_reg_reg(BUF(cg), REG_RSI, REG_RSI); EMIT(cg, pn);
             CgCountedLoop lp = cg_loop_begin(cg, REG_RSI, REG_RCX);
             /* movsd xmm1, [rdi + rsi*8] */
-            b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x10;
-            b[3]=modrm(0, 1, 4); b[4]=(uint8_t)((3<<6)|(REG_RSI<<3)|REG_RDI);
-            EMIT(cg, 5);
+            cg_movsd_xmm_base_idx(cg, 1, REG_RDI, REG_RSI, 0x10);
             /* mulsd xmm1, xmm2 */
             pn = emit_mulsd(BUF(cg), 1, 2); EMIT(cg, pn);
             /* movsd [rdi + rsi*8], xmm1 */
-            b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x11;
-            b[3]=modrm(0, 1, 4); b[4]=(uint8_t)((3<<6)|(REG_RSI<<3)|REG_RDI);
-            EMIT(cg, 5);
+            cg_movsd_xmm_base_idx(cg, 1, REG_RDI, REG_RSI, 0x11);
             cg_loop_end(cg, lp, 1);
             pn = emit_xor_reg_reg(BUF(cg), REG_RAX, REG_RAX); EMIT(cg, pn);
             return 1;

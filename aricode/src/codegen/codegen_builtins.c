@@ -169,6 +169,41 @@ static void emit_sincos_body(CodegenState *cg, int is_cos) {
     /* movq xmm0, rax — load x into xmm0 */
     b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xC0; EMIT(cg, 5);
 
+    /* --- Quick-path: if |x| <= π/4, skip octant reduction entirely. ---
+     * Common in ML/graphics where angles are already pre-normalised.
+     * Saves ~25 cycles (the full reduction) for the price of 3 insns +
+     * one well-predicted branch. */
+    /* mov rcx, rax */
+    b = BUF(cg); b[0]=0x48; b[1]=0x89; b[2]=0xC1; EMIT(cg, 3);
+    /* btr rcx, 63   — clear sign bit → rcx = bits of |x| */
+    b = BUF(cg); b[0]=0x48; b[1]=0x0F; b[2]=0xBA; b[3]=0xF1; b[4]=0x3F; EMIT(cg, 5);
+    /* mov rdx, 0x3FE921FB54442D18  (bits of π/4) */
+    pn = emit_mov_reg_imm64(BUF(cg), REG_RDX, 0x3FE921FB54442D18ULL); EMIT(cg, pn);
+    /* cmp rcx, rdx */
+    b = BUF(cg); b[0]=0x48; b[1]=0x39; b[2]=0xD1; EMIT(cg, 3);
+    /* ja need_reduce  (placeholder — 6-byte near jump: 0F 87 xx xx xx xx) */
+    size_t ja_pos = cg->code_size;
+    b = BUF(cg); b[0]=0x0F; b[1]=0x87; b[2]=0; b[3]=0; b[4]=0; b[5]=0; EMIT(cg, 6);
+
+    /* Fast path — no reduction, no octant branch, no sign flip. */
+    if (is_cos) {
+        emit_cos_poly_sse2(cg);
+    } else {
+        emit_sin_poly_sse2(cg);
+    }
+    /* movq rax, xmm0  — sync rax with result */
+    b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x7E; b[4]=0xC0; EMIT(cg, 5);
+    /* jmp done  (placeholder) */
+    size_t jmp_fast_done = cg->code_size;
+    b = BUF(cg); b[0]=0xE9; b[1]=0; b[2]=0; b[3]=0; b[4]=0; EMIT(cg, 5);
+
+    /* --- Patch `ja need_reduce` to land here --- */
+    {
+        int32_t off = (int32_t)(cg->code_size - (ja_pos + 6));
+        memcpy(cg->code + ja_pos + 2, &off, 4);
+    }
+
+    /* --- Slow path: full octant reduction + sin/cos poly select. --- */
     emit_sincos_octant_reduce(cg);  /* xmm0 = r, rax = n & 3 */
 
     if (is_cos) {
@@ -224,6 +259,12 @@ static void emit_sincos_body(CodegenState *cg, int is_cos) {
     b = BUF(cg); b[0]=0x48; b[1]=0x31; b[2]=0xC8; EMIT(cg, 3);
     /* movq xmm0, rax */
     b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xC0; EMIT(cg, 5);
+
+    /* --- Patch the fast-path `jmp done` to land here. --- */
+    {
+        int32_t off = (int32_t)(cg->code_size - (jmp_fast_done + 5));
+        memcpy(cg->code + jmp_fast_done + 1, &off, 4);
+    }
     (void)pn;
 }
 

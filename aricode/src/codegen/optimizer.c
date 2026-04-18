@@ -10,6 +10,7 @@
 #include "../decimal/decimal.h"
 #include "../decimal/decimal_ops.h"
 
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -157,6 +158,68 @@ static int try_fold_unary(ASTNode *node) {
  * Recursively fold constants in a subtree (bottom-up).
  * Returns the number of folds performed.
  */
+/*
+ * Fold math_<fn>(LITERAL) at compile time using host libm.
+ *
+ * aricode's runtime sin/cos/exp/log polynomials deliver ~10^-11 accuracy;
+ * host libm gives full ULP precision.  For a literal argument the
+ * result is identical whether we evaluate now or at runtime (same
+ * mathematical operation, different error bounds), and folding lets
+ * the consuming expression constant-fold further (e.g. `sin(0) + 1`
+ * collapses to `1.0`).  This is the same optimization gcc enables
+ * under -ffast-math / -fno-math-errno.
+ */
+static int try_fold_math_call(ASTNode *node) {
+    if (!node || node->type != NODE_CALL || node->child_count != 2)
+        return 0;
+
+    ASTNode *callee = node->children[0];
+    ASTNode *arg    = node->children[1];
+    if (!callee || callee->type != NODE_IDENTIFIER || !callee->string_val)
+        return 0;
+
+    /* Accept f64 literals; coerce int literals to f64 transparently. */
+    double x;
+    if (arg->type == NODE_FLOAT_LITERAL) {
+        x = arg->float_val;
+    } else if (arg->type == NODE_INT_LITERAL) {
+        x = (double)arg->int_val;
+    } else {
+        return 0;
+    }
+
+    const char *fn = callee->string_val;
+    double result;
+    if      (strcmp(fn, "math_sin")  == 0) result = sin(x);
+    else if (strcmp(fn, "math_cos")  == 0) result = cos(x);
+    else if (strcmp(fn, "math_exp")  == 0) result = exp(x);
+    else if (strcmp(fn, "math_log")  == 0) {
+        if (x <= 0.0) return 0;     /* leave runtime path to surface the error */
+        result = log(x);
+    }
+    else if (strcmp(fn, "math_sqrt") == 0) {
+        if (x < 0.0) return 0;
+        result = sqrt(x);
+    }
+    else if (strcmp(fn, "math_abs")  == 0) result = fabs(x);
+    else return 0;
+
+    /* Replace the CALL node in place with a float literal. */
+    for (size_t i = 0; i < node->child_count; i++)
+        ast_free(node->children[i]);
+    free(node->children);
+    free(node->string_val);
+    free(node->op);
+    node->type        = NODE_FLOAT_LITERAL;
+    node->float_val   = result;
+    node->children    = NULL;
+    node->child_count = 0;
+    node->child_cap   = 0;
+    node->string_val  = NULL;
+    node->op          = NULL;
+    return 1;
+}
+
 static int fold_node(ASTNode *node) {
     if (!node) return 0;
 
@@ -172,6 +235,8 @@ static int fold_node(ASTNode *node) {
         count += try_fold_binary_int(node);
     } else if (node->type == NODE_UNARY_OP) {
         count += try_fold_unary(node);
+    } else if (node->type == NODE_CALL) {
+        count += try_fold_math_call(node);
     }
 
     return count;

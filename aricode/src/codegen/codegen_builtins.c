@@ -28,73 +28,107 @@
  * Both leave: sin_poly(r) or cos_poly(r) in xmm0 (RAX is NOT written
  * here — the caller takes care of that after sign-flipping).
  */
-static void emit_sin_poly_sse2(CodegenState *cg) {
+/*
+ * Helper: emit a single Horner step using FMA3.
+ *
+ * Replaces the classical two-instruction pattern
+ *    mulsd xmm_acc, xmm_y     ; 3c
+ *    addsd xmm_acc, xmm_c     ; 3c  (chained = 6c)
+ * with
+ *    vfmadd213sd xmm_acc, xmm_y, xmm_c   ; 4c
+ * saving 2 cycles per Horner step on Zen 3 (and emitting fewer bytes).
+ *
+ * xmm_acc must already hold the running accumulator, xmm_y the y
+ * multiplier.  This helper loads the constant `coef_bits` into xmm_c
+ * and fuses the `acc = acc·y + c` step.
+ *
+ * VEX encoding of vfmadd213sd xmm_acc, xmm_y, xmm_c :
+ *   C4 E2 <W vvvv L pp> A9 <modrm>
+ *     W = 1, L = 0, pp = 01        (fixed for sd)
+ *     vvvv = ~xmm_y                (second source operand)
+ *     modrm = 11 xmm_acc xmm_c
+ */
+static void emit_fma_horner_step(CodegenState *cg,
+                                 int acc, int y, int c_reg,
+                                 uint64_t coef_bits) {
     int pn; uint8_t *b;
+    /* Load coefficient into xmm_c via RCX. */
+    pn = emit_mov_reg_imm64(BUF(cg), REG_RCX, coef_bits); EMIT(cg, pn);
+    b = BUF(cg);
+    b[0] = 0x66; b[1] = 0x48; b[2] = 0x0F; b[3] = 0x6E;
+    b[4] = 0xC0 | ((c_reg & 7) << 3) | (REG_RCX & 7);   /* movq xmm_c, rcx */
+    EMIT(cg, 5);
 
-    /* xmm1 = x*x */
+    /* vfmadd213sd xmm_acc, xmm_y, xmm_c  →  acc = y·acc + c */
+    b = BUF(cg);
+    b[0] = 0xC4;
+    b[1] = 0xE2;                                         /* RXB.mmmmm = 1.1.1.00010 */
+    b[2] = 0x81 | ((~y & 0xF) << 3);                     /* W=1, vvvv=~y, L=0, pp=01 */
+    b[3] = 0xA9;
+    b[4] = 0xC0 | ((acc & 7) << 3) | (c_reg & 7);        /* mod=11, reg=acc, r/m=c */
+    EMIT(cg, 5);
+}
+
+/* Emit `dst += src1·src2` as vfmadd231sd dst, src1, src2  (231 form:
+ * dst = dst + src1·src2 with single rounding).  Used for final
+ * recombination where we don't want to overwrite dst's current value. */
+static void emit_fma_add(CodegenState *cg, int dst, int src1, int src2) {
+    uint8_t *b = BUF(cg);
+    b[0] = 0xC4;
+    b[1] = 0xE2;
+    b[2] = 0x81 | ((~src1 & 0xF) << 3);
+    b[3] = 0xB9;                                 /* 231 form opcode */
+    b[4] = 0xC0 | ((dst & 7) << 3) | (src2 & 7);
+    EMIT(cg, 5);
+}
+
+static void emit_sin_poly_sse2(CodegenState *cg) {
+    uint8_t *b;
+
+    /* xmm1 = y = x*x */
     b = BUF(cg); b[0]=0x66; b[1]=0x0F; b[2]=0x28; b[3]=0xC8; EMIT(cg, 4);  /* movapd xmm1, xmm0 */
     b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x59; b[3]=0xC9; EMIT(cg, 4);  /* mulsd  xmm1, xmm1 */
 
-    /* Horner: xmm2 = S1 + x²·(S2 + x²·(S3 + x²·(S4 + x²·S5))) */
-    pn = emit_mov_reg_imm64(BUF(cg), REG_RCX, 0xBE5AE5E68A2B9CEBULL); EMIT(cg, pn);  /* S5 */
+    /* Seed accumulator with S5.  xmm2 = S5. */
+    int pn = emit_mov_reg_imm64(BUF(cg), REG_RCX, 0xBE5AE5E68A2B9CEBULL); EMIT(cg, pn);
     b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xD1; EMIT(cg, 5);
-    b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x59; b[3]=0xD1; EMIT(cg, 4);
-    pn = emit_mov_reg_imm64(BUF(cg), REG_RCX, 0x3EC71DE357B1FE7DULL); EMIT(cg, pn);  /* S4 */
-    b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xD9; EMIT(cg, 5);
-    b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x58; b[3]=0xD3; EMIT(cg, 4);
-    b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x59; b[3]=0xD1; EMIT(cg, 4);
-    pn = emit_mov_reg_imm64(BUF(cg), REG_RCX, 0xBF2A01A019C161D5ULL); EMIT(cg, pn);  /* S3 */
-    b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xD9; EMIT(cg, 5);
-    b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x58; b[3]=0xD3; EMIT(cg, 4);
-    b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x59; b[3]=0xD1; EMIT(cg, 4);
-    pn = emit_mov_reg_imm64(BUF(cg), REG_RCX, 0x3F8111111110F8A6ULL); EMIT(cg, pn);  /* S2 */
-    b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xD9; EMIT(cg, 5);
-    b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x58; b[3]=0xD3; EMIT(cg, 4);
-    b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x59; b[3]=0xD1; EMIT(cg, 4);
-    pn = emit_mov_reg_imm64(BUF(cg), REG_RCX, 0xBFC5555555555549ULL); EMIT(cg, pn);  /* S1 */
-    b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xD9; EMIT(cg, 5);
-    b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x58; b[3]=0xD3; EMIT(cg, 4);
 
-    /* sin(x) = x + x³ · poly_tail  (xmm0 += x³ · xmm2) */
+    /* Horner steps via FMA3: xmm2 = xmm2·y + Sk for k = 4..1.
+     * Critical path 4 steps × 4c = 16c (vs 4 × 6c = 24c without FMA). */
+    emit_fma_horner_step(cg, 2, 1, 3, 0x3EC71DE357B1FE7DULL);  /* + S4 */
+    emit_fma_horner_step(cg, 2, 1, 3, 0xBF2A01A019C161D5ULL);  /* + S3 */
+    emit_fma_horner_step(cg, 2, 1, 3, 0x3F8111111110F8A6ULL);  /* + S2 */
+    emit_fma_horner_step(cg, 2, 1, 3, 0xBFC5555555555549ULL);  /* + S1 */
+
+    /* Final: sin(x) = x + x³ · poly_tail.
+     *   xmm3 = x³ = x · y
+     *   xmm0 += xmm3 · xmm2      (vfmadd231sd) */
     b = BUF(cg); b[0]=0x66; b[1]=0x0F; b[2]=0x28; b[3]=0xD8; EMIT(cg, 4);  /* movapd xmm3, xmm0 */
-    b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x59; b[3]=0xD9; EMIT(cg, 4);  /* mulsd  xmm3, xmm1 (x³) */
-    b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x59; b[3]=0xDA; EMIT(cg, 4);  /* mulsd  xmm3, xmm2 */
-    b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x58; b[3]=0xC3; EMIT(cg, 4);  /* addsd  xmm0, xmm3 */
+    b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x59; b[3]=0xD9; EMIT(cg, 4);  /* mulsd  xmm3, xmm1 */
+    emit_fma_add(cg, 0, 3, 2);                                             /* xmm0 += xmm3·xmm2 */
 }
 
 static void emit_cos_poly_sse2(CodegenState *cg) {
-    int pn; uint8_t *b;
+    uint8_t *b;
 
-    /* xmm1 = x*x */
-    b = BUF(cg); b[0]=0x66; b[1]=0x0F; b[2]=0x28; b[3]=0xC8; EMIT(cg, 4);  /* movapd xmm1, xmm0 */
-    b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x59; b[3]=0xC9; EMIT(cg, 4);  /* mulsd  xmm1, xmm1 */
+    /* xmm1 = y = x*x */
+    b = BUF(cg); b[0]=0x66; b[1]=0x0F; b[2]=0x28; b[3]=0xC8; EMIT(cg, 4);
+    b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x59; b[3]=0xC9; EMIT(cg, 4);
 
-    /* Horner: xmm2 = C1 + x²·(C2 + x²·(C3 + x²·(C4 + x²·C5))) */
-    pn = emit_mov_reg_imm64(BUF(cg), REG_RCX, 0xBE927E4F809C52ADULL); EMIT(cg, pn);  /* C5 */
+    /* Seed with C5. */
+    int pn = emit_mov_reg_imm64(BUF(cg), REG_RCX, 0xBE927E4F809C52ADULL); EMIT(cg, pn);
     b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xD1; EMIT(cg, 5);
-    b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x59; b[3]=0xD1; EMIT(cg, 4);
-    pn = emit_mov_reg_imm64(BUF(cg), REG_RCX, 0x3EFA01A019CB1590ULL); EMIT(cg, pn);  /* C4 */
-    b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xD9; EMIT(cg, 5);
-    b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x58; b[3]=0xD3; EMIT(cg, 4);
-    b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x59; b[3]=0xD1; EMIT(cg, 4);
-    pn = emit_mov_reg_imm64(BUF(cg), REG_RCX, 0xBF56C16C16C15177ULL); EMIT(cg, pn);  /* C3 */
-    b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xD9; EMIT(cg, 5);
-    b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x58; b[3]=0xD3; EMIT(cg, 4);
-    b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x59; b[3]=0xD1; EMIT(cg, 4);
-    pn = emit_mov_reg_imm64(BUF(cg), REG_RCX, 0x3FA555555555554CULL); EMIT(cg, pn);  /* C2 */
-    b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xD9; EMIT(cg, 5);
-    b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x58; b[3]=0xD3; EMIT(cg, 4);
-    b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x59; b[3]=0xD1; EMIT(cg, 4);
-    pn = emit_mov_reg_imm64(BUF(cg), REG_RCX, 0xBFE0000000000000ULL); EMIT(cg, pn);  /* C1 = -1/2 */
-    b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xD9; EMIT(cg, 5);
-    b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x58; b[3]=0xD3; EMIT(cg, 4);
 
-    /* cos(x) = 1 + x² · poly_tail  (xmm0 = 1 + x² · xmm2) */
-    b = BUF(cg); b[0]=0x66; b[1]=0x0F; b[2]=0x28; b[3]=0xD9; EMIT(cg, 4);  /* movapd xmm3, xmm1 */
-    b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x59; b[3]=0xDA; EMIT(cg, 4);  /* mulsd  xmm3, xmm2 (x² · poly) */
-    pn = emit_mov_reg_imm64(BUF(cg), REG_RCX, 0x3FF0000000000000ULL); EMIT(cg, pn);  /* 1.0 */
+    emit_fma_horner_step(cg, 2, 1, 3, 0x3EFA01A019CB1590ULL);  /* + C4 */
+    emit_fma_horner_step(cg, 2, 1, 3, 0xBF56C16C16C15177ULL);  /* + C3 */
+    emit_fma_horner_step(cg, 2, 1, 3, 0x3FA555555555554CULL);  /* + C2 */
+    emit_fma_horner_step(cg, 2, 1, 3, 0xBFE0000000000000ULL);  /* + C1 = -1/2 */
+
+    /* cos(x) = 1 + x² · poly_tail.  Seed xmm0 with 1.0 and FMA in
+     * xmm1·xmm2  (vfmadd231sd). */
+    pn = emit_mov_reg_imm64(BUF(cg), REG_RCX, 0x3FF0000000000000ULL); EMIT(cg, pn);
     b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xC1; EMIT(cg, 5);  /* movq xmm0, rcx */
-    b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x58; b[3]=0xC3; EMIT(cg, 4);  /* addsd xmm0, xmm3 */
+    emit_fma_add(cg, 0, 1, 2);                                                         /* xmm0 += xmm1·xmm2 */
 }
 
 /* =====================================================================

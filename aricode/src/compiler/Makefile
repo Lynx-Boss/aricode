@@ -49,7 +49,7 @@ TARGET = aric
 all: $(TARGET)
 
 $(TARGET): $(SRCS)
-	$(CC) $(CFLAGS) $(INCLUDES) -o $@ $^
+	$(CC) $(CFLAGS) $(INCLUDES) -o $@ $^ -lm
 
 clean:
 	rm -f $(TARGET)

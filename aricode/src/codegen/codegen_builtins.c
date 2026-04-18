@@ -128,6 +128,95 @@ static void cg_mulsd(CodegenState *cg, int dst, int src) {
 }
 
 /* =====================================================================
+ *  Counted-loop bracket — abstracts the cmp/jae/…/add/jmp/patch idiom
+ *  that every vectorised array builtin opened with.  Use by capturing
+ *  the handle returned by cg_loop_begin, emitting the body, then
+ *  closing with cg_loop_end (which knows whether to step by 4 for the
+ *  AVX2 path or by 1 for the scalar tail).
+ * ===================================================================== */
+
+typedef struct {
+    size_t top;          /* code offset of the `cmp idx, limit` */
+    size_t jae_patch;    /* code offset of the 6-byte jae rel32  */
+    int    idx_reg;      /* e.g. REG_RSI or R12 (low 3 bits used) */
+    int    limit_is_high;/* limit register (RDX, R8..R11, RCX, …) */
+    int    limit_reg;    /* full 0..15                           */
+} CgCountedLoop;
+
+/* Emit:
+ *     .top:
+ *        cmp <idx>, <limit>         ; 3-byte REX.W 0x39 modrm
+ *        jae .done (rel32 placeholder, patched in cg_loop_end)
+ * Caller emits the body between this and cg_loop_end. */
+static CgCountedLoop cg_loop_begin(CodegenState *cg, int idx_reg, int limit_reg) {
+    CgCountedLoop lp;
+    lp.top       = cg->code_size;
+    lp.idx_reg   = idx_reg;
+    lp.limit_reg = limit_reg;
+    lp.limit_is_high = (limit_reg >= 8);
+
+    /* REX.W + opcode 0x39 + modrm = cmp r64, r64. */
+    uint8_t rex = 0x48;
+    if (idx_reg >= 8)   rex |= 0x01;   /* REX.B on r/m */
+    if (limit_reg >= 8) rex |= 0x04;   /* REX.R on reg */
+
+    uint8_t *b = BUF(cg);
+    b[0] = rex;
+    b[1] = 0x39;
+    /* mod=11, reg = limit (in modrm.reg), r/m = idx */
+    b[2] = 0xC0 | ((limit_reg & 7) << 3) | (idx_reg & 7);
+    EMIT(cg, 3);
+
+    /* jae rel32 placeholder — we patch it in cg_loop_end. */
+    lp.jae_patch = cg->code_size;
+    b = BUF(cg);
+    b[0] = 0x0F; b[1] = 0x83;
+    memset(b + 2, 0, 4);
+    EMIT(cg, 6);
+    return lp;
+}
+
+/* Emit:
+ *        add idx, step    ; (or `inc idx` when step == 1)
+ *        jmp .top         ; rel32
+ *     .done:               ; patched into the jae above
+ *
+ * `step` must be 1 (scalar tail) or 4 (4-wide AVX2 body).
+ */
+static void cg_loop_end(CodegenState *cg, CgCountedLoop lp, int step) {
+    uint8_t *b;
+
+    /* Index advance: `add idx, 4` or `inc idx`. */
+    if (step == 1) {
+        /* inc r64. REX.W = 1; opcode FF /0. */
+        uint8_t rex = 0x48 | ((lp.idx_reg >= 8) ? 0x01 : 0);
+        b = BUF(cg);
+        b[0] = rex;
+        b[1] = 0xFF;
+        b[2] = 0xC0 | (lp.idx_reg & 7);
+        EMIT(cg, 3);
+    } else {
+        /* add r64, imm8. REX.W = 1; opcode 83 /0. */
+        uint8_t rex = 0x48 | ((lp.idx_reg >= 8) ? 0x01 : 0);
+        b = BUF(cg);
+        b[0] = rex;
+        b[1] = 0x83;
+        b[2] = 0xC0 | (lp.idx_reg & 7);
+        b[3] = (uint8_t)step;
+        EMIT(cg, 4);
+    }
+
+    /* jmp rel32 back to top. */
+    int32_t back = (int32_t)((int64_t)lp.top - (int64_t)(cg->code_size + 5));
+    int n = emit_jmp(BUF(cg), back);
+    EMIT(cg, n);
+
+    /* Patch the jae at loop entry to land here (.done). */
+    int32_t done_off = (int32_t)(cg->code_size - (lp.jae_patch + 6));
+    memcpy(cg->code + lp.jae_patch + 2, &done_off, 4);
+}
+
+/* =====================================================================
  *  Packed AVX2 helpers (ymm, 4 doubles per register)
  * =====================================================================
  *
@@ -1036,21 +1125,14 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             pn = emit_add_reg_reg(BUF(cg), REG_RAX, REG_RDX); EMIT(cg, pn);
 
             /* Scalar tail for remaining elements */
-            size_t scalar_loop = cg->code_size;
-            pn = emit_cmp_reg_reg(BUF(cg), REG_RSI, REG_RCX); EMIT(cg, pn);
-            size_t jae_end = cg->code_size;
-            b = BUF(cg); b[0]=0x0F; b[1]=0x83; memset(b+2,0,4); EMIT(cg, 6);
+            CgCountedLoop st = cg_loop_begin(cg, REG_RSI, REG_RCX);
             /* mov rdx, [rdi + rsi*8] */
             b = BUF(cg); b[0]=rex(1,reg_ext(REG_RDX),reg_ext(REG_RSI),reg_ext(REG_RDI));
             b[1]=0x8B; b[2]=modrm(0,REG_RDX&7,4);
             b[3]=(uint8_t)((3<<6)|((REG_RSI&7)<<3)|(REG_RDI&7));
             EMIT(cg, 4);
             pn = emit_add_reg_reg(BUF(cg), REG_RAX, REG_RDX); EMIT(cg, pn);
-            pn = emit_inc_reg(BUF(cg), REG_RSI); EMIT(cg, pn);
-            int32_t back2 = (int32_t)((int64_t)scalar_loop - (int64_t)(cg->code_size + 5));
-            pn = emit_jmp(BUF(cg), back2); EMIT(cg, pn);
-            int32_t jae_off = (int32_t)(cg->code_size - (jae_end + 6));
-            memcpy(cg->code + jae_end + 2, &jae_off, 4);
+            cg_loop_end(cg, st, 1);
 
             /* vzeroupper — required after AVX to avoid SSE transition penalty */
             b = BUF(cg); b[0]=0xC5; b[1]=0xF8; b[2]=0x77; EMIT(cg, 3);
@@ -1192,10 +1274,7 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             pn = emit_mov_reg_mem(BUF(cg), REG_RCX, REG_RAX, -8); EMIT(cg, pn); /* len */
             pn = emit_xor_reg_reg(BUF(cg), REG_RSI, REG_RSI); EMIT(cg, pn); /* i=0 */
 
-            size_t loop_top = cg->code_size;
-            pn = emit_cmp_reg_reg(BUF(cg), REG_RSI, REG_RCX); EMIT(cg, pn);
-            size_t jae_done = cg->code_size;
-            b = BUF(cg); b[0]=0x0F; b[1]=0x83; memset(b+2,0,4); EMIT(cg, 6);
+            CgCountedLoop lp = cg_loop_begin(cg, REG_RSI, REG_RCX);
             /* mov rax, [rdi + rsi*8] */
             b = BUF(cg); b[0]=rex(1,reg_ext(REG_RAX),reg_ext(REG_RSI),reg_ext(REG_RDI));
             b[1]=0x8B; b[2]=modrm(0,REG_RAX&7,4);
@@ -1208,11 +1287,7 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             b[1]=0x89; b[2]=modrm(0,REG_RAX&7,4);
             b[3]=(uint8_t)((3<<6)|((REG_RSI&7)<<3)|(REG_RDI&7));
             EMIT(cg, 4);
-            pn = emit_inc_reg(BUF(cg), REG_RSI); EMIT(cg, pn);
-            int32_t back = (int32_t)((int64_t)loop_top - (int64_t)(cg->code_size + 5));
-            pn = emit_jmp(BUF(cg), back); EMIT(cg, pn);
-            int32_t jae_off = (int32_t)(cg->code_size - (jae_done + 6));
-            memcpy(cg->code + jae_done + 2, &jae_off, 4);
+            cg_loop_end(cg, lp, 1);
             pn = emit_xor_reg_reg(BUF(cg), REG_RAX, REG_RAX); EMIT(cg, pn);
             return 1;
         }
@@ -1235,10 +1310,7 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             b = BUF(cg); b[0]=0x4D; b[1]=0x31; b[2]=0xC9; EMIT(cg, 3); /* xor r9, r9 (acc=0) */
             pn = emit_xor_reg_reg(BUF(cg), REG_RSI, REG_RSI); EMIT(cg, pn); /* i=0 */
 
-            size_t loop_top = cg->code_size;
-            pn = emit_cmp_reg_reg(BUF(cg), REG_RSI, REG_RCX); EMIT(cg, pn);
-            size_t jae_done = cg->code_size;
-            b = BUF(cg); b[0]=0x0F; b[1]=0x83; memset(b+2,0,4); EMIT(cg, 6);
+            CgCountedLoop lp = cg_loop_begin(cg, REG_RSI, REG_RCX);
             /* mov rax, [rdi + rsi*8] — a[i] */
             b = BUF(cg); b[0]=rex(1,reg_ext(REG_RAX),reg_ext(REG_RSI),reg_ext(REG_RDI));
             b[1]=0x8B; b[2]=modrm(0,REG_RAX&7,4);
@@ -1253,11 +1325,7 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             pn = emit_imul_reg_reg(BUF(cg), REG_RAX, REG_RDX); EMIT(cg, pn);
             /* add r9, rax */
             b = BUF(cg); b[0]=0x49; b[1]=0x01; b[2]=0xC1; EMIT(cg, 3);
-            pn = emit_inc_reg(BUF(cg), REG_RSI); EMIT(cg, pn);
-            int32_t back = (int32_t)((int64_t)loop_top - (int64_t)(cg->code_size + 5));
-            pn = emit_jmp(BUF(cg), back); EMIT(cg, pn);
-            int32_t jae_off = (int32_t)(cg->code_size - (jae_done + 6));
-            memcpy(cg->code + jae_done + 2, &jae_off, 4);
+            cg_loop_end(cg, lp, 1);
             /* Restore RBX */
             pn = emit_pop(BUF(cg), REG_RBX); EMIT(cg, pn);
             /* mov rax, r9 (return accumulator) */
@@ -2722,21 +2790,14 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             /* xorpd xmm0, xmm0 (zero accumulator) */
             b = BUF(cg); b[0]=0x66; b[1]=0x0F; b[2]=0x57; b[3]=0xC0; EMIT(cg, 4);
             pn = emit_xor_reg_reg(BUF(cg), REG_RSI, REG_RSI); EMIT(cg, pn);
-            size_t loop_top = cg->code_size;
-            pn = emit_cmp_reg_reg(BUF(cg), REG_RSI, REG_RCX); EMIT(cg, pn);
-            size_t jae_done = cg->code_size;
-            b = BUF(cg); b[0]=0x0F; b[1]=0x83; memset(b+2,0,4); EMIT(cg, 6);
+            CgCountedLoop lp = cg_loop_begin(cg, REG_RSI, REG_RCX);
             /* movsd xmm1, [rdi + rsi*8] */
             b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x10;
             b[3]=modrm(0, 1, 4); b[4]=(uint8_t)((3<<6)|(REG_RSI<<3)|REG_RDI);
             EMIT(cg, 5);
             /* addsd xmm0, xmm1 */
             pn = emit_addsd(BUF(cg), 0, 1); EMIT(cg, pn);
-            pn = emit_inc_reg(BUF(cg), REG_RSI); EMIT(cg, pn);
-            int32_t back = (int32_t)((int64_t)loop_top - (int64_t)(cg->code_size + 5));
-            pn = emit_jmp(BUF(cg), back); EMIT(cg, pn);
-            int32_t jae_off = (int32_t)(cg->code_size - (jae_done + 6));
-            memcpy(cg->code + jae_done + 2, &jae_off, 4);
+            cg_loop_end(cg, lp, 1);
             /* movq rax, xmm0 (return f64 bits) */
             b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x7E; b[4]=0xC0; EMIT(cg, 5);
             return 1;
@@ -2764,10 +2825,7 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             b = BUF(cg); b[0]=0x66; b[1]=0x0F; b[2]=0x57; b[3]=0xC9; EMIT(cg, 4);
             pn = emit_xor_reg_reg(BUF(cg), REG_RSI, REG_RSI); EMIT(cg, pn);
 
-            size_t loop_top = cg->code_size;
-            pn = emit_cmp_reg_reg(BUF(cg), REG_RSI, REG_RCX); EMIT(cg, pn);
-            size_t jae_done = cg->code_size;
-            b = BUF(cg); b[0]=0x0F; b[1]=0x83; memset(b+2,0,4); EMIT(cg, 6);
+            CgCountedLoop lp = cg_loop_begin(cg, REG_RSI, REG_RCX);
 
             /* xmm2 = arr[i] */
             b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x10;
@@ -2790,11 +2848,7 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             /* xmm0 = sum = t */
             pn = emit_movsd_xmm_xmm(BUF(cg), 0, 4); EMIT(cg, pn);
 
-            pn = emit_inc_reg(BUF(cg), REG_RSI); EMIT(cg, pn);
-            int32_t back = (int32_t)((int64_t)loop_top - (int64_t)(cg->code_size + 5));
-            pn = emit_jmp(BUF(cg), back); EMIT(cg, pn);
-            int32_t jae_off = (int32_t)(cg->code_size - (jae_done + 6));
-            memcpy(cg->code + jae_done + 2, &jae_off, 4);
+            cg_loop_end(cg, lp, 1);
 
             /* movq rax, xmm0 */
             b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x7E; b[4]=0xC0; EMIT(cg, 5);
@@ -2836,10 +2890,7 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             pn = emit_xor_reg_reg(BUF(cg), REG_RSI, REG_RSI); EMIT(cg, pn);
 
             /* ── Vector loop: while RSI < RDX { … RSI += 4 } ─────────── */
-            size_t vloop_top = cg->code_size;
-            pn = emit_cmp_reg_reg(BUF(cg), REG_RSI, REG_RDX); EMIT(cg, pn);
-            size_t vloop_jae = cg->code_size;
-            b = BUF(cg); b[0]=0x0F; b[1]=0x83; memset(b+2,0,4); EMIT(cg, 6);
+            CgCountedLoop vec = cg_loop_begin(cg, REG_RSI, REG_RDX);
 
             /* vmovupd ymm1, [rdi + rsi*8] */
             b = BUF(cg); b[0]=0xC5; b[1]=0xFD; b[2]=0x10;
@@ -2852,16 +2903,7 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             /* vfmadd231pd ymm0, ymm1, ymm2  →  ymm0 += ymm1·ymm2 */
             b = BUF(cg); b[0]=0xC4; b[1]=0xE2; b[2]=0xF5; b[3]=0xB8; b[4]=0xC2; EMIT(cg, 5);
 
-            /* add rsi, 4 */
-            b = BUF(cg); b[0]=0x48; b[1]=0x83; b[2]=0xC6; b[3]=0x04; EMIT(cg, 4);
-
-            /* jmp vloop_top */
-            int32_t vback = (int32_t)((int64_t)vloop_top - (int64_t)(cg->code_size + 5));
-            pn = emit_jmp(BUF(cg), vback); EMIT(cg, pn);
-            {
-                int32_t off = (int32_t)(cg->code_size - (vloop_jae + 6));
-                memcpy(cg->code + vloop_jae + 2, &off, 4);
-            }
+            cg_loop_end(cg, vec, 4);
 
             /* ── Horizontal sum: ymm0 → scalar xmm0 ──────────────────── */
             /* vextractf128 xmm1, ymm0, 1 */
@@ -2872,10 +2914,7 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             b = BUF(cg); b[0]=0xC5; b[1]=0xF9; b[2]=0x7C; b[3]=0xC0; EMIT(cg, 4);
 
             /* ── Scalar tail loop: while RSI < RCX ───────────────────── */
-            size_t tloop_top = cg->code_size;
-            pn = emit_cmp_reg_reg(BUF(cg), REG_RSI, REG_RCX); EMIT(cg, pn);
-            size_t tloop_jae = cg->code_size;
-            b = BUF(cg); b[0]=0x0F; b[1]=0x83; memset(b+2,0,4); EMIT(cg, 6);
+            CgCountedLoop tail = cg_loop_begin(cg, REG_RSI, REG_RCX);
 
             /* movsd xmm1, [rdi + rsi*8] */
             b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x10;
@@ -2888,13 +2927,7 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             /* vfmadd231sd xmm0, xmm1, xmm2 */
             b = BUF(cg); b[0]=0xC4; b[1]=0xE2; b[2]=0xF1; b[3]=0xB9; b[4]=0xC2; EMIT(cg, 5);
 
-            pn = emit_inc_reg(BUF(cg), REG_RSI); EMIT(cg, pn);
-            int32_t tback = (int32_t)((int64_t)tloop_top - (int64_t)(cg->code_size + 5));
-            pn = emit_jmp(BUF(cg), tback); EMIT(cg, pn);
-            {
-                int32_t off = (int32_t)(cg->code_size - (tloop_jae + 6));
-                memcpy(cg->code + tloop_jae + 2, &off, 4);
-            }
+            cg_loop_end(cg, tail, 1);
 
             /* vzeroupper — avoid AVX↔SSE transition penalty on return. */
             b = BUF(cg); b[0]=0xC5; b[1]=0xF8; b[2]=0x77; EMIT(cg, 3);
@@ -2927,18 +2960,12 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             b = BUF(cg); b[0]=0x49; b[1]=0x83; b[2]=0xE0; b[3]=0xFC; EMIT(cg, 4);
             pn = emit_xor_reg_reg(BUF(cg), REG_RSI, REG_RSI); EMIT(cg, pn);
 
-            size_t vtop = cg->code_size;
-            /* cmp rsi, r8 */
-            b = BUF(cg); b[0]=0x4C; b[1]=0x39; b[2]=0xC6; EMIT(cg, 3);
-            size_t vjae = cg->code_size;
-            b = BUF(cg); b[0]=0x0F; b[1]=0x83; memset(b+2,0,4); EMIT(cg, 6);
-
+            CgCountedLoop vec = cg_loop_begin(cg, REG_RSI, REG_R8);
             /* vmovupd ymm0, [rbx + rsi*8] */
             b = BUF(cg); b[0]=0xC5; b[1]=0xFD; b[2]=0x10;
             b[3]=modrm(0, 0, 4); b[4]=(uint8_t)((3<<6)|(REG_RSI<<3)|REG_RBX);
             EMIT(cg, 5);
-            /* vsubpd ymm0, ymm0, [rdx + rsi*8]   (mem form)
-             *   VEX.256.66.0F.WIG 5C /r with SIB. */
+            /* vsubpd ymm0, ymm0, [rdx + rsi*8]   (VEX.256.66.0F.WIG 5C /r). */
             b = BUF(cg); b[0]=0xC5; b[1]=0xFD; b[2]=0x5C;
             b[3]=modrm(0, 0, 4); b[4]=(uint8_t)((3<<6)|(REG_RSI<<3)|REG_RDX);
             EMIT(cg, 5);
@@ -2946,21 +2973,10 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             b = BUF(cg); b[0]=0xC5; b[1]=0xFD; b[2]=0x11;
             b[3]=modrm(0, 0, 4); b[4]=(uint8_t)((3<<6)|(REG_RSI<<3)|REG_RDI);
             EMIT(cg, 5);
-
-            /* add rsi, 4 */
-            b = BUF(cg); b[0]=0x48; b[1]=0x83; b[2]=0xC6; b[3]=0x04; EMIT(cg, 4);
-            int32_t vback = (int32_t)((int64_t)vtop - (int64_t)(cg->code_size + 5));
-            pn = emit_jmp(BUF(cg), vback); EMIT(cg, pn);
-            {
-                int32_t off = (int32_t)(cg->code_size - (vjae + 6));
-                memcpy(cg->code + vjae + 2, &off, 4);
-            }
+            cg_loop_end(cg, vec, 4);
 
             /* Scalar tail for rsi < rcx (n mod 4). */
-            size_t st_top = cg->code_size;
-            pn = emit_cmp_reg_reg(BUF(cg), REG_RSI, REG_RCX); EMIT(cg, pn);
-            size_t st_jae = cg->code_size;
-            b = BUF(cg); b[0]=0x0F; b[1]=0x83; memset(b+2,0,4); EMIT(cg, 6);
+            CgCountedLoop tail = cg_loop_begin(cg, REG_RSI, REG_RCX);
             /* movsd xmm0, [rbx + rsi*8] ; subsd xmm0, [rdx + rsi*8] ; movsd [rdi+rsi*8], xmm0 */
             b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x10;
             b[3]=modrm(0, 0, 4); b[4]=(uint8_t)((3<<6)|(REG_RSI<<3)|REG_RBX);
@@ -2971,13 +2987,7 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x11;
             b[3]=modrm(0, 0, 4); b[4]=(uint8_t)((3<<6)|(REG_RSI<<3)|REG_RDI);
             EMIT(cg, 5);
-            pn = emit_inc_reg(BUF(cg), REG_RSI); EMIT(cg, pn);
-            int32_t st_back = (int32_t)((int64_t)st_top - (int64_t)(cg->code_size + 5));
-            pn = emit_jmp(BUF(cg), st_back); EMIT(cg, pn);
-            {
-                int32_t off = (int32_t)(cg->code_size - (st_jae + 6));
-                memcpy(cg->code + st_jae + 2, &off, 4);
-            }
+            cg_loop_end(cg, tail, 1);
 
             b = BUF(cg); b[0]=0xC5; b[1]=0xF8; b[2]=0x77; EMIT(cg, 3);  /* vzeroupper */
             pn = emit_pop(BUF(cg), REG_RBX); EMIT(cg, pn);
@@ -3005,11 +3015,7 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             b = BUF(cg); b[0]=0x49; b[1]=0x83; b[2]=0xE0; b[3]=0xFC; EMIT(cg, 4);
             pn = emit_xor_reg_reg(BUF(cg), REG_RSI, REG_RSI); EMIT(cg, pn);
 
-            size_t vtop = cg->code_size;
-            b = BUF(cg); b[0]=0x4C; b[1]=0x39; b[2]=0xC6; EMIT(cg, 3);
-            size_t vjae = cg->code_size;
-            b = BUF(cg); b[0]=0x0F; b[1]=0x83; memset(b+2,0,4); EMIT(cg, 6);
-
+            CgCountedLoop vec = cg_loop_begin(cg, REG_RSI, REG_R8);
             b = BUF(cg); b[0]=0xC5; b[1]=0xFD; b[2]=0x10;
             b[3]=modrm(0, 0, 4); b[4]=(uint8_t)((3<<6)|(REG_RSI<<3)|REG_RBX);
             EMIT(cg, 5);
@@ -3020,14 +3026,7 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             b = BUF(cg); b[0]=0xC5; b[1]=0xFD; b[2]=0x11;
             b[3]=modrm(0, 0, 4); b[4]=(uint8_t)((3<<6)|(REG_RSI<<3)|REG_RDI);
             EMIT(cg, 5);
-
-            b = BUF(cg); b[0]=0x48; b[1]=0x83; b[2]=0xC6; b[3]=0x04; EMIT(cg, 4);
-            int32_t vback = (int32_t)((int64_t)vtop - (int64_t)(cg->code_size + 5));
-            pn = emit_jmp(BUF(cg), vback); EMIT(cg, pn);
-            {
-                int32_t off = (int32_t)(cg->code_size - (vjae + 6));
-                memcpy(cg->code + vjae + 2, &off, 4);
-            }
+            cg_loop_end(cg, vec, 4);
 
             b = BUF(cg); b[0]=0xC5; b[1]=0xF8; b[2]=0x77; EMIT(cg, 3);
             pn = emit_pop(BUF(cg), REG_RBX); EMIT(cg, pn);
@@ -3072,25 +3071,15 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             b = BUF(cg); b[0]=0x48; b[1]=0xC7; b[2]=0xC6;
             memcpy(b+3, (int32_t[]){4}, 4); EMIT(cg, 7);
 
-            size_t mxtop = cg->code_size;
-            pn = emit_cmp_reg_reg(BUF(cg), REG_RSI, REG_RDX); EMIT(cg, pn);
-            size_t mxjae = cg->code_size;
-            b = BUF(cg); b[0]=0x0F; b[1]=0x83; memset(b+2,0,4); EMIT(cg, 6);
+            CgCountedLoop mx = cg_loop_begin(cg, REG_RSI, REG_RDX);
             /* vmovupd ymm0, [rdi + rsi*8] */
             b = BUF(cg); b[0]=0xC5; b[1]=0xFD; b[2]=0x10;
             b[3]=modrm(0, 0, 4); b[4]=(uint8_t)((3<<6)|(REG_RSI<<3)|REG_RDI);
             EMIT(cg, 5);
-            /* vmaxpd ymm11, ymm11, ymm0   (3-byte VEX since dst=ymm11 high)
-             *   byte2 = 0x05 | <no RXB shifts, all low for src/base>... use cg_vex3 */
+            /* vmaxpd ymm11, ymm11, ymm0 */
             cg_vex3(cg, /*dst=*/11, /*a=*/11, /*b_reg=*/0, 0, 1, 1, 1);
             b = BUF(cg); b[0]=0x5F; b[1]=0xC0 | ((11&7)<<3) | (0&7); EMIT(cg, 2);
-            b = BUF(cg); b[0]=0x48; b[1]=0x83; b[2]=0xC6; b[3]=4; EMIT(cg, 4);
-            int32_t mxback = (int32_t)((int64_t)mxtop - (int64_t)(cg->code_size + 5));
-            pn = emit_jmp(BUF(cg), mxback); EMIT(cg, pn);
-            {
-                int32_t off = (int32_t)(cg->code_size - (mxjae + 6));
-                memcpy(cg->code + mxjae + 2, &off, 4);
-            }
+            cg_loop_end(cg, mx, 4);
 
             /* Horizontal max reduction of ymm11 → scalar → broadcast back.
              *   vextractf128 xmm0, ymm11, 1
@@ -3121,17 +3110,13 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             b = BUF(cg); b[0]=0x57; b[1]=0xC0 | ((12&7)<<3) | (12&7); EMIT(cg, 2);
             pn = emit_xor_reg_reg(BUF(cg), REG_RSI, REG_RSI); EMIT(cg, pn);
 
-            size_t ex_top = cg->code_size;
-            pn = emit_cmp_reg_reg(BUF(cg), REG_RSI, REG_RDX); EMIT(cg, pn);
-            size_t ex_jae = cg->code_size;
-            b = BUF(cg); b[0]=0x0F; b[1]=0x83; memset(b+2,0,4); EMIT(cg, 6);
+            CgCountedLoop ex = cg_loop_begin(cg, REG_RSI, REG_RDX);
 
             /* vmovupd ymm0, [rdi + rsi*8] */
             b = BUF(cg); b[0]=0xC5; b[1]=0xFD; b[2]=0x10;
             b[3]=modrm(0, 0, 4); b[4]=(uint8_t)((3<<6)|(REG_RSI<<3)|REG_RDI);
             EMIT(cg, 5);
-            /* ymm0 -= ymm11  (shift by max)
-             *   vsubpd ymm0, ymm0, ymm11 */
+            /* ymm0 -= ymm11  (shift by max)  —  vsubpd ymm0, ymm0, ymm11 */
             cg_vex3(cg, 0, 0, 11, 0, 1, 1, 1);
             b = BUF(cg); b[0]=0x5C; b[1]=0xC0 | (0<<3) | (11&7); EMIT(cg, 2);
 
@@ -3146,13 +3131,7 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             b[3]=modrm(0, 0, 4); b[4]=(uint8_t)((3<<6)|(REG_RSI<<3)|REG_RDI);
             EMIT(cg, 5);
 
-            b = BUF(cg); b[0]=0x48; b[1]=0x83; b[2]=0xC6; b[3]=4; EMIT(cg, 4);
-            int32_t ex_back = (int32_t)((int64_t)ex_top - (int64_t)(cg->code_size + 5));
-            pn = emit_jmp(BUF(cg), ex_back); EMIT(cg, pn);
-            {
-                int32_t off = (int32_t)(cg->code_size - (ex_jae + 6));
-                memcpy(cg->code + ex_jae + 2, &off, 4);
-            }
+            cg_loop_end(cg, ex, 4);
 
             /* Horizontal sum of ymm12 → scalar → ymm12 = broadcast(1/sum). */
             /* vextractf128 xmm0, ymm12, 1 */
@@ -3177,10 +3156,7 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
 
             /* ── PASS 3: buf[i] *= 1/sum ───────────────────────────── */
             pn = emit_xor_reg_reg(BUF(cg), REG_RSI, REG_RSI); EMIT(cg, pn);
-            size_t nm_top = cg->code_size;
-            pn = emit_cmp_reg_reg(BUF(cg), REG_RSI, REG_RDX); EMIT(cg, pn);
-            size_t nm_jae = cg->code_size;
-            b = BUF(cg); b[0]=0x0F; b[1]=0x83; memset(b+2,0,4); EMIT(cg, 6);
+            CgCountedLoop nm = cg_loop_begin(cg, REG_RSI, REG_RDX);
             /* vmovupd ymm0, [rdi + rsi*8] */
             b = BUF(cg); b[0]=0xC5; b[1]=0xFD; b[2]=0x10;
             b[3]=modrm(0, 0, 4); b[4]=(uint8_t)((3<<6)|(REG_RSI<<3)|REG_RDI);
@@ -3192,13 +3168,7 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             b = BUF(cg); b[0]=0xC5; b[1]=0xFD; b[2]=0x11;
             b[3]=modrm(0, 0, 4); b[4]=(uint8_t)((3<<6)|(REG_RSI<<3)|REG_RDI);
             EMIT(cg, 5);
-            b = BUF(cg); b[0]=0x48; b[1]=0x83; b[2]=0xC6; b[3]=4; EMIT(cg, 4);
-            int32_t nm_back = (int32_t)((int64_t)nm_top - (int64_t)(cg->code_size + 5));
-            pn = emit_jmp(BUF(cg), nm_back); EMIT(cg, pn);
-            {
-                int32_t off = (int32_t)(cg->code_size - (nm_jae + 6));
-                memcpy(cg->code + nm_jae + 2, &off, 4);
-            }
+            cg_loop_end(cg, nm, 4);
 
             emit_exp_coeff_stack_teardown(cg);
             b = BUF(cg); b[0]=0xC5; b[1]=0xF8; b[2]=0x77; EMIT(cg, 3);
@@ -3233,10 +3203,7 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
 
             pn = emit_xor_reg_reg(BUF(cg), REG_RSI, REG_RSI); EMIT(cg, pn);
 
-            size_t vtop = cg->code_size;
-            pn = emit_cmp_reg_reg(BUF(cg), REG_RSI, REG_RDX); EMIT(cg, pn);
-            size_t vjae = cg->code_size;
-            b = BUF(cg); b[0]=0x0F; b[1]=0x83; memset(b+2,0,4); EMIT(cg, 6);
+            CgCountedLoop vec = cg_loop_begin(cg, REG_RSI, REG_RDX);
 
             /* Load ymm0 = x and compute ymm0 = -2·x. */
             b = BUF(cg); b[0]=0xC5; b[1]=0xFD; b[2]=0x10;
@@ -3264,13 +3231,7 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             b[3]=modrm(0, 0, 4); b[4]=(uint8_t)((3<<6)|(REG_RSI<<3)|REG_RDI);
             EMIT(cg, 5);
 
-            b = BUF(cg); b[0]=0x48; b[1]=0x83; b[2]=0xC6; b[3]=0x04; EMIT(cg, 4);
-            int32_t vback = (int32_t)((int64_t)vtop - (int64_t)(cg->code_size + 5));
-            pn = emit_jmp(BUF(cg), vback); EMIT(cg, pn);
-            {
-                int32_t off = (int32_t)(cg->code_size - (vjae + 6));
-                memcpy(cg->code + vjae + 2, &off, 4);
-            }
+            cg_loop_end(cg, vec, 4);
 
             emit_exp_coeff_stack_teardown(cg);
 
@@ -3305,10 +3266,7 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
 
             pn = emit_xor_reg_reg(BUF(cg), REG_RSI, REG_RSI); EMIT(cg, pn);
 
-            size_t vtop = cg->code_size;
-            pn = emit_cmp_reg_reg(BUF(cg), REG_RSI, REG_RDX); EMIT(cg, pn);
-            size_t vjae = cg->code_size;
-            b = BUF(cg); b[0]=0x0F; b[1]=0x83; memset(b+2,0,4); EMIT(cg, 6);
+            CgCountedLoop vec = cg_loop_begin(cg, REG_RSI, REG_RDX);
 
             /* Load ymm0 = x. */
             b = BUF(cg); b[0]=0xC5; b[1]=0xFD; b[2]=0x10;
@@ -3334,13 +3292,7 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             b[3]=modrm(0, 0, 4); b[4]=(uint8_t)((3<<6)|(REG_RSI<<3)|REG_RDI);
             EMIT(cg, 5);
 
-            b = BUF(cg); b[0]=0x48; b[1]=0x83; b[2]=0xC6; b[3]=0x04; EMIT(cg, 4);
-            int32_t vback = (int32_t)((int64_t)vtop - (int64_t)(cg->code_size + 5));
-            pn = emit_jmp(BUF(cg), vback); EMIT(cg, pn);
-            {
-                int32_t off = (int32_t)(cg->code_size - (vjae + 6));
-                memcpy(cg->code + vjae + 2, &off, 4);
-            }
+            cg_loop_end(cg, vec, 4);
 
             emit_exp_coeff_stack_teardown(cg);
 
@@ -3389,10 +3341,7 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             pn = emit_xor_reg_reg(BUF(cg), REG_RSI, REG_RSI); EMIT(cg, pn);
 
             /* ── Vector loop ────────────────────────────────────────── */
-            size_t vtop = cg->code_size;
-            pn = emit_cmp_reg_reg(BUF(cg), REG_RSI, REG_RDX); EMIT(cg, pn);
-            size_t vjae = cg->code_size;
-            b = BUF(cg); b[0]=0x0F; b[1]=0x83; memset(b+2,0,4); EMIT(cg, 6);
+            CgCountedLoop vec = cg_loop_begin(cg, REG_RSI, REG_RDX);
 
             /* ymm0 = x = load from [rdi + rsi*8] */
             b = BUF(cg); b[0]=0xC5; b[1]=0xFD; b[2]=0x10;
@@ -3406,14 +3355,7 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             b[3]=modrm(0, 0, 4); b[4]=(uint8_t)((3<<6)|(REG_RSI<<3)|REG_RDI);
             EMIT(cg, 5);
 
-            /* add rsi, 4 ; jmp vtop */
-            b = BUF(cg); b[0]=0x48; b[1]=0x83; b[2]=0xC6; b[3]=0x04; EMIT(cg, 4);
-            int32_t vback = (int32_t)((int64_t)vtop - (int64_t)(cg->code_size + 5));
-            pn = emit_jmp(BUF(cg), vback); EMIT(cg, pn);
-            {
-                int32_t off = (int32_t)(cg->code_size - (vjae + 6));
-                memcpy(cg->code + vjae + 2, &off, 4);
-            }
+            cg_loop_end(cg, vec, 4);
 
             /* Scalar tail intentionally left empty — callers pad arrays
              * to multiples of 4 (standard NN batching convention). */
@@ -3447,36 +3389,23 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             pn = emit_xor_reg_reg(BUF(cg), REG_RSI, REG_RSI); EMIT(cg, pn);
 
             /* Vector loop. */
-            size_t vtop = cg->code_size;
-            pn = emit_cmp_reg_reg(BUF(cg), REG_RSI, REG_RDX); EMIT(cg, pn);
-            size_t vjae = cg->code_size;
-            b = BUF(cg); b[0]=0x0F; b[1]=0x83; memset(b+2,0,4); EMIT(cg, 6);
+            CgCountedLoop vec = cg_loop_begin(cg, REG_RSI, REG_RDX);
 
             /* vmovupd ymm0, [rdi + rsi*8] */
             b = BUF(cg); b[0]=0xC5; b[1]=0xFD; b[2]=0x10;
             b[3]=modrm(0, 0, 4); b[4]=(uint8_t)((3<<6)|(REG_RSI<<3)|REG_RDI);
             EMIT(cg, 5);
-            /* vmaxpd ymm0, ymm0, ymm1   — VEX.256.66.0F.WIG 5F /r
-             *   C5 FD 5F C1 */
+            /* vmaxpd ymm0, ymm0, ymm1   —  C5 FD 5F C1 */
             b = BUF(cg); b[0]=0xC5; b[1]=0xFD; b[2]=0x5F; b[3]=0xC1; EMIT(cg, 4);
             /* vmovupd [rdi + rsi*8], ymm0 */
             b = BUF(cg); b[0]=0xC5; b[1]=0xFD; b[2]=0x11;
             b[3]=modrm(0, 0, 4); b[4]=(uint8_t)((3<<6)|(REG_RSI<<3)|REG_RDI);
             EMIT(cg, 5);
 
-            b = BUF(cg); b[0]=0x48; b[1]=0x83; b[2]=0xC6; b[3]=0x04; EMIT(cg, 4);
-            int32_t vback = (int32_t)((int64_t)vtop - (int64_t)(cg->code_size + 5));
-            pn = emit_jmp(BUF(cg), vback); EMIT(cg, pn);
-            {
-                int32_t off = (int32_t)(cg->code_size - (vjae + 6));
-                memcpy(cg->code + vjae + 2, &off, 4);
-            }
+            cg_loop_end(cg, vec, 4);
 
             /* Scalar tail: maxsd per element. */
-            size_t ttop = cg->code_size;
-            pn = emit_cmp_reg_reg(BUF(cg), REG_RSI, REG_RCX); EMIT(cg, pn);
-            size_t tjae = cg->code_size;
-            b = BUF(cg); b[0]=0x0F; b[1]=0x83; memset(b+2,0,4); EMIT(cg, 6);
+            CgCountedLoop tail = cg_loop_begin(cg, REG_RSI, REG_RCX);
 
             /* movsd xmm0, [rdi + rsi*8] */
             b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x10;
@@ -3489,13 +3418,7 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             b[3]=modrm(0, 0, 4); b[4]=(uint8_t)((3<<6)|(REG_RSI<<3)|REG_RDI);
             EMIT(cg, 5);
 
-            pn = emit_inc_reg(BUF(cg), REG_RSI); EMIT(cg, pn);
-            int32_t tback = (int32_t)((int64_t)ttop - (int64_t)(cg->code_size + 5));
-            pn = emit_jmp(BUF(cg), tback); EMIT(cg, pn);
-            {
-                int32_t off = (int32_t)(cg->code_size - (tjae + 6));
-                memcpy(cg->code + tjae + 2, &off, 4);
-            }
+            cg_loop_end(cg, tail, 1);
 
             /* vzeroupper + return 0 */
             b = BUF(cg); b[0]=0xC5; b[1]=0xF8; b[2]=0x77; EMIT(cg, 3);
@@ -3542,10 +3465,7 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             pn = emit_xor_reg_reg(BUF(cg), REG_RSI, REG_RSI); EMIT(cg, pn);
 
             /* ── Vector loop: 4 doubles/iter ─────────────────────────── */
-            size_t vtop = cg->code_size;
-            pn = emit_cmp_reg_reg(BUF(cg), REG_RSI, REG_RDX); EMIT(cg, pn);
-            size_t vjae = cg->code_size;
-            b = BUF(cg); b[0]=0x0F; b[1]=0x83; memset(b+2,0,4); EMIT(cg, 6);
+            CgCountedLoop vec = cg_loop_begin(cg, REG_RSI, REG_RDX);
 
             /* vmovupd ymm0, [rdi + rsi*8]  — y chunk */
             b = BUF(cg); b[0]=0xC5; b[1]=0xFD; b[2]=0x10;
@@ -3562,20 +3482,10 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             b[3]=modrm(0, 0, 4); b[4]=(uint8_t)((3<<6)|(REG_RSI<<3)|REG_RDI);
             EMIT(cg, 5);
 
-            /* add rsi, 4 */
-            b = BUF(cg); b[0]=0x48; b[1]=0x83; b[2]=0xC6; b[3]=0x04; EMIT(cg, 4);
-            int32_t vback = (int32_t)((int64_t)vtop - (int64_t)(cg->code_size + 5));
-            pn = emit_jmp(BUF(cg), vback); EMIT(cg, pn);
-            {
-                int32_t off = (int32_t)(cg->code_size - (vjae + 6));
-                memcpy(cg->code + vjae + 2, &off, 4);
-            }
+            cg_loop_end(cg, vec, 4);
 
             /* ── Scalar tail ─────────────────────────────────────────── */
-            size_t ttop = cg->code_size;
-            pn = emit_cmp_reg_reg(BUF(cg), REG_RSI, REG_RCX); EMIT(cg, pn);
-            size_t tjae = cg->code_size;
-            b = BUF(cg); b[0]=0x0F; b[1]=0x83; memset(b+2,0,4); EMIT(cg, 6);
+            CgCountedLoop tail = cg_loop_begin(cg, REG_RSI, REG_RCX);
 
             /* movsd xmm0, [rdi + rsi*8] */
             b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x10;
@@ -3592,13 +3502,7 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             b[3]=modrm(0, 0, 4); b[4]=(uint8_t)((3<<6)|(REG_RSI<<3)|REG_RDI);
             EMIT(cg, 5);
 
-            pn = emit_inc_reg(BUF(cg), REG_RSI); EMIT(cg, pn);
-            int32_t tback = (int32_t)((int64_t)ttop - (int64_t)(cg->code_size + 5));
-            pn = emit_jmp(BUF(cg), tback); EMIT(cg, pn);
-            {
-                int32_t off = (int32_t)(cg->code_size - (tjae + 6));
-                memcpy(cg->code + tjae + 2, &off, 4);
-            }
+            cg_loop_end(cg, tail, 1);
 
             /* vzeroupper + restore RBX + drop the 2 earlier pushed args. */
             b = BUF(cg); b[0]=0xC5; b[1]=0xF8; b[2]=0x77; EMIT(cg, 3);
@@ -3648,10 +3552,7 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
 
             pn = emit_xor_reg_reg(BUF(cg), REG_RBX, REG_RBX); EMIT(cg, pn);
 
-            size_t outer_top = cg->code_size;
-            b = BUF(cg); b[0]=0x4C; b[1]=0x39; b[2]=0xCB; EMIT(cg, 3);
-            size_t outer_jae = cg->code_size;
-            b = BUF(cg); b[0]=0x0F; b[1]=0x83; memset(b+2,0,4); EMIT(cg, 6);
+            CgCountedLoop outer = cg_loop_begin(cg, REG_RBX, 9 /* R9 */);
 
             /* Row base R13 = G + j·n·8 */
             b = BUF(cg); b[0]=0x48; b[1]=0x89; b[2]=0xD8; EMIT(cg, 3);
@@ -3666,64 +3567,38 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             /* Inner loop: i = 0 → n_vec step 4 */
             b = BUF(cg); b[0]=0x4D; b[1]=0x31; b[2]=0xE4; EMIT(cg, 3);
 
-            size_t iv_top = cg->code_size;
-            b = BUF(cg); b[0]=0x4D; b[1]=0x39; b[2]=0xDC; EMIT(cg, 3);
-            size_t iv_jae = cg->code_size;
-            b = BUF(cg); b[0]=0x0F; b[1]=0x83; memset(b+2,0,4); EMIT(cg, 6);
+            CgCountedLoop iv = cg_loop_begin(cg, 12 /* R12 */, 11 /* R11 */);
 
-            /* vmovupd ymm1, [r8 + r12*8]  — b chunk
-             *   byte2: R~=1, X~=0, B~=0 = 0x81 */
+            /* vmovupd ymm1, [r8 + r12*8]  — b chunk  (byte2: R~=1, X~=0, B~=0 = 0x81) */
             b = BUF(cg); b[0]=0xC4; b[1]=0x81; b[2]=0x7D; b[3]=0x10;
             b[4]=0x0C; b[5]=0xE0; EMIT(cg, 6);
-            /* vmovupd ymm2, [r13 + r12*8 + 0]  — G row chunk
-             *   byte2: R~=1, X~=0, B~=0 (r13 base needs disp8 even for 0) */
+            /* vmovupd ymm2, [r13 + r12*8 + 0]  — G row chunk (r13 base → disp8=0) */
             b = BUF(cg); b[0]=0xC4; b[1]=0x81; b[2]=0x7D; b[3]=0x10;
             b[4]=0x54; b[5]=0xE5; b[6]=0x00; EMIT(cg, 7);
-            /* vfmadd231pd ymm2, ymm1, ymm0   — ymm2 += ymm1·ymm0 */
+            /* vfmadd231pd ymm2, ymm1, ymm0 */
             b = BUF(cg); b[0]=0xC4; b[1]=0xE2; b[2]=0xF5; b[3]=0xB8; b[4]=0xD0; EMIT(cg, 5);
             /* vmovupd [r13 + r12*8 + 0], ymm2 */
             b = BUF(cg); b[0]=0xC4; b[1]=0x81; b[2]=0x7D; b[3]=0x11;
             b[4]=0x54; b[5]=0xE5; b[6]=0x00; EMIT(cg, 7);
 
-            b = BUF(cg); b[0]=0x49; b[1]=0x83; b[2]=0xC4; b[3]=0x04; EMIT(cg, 4);
-            int32_t iv_back = (int32_t)((int64_t)iv_top - (int64_t)(cg->code_size + 5));
-            pn = emit_jmp(BUF(cg), iv_back); EMIT(cg, pn);
-            {
-                int32_t off = (int32_t)(cg->code_size - (iv_jae + 6));
-                memcpy(cg->code + iv_jae + 2, &off, 4);
-            }
+            cg_loop_end(cg, iv, 4);
 
             /* Scalar tail for i = n_vec..n, same FMA semantics on xmm. */
-            size_t it_top = cg->code_size;
-            b = BUF(cg); b[0]=0x4D; b[1]=0x39; b[2]=0xD4; EMIT(cg, 3);   /* cmp r12, r10 */
-            size_t it_jae = cg->code_size;
-            b = BUF(cg); b[0]=0x0F; b[1]=0x83; memset(b+2,0,4); EMIT(cg, 6);
+            CgCountedLoop it = cg_loop_begin(cg, 12 /* R12 */, 10 /* R10 */);
             /* movsd xmm1, [r8 + r12*8]  — b[i]   (REX.X|B = 0x43 for r12 index + r8 base) */
             b = BUF(cg); b[0]=0xF2; b[1]=0x43; b[2]=0x0F; b[3]=0x10;
             b[4]=0x0C; b[5]=0xE0; EMIT(cg, 6);
             /* movsd xmm2, [r13 + r12*8 + 0]  — G[j,i] */
             b = BUF(cg); b[0]=0xF2; b[1]=0x43; b[2]=0x0F; b[3]=0x10;
             b[4]=0x54; b[5]=0xE5; b[6]=0x00; EMIT(cg, 7);
-            /* vfmadd231sd xmm2, xmm1, xmm0  — xmm2 += xmm1·a[j] (lane 0) */
+            /* vfmadd231sd xmm2, xmm1, xmm0 */
             b = BUF(cg); b[0]=0xC4; b[1]=0xE2; b[2]=0xF1; b[3]=0xB9; b[4]=0xD0; EMIT(cg, 5);
             /* movsd [r13 + r12*8 + 0], xmm2 */
             b = BUF(cg); b[0]=0xF2; b[1]=0x43; b[2]=0x0F; b[3]=0x11;
             b[4]=0x54; b[5]=0xE5; b[6]=0x00; EMIT(cg, 7);
-            b = BUF(cg); b[0]=0x49; b[1]=0xFF; b[2]=0xC4; EMIT(cg, 3);
-            int32_t it_back = (int32_t)((int64_t)it_top - (int64_t)(cg->code_size + 5));
-            pn = emit_jmp(BUF(cg), it_back); EMIT(cg, pn);
-            {
-                int32_t off = (int32_t)(cg->code_size - (it_jae + 6));
-                memcpy(cg->code + it_jae + 2, &off, 4);
-            }
+            cg_loop_end(cg, it, 1);
 
-            b = BUF(cg); b[0]=0x48; b[1]=0xFF; b[2]=0xC3; EMIT(cg, 3);
-            int32_t outer_back = (int32_t)((int64_t)outer_top - (int64_t)(cg->code_size + 5));
-            pn = emit_jmp(BUF(cg), outer_back); EMIT(cg, pn);
-            {
-                int32_t off = (int32_t)(cg->code_size - (outer_jae + 6));
-                memcpy(cg->code + outer_jae + 2, &off, 4);
-            }
+            cg_loop_end(cg, outer, 1);
 
             b = BUF(cg); b[0]=0xC5; b[1]=0xF8; b[2]=0x77; EMIT(cg, 3);
             b = BUF(cg); b[0]=0x41; b[1]=0x5D; EMIT(cg, 2);
@@ -3790,51 +3665,28 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             b = BUF(cg); b[0]=0xC5; b[1]=0xF5; b[2]=0x57; b[3]=0xC9; EMIT(cg, 4);
             b = BUF(cg); b[0]=0x66; b[1]=0x0F; b[2]=0x57; b[3]=0xD2; EMIT(cg, 4);
             b = BUF(cg); b[0]=0x4D; b[1]=0x31; b[2]=0xE4; EMIT(cg, 3);
-            size_t ztop = cg->code_size;
-            b = BUF(cg); b[0]=0x4D; b[1]=0x39; b[2]=0xDC; EMIT(cg, 3);
-            size_t zjae = cg->code_size;
-            b = BUF(cg); b[0]=0x0F; b[1]=0x83; memset(b+2,0,4); EMIT(cg, 6);
+            CgCountedLoop z = cg_loop_begin(cg, 12 /* R12 */, 11 /* R11 */);
             b = BUF(cg); b[0]=0xC4; b[1]=0x81; b[2]=0x7D; b[3]=0x11;
             b[4]=0x0C; b[5]=0xE0; EMIT(cg, 6);
-            b = BUF(cg); b[0]=0x49; b[1]=0x83; b[2]=0xC4; b[3]=0x04; EMIT(cg, 4);
-            int32_t zback = (int32_t)((int64_t)ztop - (int64_t)(cg->code_size + 5));
-            pn = emit_jmp(BUF(cg), zback); EMIT(cg, pn);
-            {
-                int32_t off = (int32_t)(cg->code_size - (zjae + 6));
-                memcpy(cg->code + zjae + 2, &off, 4);
-            }
+            cg_loop_end(cg, z, 4);
             /* Scalar zero-init tail: r12 runs from n_vec to n. */
-            size_t zt_top = cg->code_size;
-            b = BUF(cg); b[0]=0x4D; b[1]=0x39; b[2]=0xD4; EMIT(cg, 3);   /* cmp r12, r10 */
-            size_t zt_jae = cg->code_size;
-            b = BUF(cg); b[0]=0x0F; b[1]=0x83; memset(b+2,0,4); EMIT(cg, 6);
+            CgCountedLoop zt = cg_loop_begin(cg, 12 /* R12 */, 10 /* R10 */);
             /* movsd [r8 + r12*8], xmm2   (REX.X|B = 0x43) */
             b = BUF(cg); b[0]=0xF2; b[1]=0x43; b[2]=0x0F; b[3]=0x11;
             b[4]=0x14; b[5]=0xE0; EMIT(cg, 6);
-            b = BUF(cg); b[0]=0x49; b[1]=0xFF; b[2]=0xC4; EMIT(cg, 3);    /* inc r12 */
-            int32_t zt_back = (int32_t)((int64_t)zt_top - (int64_t)(cg->code_size + 5));
-            pn = emit_jmp(BUF(cg), zt_back); EMIT(cg, pn);
-            {
-                int32_t off = (int32_t)(cg->code_size - (zt_jae + 6));
-                memcpy(cg->code + zt_jae + 2, &off, 4);
-            }
+            cg_loop_end(cg, zt, 1);
 
             /* ── Outer loop: j = 0 → m ───────────────────────────── */
             pn = emit_xor_reg_reg(BUF(cg), REG_RBX, REG_RBX); EMIT(cg, pn);
 
-            size_t outer_top = cg->code_size;
-            b = BUF(cg); b[0]=0x4C; b[1]=0x39; b[2]=0xCB; EMIT(cg, 3);       /* cmp rbx, r9 */
-            size_t outer_jae = cg->code_size;
-            b = BUF(cg); b[0]=0x0F; b[1]=0x83; memset(b+2,0,4); EMIT(cg, 6);
+            CgCountedLoop outer = cg_loop_begin(cg, REG_RBX, 9 /* R9 */);
 
             /* R13 = RDI + (j · n) · 8   — row base pointer. */
             b = BUF(cg); b[0]=0x48; b[1]=0x89; b[2]=0xD8; EMIT(cg, 3);        /* mov rax, rbx */
             b = BUF(cg); b[0]=0x49; b[1]=0x0F; b[2]=0xAF; b[3]=0xC2; EMIT(cg, 4); /* imul rax, r10 */
             b = BUF(cg); b[0]=0x4C; b[1]=0x8D; b[2]=0x2C; b[3]=0xC7; EMIT(cg, 4); /* lea r13, [rdi+rax*8] */
 
-            /* ymm0 = broadcast(v[j]).
-             *   vbroadcastsd ymm0, [rsi + rbx*8]  (3-byte VEX, W=0, mmmmm=00010)
-             *   C4 E2 7D 19 [modrm=0x04] [sib=rbx:8+rsi] */
+            /* ymm0 = broadcast(v[j])   —  vbroadcastsd ymm0, [rsi + rbx*8] */
             b = BUF(cg); b[0]=0xC4; b[1]=0xE2; b[2]=0x7D; b[3]=0x19;
             b[4]=0x04; b[5]=(uint8_t)((3<<6)|(REG_RBX<<3)|REG_RSI);
             EMIT(cg, 6);
@@ -3842,66 +3694,38 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             /* ── Inner loop: i = 0 → n_vec step 4 ─────────────────── */
             b = BUF(cg); b[0]=0x4D; b[1]=0x31; b[2]=0xE4; EMIT(cg, 3);   /* xor r12, r12 */
 
-            size_t iv_top = cg->code_size;
-            b = BUF(cg); b[0]=0x4D; b[1]=0x39; b[2]=0xDC; EMIT(cg, 3);   /* cmp r12, r11 */
-            size_t iv_jae = cg->code_size;
-            b = BUF(cg); b[0]=0x0F; b[1]=0x83; memset(b+2,0,4); EMIT(cg, 6);
+            CgCountedLoop iv = cg_loop_begin(cg, 12 /* R12 */, 11 /* R11 */);
 
-            /* vmovupd ymm1, [r13 + r12*8 + 0]   — row chunk.
-             *   SIB base=101 (r13) with mod=00 is "no base, disp32", so
-             *   use mod=01 with disp8=0 to really address through R13. */
+            /* vmovupd ymm1, [r13 + r12*8 + 0]   — row chunk (r13 base → disp8=0). */
             b = BUF(cg); b[0]=0xC4; b[1]=0x81; b[2]=0x7D; b[3]=0x10;
             b[4]=0x4C; b[5]=0xE5; b[6]=0x00; EMIT(cg, 7);
-            /* vmovupd ymm2, [r8 + r12*8]       — out chunk (R~=1, B~=X~=0) */
+            /* vmovupd ymm2, [r8 + r12*8]       — out chunk */
             b = BUF(cg); b[0]=0xC4; b[1]=0x81; b[2]=0x7D; b[3]=0x10;
             b[4]=0x14; b[5]=0xE0; EMIT(cg, 6);
-            /* vfmadd231pd ymm2, ymm1, ymm0      — ymm2 += ymm1·v_broadcast */
+            /* vfmadd231pd ymm2, ymm1, ymm0 */
             b = BUF(cg); b[0]=0xC4; b[1]=0xE2; b[2]=0xF5; b[3]=0xB8; b[4]=0xD0; EMIT(cg, 5);
-            /* vmovupd [r8 + r12*8], ymm2   (R~=1 for low ymm2) */
+            /* vmovupd [r8 + r12*8], ymm2 */
             b = BUF(cg); b[0]=0xC4; b[1]=0x81; b[2]=0x7D; b[3]=0x11;
             b[4]=0x14; b[5]=0xE0; EMIT(cg, 6);
 
-            /* add r12, 4 */
-            b = BUF(cg); b[0]=0x49; b[1]=0x83; b[2]=0xC4; b[3]=0x04; EMIT(cg, 4);
-            int32_t iv_back = (int32_t)((int64_t)iv_top - (int64_t)(cg->code_size + 5));
-            pn = emit_jmp(BUF(cg), iv_back); EMIT(cg, pn);
-            {
-                int32_t off = (int32_t)(cg->code_size - (iv_jae + 6));
-                memcpy(cg->code + iv_jae + 2, &off, 4);
-            }
+            cg_loop_end(cg, iv, 4);
 
             /* ── Scalar tail for n mod 4 ─────────────────────────── */
-            size_t it_top = cg->code_size;
-            b = BUF(cg); b[0]=0x4D; b[1]=0x39; b[2]=0xD4; EMIT(cg, 3);    /* cmp r12, r10 */
-            size_t it_jae = cg->code_size;
-            b = BUF(cg); b[0]=0x0F; b[1]=0x83; memset(b+2,0,4); EMIT(cg, 6);
+            CgCountedLoop it = cg_loop_begin(cg, 12 /* R12 */, 10 /* R10 */);
             /* movsd xmm1, [r13 + r12*8]   — W[j,i] */
             b = BUF(cg); b[0]=0xF2; b[1]=0x43; b[2]=0x0F; b[3]=0x10;
             b[4]=0x4C; b[5]=0xE5; b[6]=0x00; EMIT(cg, 7);
-            /* movsd xmm2, [r8 + r12*8]    — out[i]  (REX.X|B = 0x43) */
+            /* movsd xmm2, [r8 + r12*8] */
             b = BUF(cg); b[0]=0xF2; b[1]=0x43; b[2]=0x0F; b[3]=0x10;
             b[4]=0x14; b[5]=0xE0; EMIT(cg, 6);
-            /* vfmadd231sd xmm2, xmm1, xmm0  — xmm2 += xmm1·v[j] (lane 0 of ymm0) */
+            /* vfmadd231sd xmm2, xmm1, xmm0 */
             b = BUF(cg); b[0]=0xC4; b[1]=0xE2; b[2]=0xF1; b[3]=0xB9; b[4]=0xD0; EMIT(cg, 5);
-            /* movsd [r8 + r12*8], xmm2   (REX.X|B = 0x43) */
+            /* movsd [r8 + r12*8], xmm2 */
             b = BUF(cg); b[0]=0xF2; b[1]=0x43; b[2]=0x0F; b[3]=0x11;
             b[4]=0x14; b[5]=0xE0; EMIT(cg, 6);
-            b = BUF(cg); b[0]=0x49; b[1]=0xFF; b[2]=0xC4; EMIT(cg, 3);    /* inc r12 */
-            int32_t it_back = (int32_t)((int64_t)it_top - (int64_t)(cg->code_size + 5));
-            pn = emit_jmp(BUF(cg), it_back); EMIT(cg, pn);
-            {
-                int32_t off = (int32_t)(cg->code_size - (it_jae + 6));
-                memcpy(cg->code + it_jae + 2, &off, 4);
-            }
+            cg_loop_end(cg, it, 1);
 
-            /* inc rbx ;  jmp outer_top */
-            b = BUF(cg); b[0]=0x48; b[1]=0xFF; b[2]=0xC3; EMIT(cg, 3);
-            int32_t outer_back = (int32_t)((int64_t)outer_top - (int64_t)(cg->code_size + 5));
-            pn = emit_jmp(BUF(cg), outer_back); EMIT(cg, pn);
-            {
-                int32_t off = (int32_t)(cg->code_size - (outer_jae + 6));
-                memcpy(cg->code + outer_jae + 2, &off, 4);
-            }
+            cg_loop_end(cg, outer, 1);
 
             b = BUF(cg); b[0]=0xC5; b[1]=0xF8; b[2]=0x77; EMIT(cg, 3);   /* vzeroupper */
             b = BUF(cg); b[0]=0x41; b[1]=0x5D; EMIT(cg, 2);               /* pop r13 */
@@ -3982,11 +3806,7 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             pn = emit_xor_reg_reg(BUF(cg), REG_RBX, REG_RBX); EMIT(cg, pn);
 
             /* ── Outer loop: for j = 0..m ─────────────────────────── */
-            size_t outer_top = cg->code_size;
-            /* cmp rbx, r9 */
-            b = BUF(cg); b[0]=0x4C; b[1]=0x39; b[2]=0xCB; EMIT(cg, 3);
-            size_t outer_jae = cg->code_size;
-            b = BUF(cg); b[0]=0x0F; b[1]=0x83; memset(b+2,0,4); EMIT(cg, 6);
+            CgCountedLoop outer = cg_loop_begin(cg, REG_RBX, 9 /* R9 */);
 
             /* Compute row_base_ptr R13 = RDI + (j * n) * 8. */
             /* mov rax, rbx */
@@ -4009,16 +3829,9 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             b = BUF(cg); b[0]=0x4D; b[1]=0x31; b[2]=0xE4; EMIT(cg, 3);
 
             /* ── Vector inner loop: 4 doubles per iter ─────────────── */
-            size_t vloop_top = cg->code_size;
-            /* cmp r12, r11 */
-            b = BUF(cg); b[0]=0x4D; b[1]=0x39; b[2]=0xDC; EMIT(cg, 3);
-            size_t vloop_jae = cg->code_size;
-            b = BUF(cg); b[0]=0x0F; b[1]=0x83; memset(b+2,0,4); EMIT(cg, 6);
+            CgCountedLoop vloop = cg_loop_begin(cg, 12 /* R12 */, 11 /* R11 */);
 
-            /* vmovupd ymm1, [r13 + r12*8 + 0]  — W row chunk.
-             * Note: SIB base=101 (r13/rbp) with mod=00 means "absolute
-             * disp32, no base" in x86 encoding — so we must use mod=01
-             * with disp8=0 to actually address through R13. */
+            /* vmovupd ymm1, [r13 + r12*8 + 0]  — W row chunk (r13 → disp8=0). */
             b = BUF(cg); b[0]=0xC4; b[1]=0x81; b[2]=0x7D; b[3]=0x10;
             b[4]=0x4C; b[5]=0xE5; b[6]=0x00; EMIT(cg, 7);
             /* vmovupd ymm2, [rsi + r12*8]  — x chunk (rsi base is fine). */
@@ -4027,15 +3840,7 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             /* vfmadd231pd ymm0, ymm1, ymm2 */
             b = BUF(cg); b[0]=0xC4; b[1]=0xE2; b[2]=0xF5; b[3]=0xB8; b[4]=0xC2; EMIT(cg, 5);
 
-            /* add r12, 4 */
-            b = BUF(cg); b[0]=0x49; b[1]=0x83; b[2]=0xC4; b[3]=0x04; EMIT(cg, 4);
-
-            int32_t vback = (int32_t)((int64_t)vloop_top - (int64_t)(cg->code_size + 5));
-            pn = emit_jmp(BUF(cg), vback); EMIT(cg, pn);
-            {
-                int32_t off = (int32_t)(cg->code_size - (vloop_jae + 6));
-                memcpy(cg->code + vloop_jae + 2, &off, 4);
-            }
+            cg_loop_end(cg, vloop, 4);
 
             /* Horizontal sum ymm0 → scalar, add to xmm7. */
             /* vextractf128 xmm3, ymm0, 1 */
@@ -4048,13 +3853,9 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             pn = emit_addsd(BUF(cg), 7, 0); EMIT(cg, pn);
 
             /* ── Scalar tail: while R12 < R10 ──────────────────────── */
-            size_t tloop_top = cg->code_size;
-            /* cmp r12, r10 */
-            b = BUF(cg); b[0]=0x4D; b[1]=0x39; b[2]=0xD4; EMIT(cg, 3);
-            size_t tloop_jae = cg->code_size;
-            b = BUF(cg); b[0]=0x0F; b[1]=0x83; memset(b+2,0,4); EMIT(cg, 6);
+            CgCountedLoop tloop = cg_loop_begin(cg, 12 /* R12 */, 10 /* R10 */);
 
-            /* movsd xmm1, [r13 + r12*8 + 0]  — same SIB base=101 quirk */
+            /* movsd xmm1, [r13 + r12*8 + 0] */
             b = BUF(cg); b[0]=0xF2; b[1]=0x43; b[2]=0x0F; b[3]=0x10;
             b[4]=0x4C; b[5]=0xE5; b[6]=0x00; EMIT(cg, 7);
             /* movsd xmm2, [rsi + r12*8] */
@@ -4063,27 +3864,13 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             /* vfmadd231sd xmm7, xmm1, xmm2 */
             b = BUF(cg); b[0]=0xC4; b[1]=0xE2; b[2]=0xF1; b[3]=0xB9; b[4]=0xFA; EMIT(cg, 5);
 
-            /* inc r12 */
-            b = BUF(cg); b[0]=0x49; b[1]=0xFF; b[2]=0xC4; EMIT(cg, 3);
-            int32_t tback = (int32_t)((int64_t)tloop_top - (int64_t)(cg->code_size + 5));
-            pn = emit_jmp(BUF(cg), tback); EMIT(cg, pn);
-            {
-                int32_t off = (int32_t)(cg->code_size - (tloop_jae + 6));
-                memcpy(cg->code + tloop_jae + 2, &off, 4);
-            }
+            cg_loop_end(cg, tloop, 1);
 
             /* y[j] = xmm7   →  movsd [r8 + rbx*8], xmm7 */
             b = BUF(cg); b[0]=0xF2; b[1]=0x41; b[2]=0x0F; b[3]=0x11;
             b[4]=0x3C; b[5]=0xD8; EMIT(cg, 6);
 
-            /* inc rbx ;  jmp outer_top */
-            b = BUF(cg); b[0]=0x48; b[1]=0xFF; b[2]=0xC3; EMIT(cg, 3);
-            int32_t oback = (int32_t)((int64_t)outer_top - (int64_t)(cg->code_size + 5));
-            pn = emit_jmp(BUF(cg), oback); EMIT(cg, pn);
-            {
-                int32_t off = (int32_t)(cg->code_size - (outer_jae + 6));
-                memcpy(cg->code + outer_jae + 2, &off, 4);
-            }
+            cg_loop_end(cg, outer, 1);
 
             /* vzeroupper */
             b = BUF(cg); b[0]=0xC5; b[1]=0xF8; b[2]=0x77; EMIT(cg, 3);
@@ -4115,10 +3902,7 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             /* movq xmm2, rdx (factor) */
             b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xD2; EMIT(cg, 5);
             pn = emit_xor_reg_reg(BUF(cg), REG_RSI, REG_RSI); EMIT(cg, pn);
-            size_t loop_top = cg->code_size;
-            pn = emit_cmp_reg_reg(BUF(cg), REG_RSI, REG_RCX); EMIT(cg, pn);
-            size_t jae_done = cg->code_size;
-            b = BUF(cg); b[0]=0x0F; b[1]=0x83; memset(b+2,0,4); EMIT(cg, 6);
+            CgCountedLoop lp = cg_loop_begin(cg, REG_RSI, REG_RCX);
             /* movsd xmm1, [rdi + rsi*8] */
             b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x10;
             b[3]=modrm(0, 1, 4); b[4]=(uint8_t)((3<<6)|(REG_RSI<<3)|REG_RDI);
@@ -4129,11 +3913,7 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x11;
             b[3]=modrm(0, 1, 4); b[4]=(uint8_t)((3<<6)|(REG_RSI<<3)|REG_RDI);
             EMIT(cg, 5);
-            pn = emit_inc_reg(BUF(cg), REG_RSI); EMIT(cg, pn);
-            int32_t back = (int32_t)((int64_t)loop_top - (int64_t)(cg->code_size + 5));
-            pn = emit_jmp(BUF(cg), back); EMIT(cg, pn);
-            int32_t jae_off = (int32_t)(cg->code_size - (jae_done + 6));
-            memcpy(cg->code + jae_done + 2, &jae_off, 4);
+            cg_loop_end(cg, lp, 1);
             pn = emit_xor_reg_reg(BUF(cg), REG_RAX, REG_RAX); EMIT(cg, pn);
             return 1;
         }

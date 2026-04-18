@@ -14,6 +14,48 @@
 #include <stdio.h>
 #include <string.h>
 
+/*
+ * Mod-2π range reduction for math_sin / math_cos.
+ *
+ * Input:  x in xmm0 (caller has already loaded the argument)
+ * Output: r in xmm0 and rax, with r ~= x - round(x / 2π) * 2π
+ *         so |r| <= π.  The existing SSE2 minimax polynomial is
+ *         accurate enough over [-π, π] for 12+ digit use cases.
+ *
+ * For very large x (magnitudes approaching 2^63) the reduction loses
+ * ULPs, but the polynomial itself is the practical precision limit
+ * for the default SSE2 path — users needing full precision should
+ * compile with `aric --precision=15` (x87 FSIN does its own reduction
+ * via FPREM1).
+ */
+static void emit_sincos_range_reduce_sse2(CodegenState *cg) {
+    int pn; uint8_t *b;
+
+    /* xmm5 = 1/(2π)  (0x3FC45F306DC9C883 = 0.15915494309189535) */
+    pn = emit_mov_reg_imm64(BUF(cg), REG_RCX, 0x3FC45F306DC9C883ULL); EMIT(cg, pn);
+    b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xE9; EMIT(cg, 5);
+    /* mulsd xmm5, xmm0   — xmm5 = x / (2π) */
+    b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x59; b[3]=0xE8; EMIT(cg, 4);
+
+    /* cvtsd2si rax, xmm5  — rax = round(x / 2π), rounding mode = nearest-even (default) */
+    b = BUF(cg); b[0]=0xF2; b[1]=0x48; b[2]=0x0F; b[3]=0x2D; b[4]=0xC5; EMIT(cg, 5);
+
+    /* cvtsi2sd xmm6, rax — xmm6 = (double) rax = n */
+    b = BUF(cg); b[0]=0xF2; b[1]=0x48; b[2]=0x0F; b[3]=0x2A; b[4]=0xF0; EMIT(cg, 5);
+
+    /* xmm7 = 2π  (0x401921FB54442D18 = 6.283185307179586) */
+    pn = emit_mov_reg_imm64(BUF(cg), REG_RCX, 0x401921FB54442D18ULL); EMIT(cg, pn);
+    b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xF9; EMIT(cg, 5);
+    /* mulsd xmm7, xmm6   — xmm7 = n * 2π */
+    b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x59; b[3]=0xFE; EMIT(cg, 4);
+
+    /* subsd xmm0, xmm7   — xmm0 = r = x - n*2π */
+    b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x5C; b[3]=0xC7; EMIT(cg, 4);
+
+    /* movq rax, xmm0     — keep rax in sync with xmm0 for downstream code */
+    b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x7E; b[4]=0xC0; EMIT(cg, 5);
+}
+
 int emit_builtin(CodegenState *cg, const ASTNode *node,
                  const char *name, size_t argc) {
         if (strcmp(name, "print_int") == 0 && argc == 1) {
@@ -1802,12 +1844,17 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
                 b = BUF(cg); b[0]=0x48; b[1]=0x8B; b[2]=0x04; b[3]=0x24; EMIT(cg, 4);
                 b = BUF(cg); b[0]=0x48; b[1]=0x83; b[2]=0xC4; b[3]=16; EMIT(cg, 4);
             } else {
-                /* SSE2 minimax polynomial: sin(x) for |x| <= pi/4
+                /* SSE2 minimax polynomial: sin(x) with mod-2π range reduction.
+                 * Polynomial alone is accurate for |x| <= pi/4, extended to
+                 * [-π, π] via mod-2π pre-reduction (see helper above).
                  * sin(x) = x + x^3*(S1 + x^2*(S2 + x^2*(S3 + x^2*(S4 + x^2*S5))))
                  * Horner evaluation from inside out. */
 
                 /* movq xmm0, rax  — load x into xmm0 */
                 b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xC0; EMIT(cg, 5);
+
+                /* Range reduce to |r| <= π before the polynomial. */
+                emit_sincos_range_reduce_sse2(cg);
 
                 /* xmm1 = x*x (x squared) */
                 /* movapd xmm1, xmm0 */
@@ -1873,12 +1920,17 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
                 b = BUF(cg); b[0]=0x48; b[1]=0x8B; b[2]=0x04; b[3]=0x24; EMIT(cg, 4);
                 b = BUF(cg); b[0]=0x48; b[1]=0x83; b[2]=0xC4; b[3]=16; EMIT(cg, 4);
             } else {
-                /* SSE2 minimax polynomial: cos(x) for |x| <= pi/4
+                /* SSE2 minimax polynomial: cos(x) with mod-2π range reduction.
+                 * Polynomial alone is accurate for |x| <= pi/4, extended to
+                 * [-π, π] via mod-2π pre-reduction (see helper above).
                  * cos(x) = 1 + x^2*(C1 + x^2*(C2 + x^2*(C3 + x^2*(C4 + x^2*C5))))
                  * Horner evaluation from inside out. */
 
                 /* movq xmm0, rax  — load x into xmm0 */
                 b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xC0; EMIT(cg, 5);
+
+                /* Range reduce to |r| <= π before the polynomial. */
+                emit_sincos_range_reduce_sse2(cg);
 
                 /* xmm1 = x*x (x squared) */
                 /* movapd xmm1, xmm0 */

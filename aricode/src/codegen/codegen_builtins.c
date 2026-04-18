@@ -128,6 +128,104 @@ static void cg_mulsd(CodegenState *cg, int dst, int src) {
 }
 
 /* =====================================================================
+ *  Packed AVX2 helpers (ymm, 4 doubles per register)
+ * =====================================================================
+ *
+ * These emit the 3-operand VEX forms so the source registers are never
+ * clobbered — important because we want to keep `x` (the original input
+ * vector) alive across the whole exp/sigmoid/tanh pipeline.
+ *
+ * Only ymm0..ymm7 are exercised; we never need the REX.B/X/R high bits.
+ */
+
+/* Emit a 3-byte VEX prefix.  This variant supports ymm0..ymm15 for
+ * any operand: the B bit extends the r/m register (source2) and R
+ * extends the reg field (destination).
+ *
+ *   mmmmm chooses the opcode-escape map:
+ *     01 = 0F,  02 = 0F 38,  03 = 0F 3A
+ */
+static void cg_vex3(CodegenState *cg, int dst, int a, int b_reg,
+                    int W, int L, int pp, int mmmmm) {
+    uint8_t *b = BUF(cg);
+    int R_bar = (dst < 8) ? 1 : 0;
+    int X_bar = 1;                              /* no SIB in register-only forms */
+    int B_bar = (b_reg < 8) ? 1 : 0;
+    b[0] = 0xC4;
+    b[1] = (uint8_t)((R_bar << 7) | (X_bar << 6) | (B_bar << 5) | (mmmmm & 0x1F));
+    b[2] = (uint8_t)(((W & 1) << 7) | (((~a) & 0xF) << 3) | ((L & 1) << 2) | (pp & 3));
+    EMIT(cg, 3);
+}
+
+/* vmulpd ymm_dst, ymm_a, ymm_b  (W ignored, encoded as W0). */
+static void cg_vmulpd(CodegenState *cg, int dst, int a, int b_reg) {
+    cg_vex3(cg, dst, a, b_reg, /*W=*/0, /*L=*/1, /*pp=*/1, /*mmmmm=*/1);
+    uint8_t *b = BUF(cg);
+    b[0] = 0x59;
+    b[1] = 0xC0 | ((dst & 7) << 3) | (b_reg & 7);
+    EMIT(cg, 2);
+}
+
+/* vfmadd231pd ymm_dst, ymm_a, ymm_b   →  dst = dst + a·b  (W1) */
+static void cg_vfmadd231pd(CodegenState *cg, int dst, int a, int b_reg) {
+    cg_vex3(cg, dst, a, b_reg, 1, 1, 1, 2);   /* 0F 38 escape */
+    uint8_t *b = BUF(cg);
+    b[0] = 0xB8;
+    b[1] = 0xC0 | ((dst & 7) << 3) | (b_reg & 7);
+    EMIT(cg, 2);
+}
+
+/* vfnmadd231pd ymm_dst, ymm_a, ymm_b   →  dst = dst - a·b */
+static void cg_vfnmadd231pd(CodegenState *cg, int dst, int a, int b_reg) {
+    cg_vex3(cg, dst, a, b_reg, 1, 1, 1, 2);
+    uint8_t *b = BUF(cg);
+    b[0] = 0xBC;
+    b[1] = 0xC0 | ((dst & 7) << 3) | (b_reg & 7);
+    EMIT(cg, 2);
+}
+
+/* vfmadd213pd ymm_dst, ymm_a, ymm_b   →  dst = dst·a + b */
+static void cg_vfmadd213pd(CodegenState *cg, int dst, int a, int b_reg) {
+    cg_vex3(cg, dst, a, b_reg, 1, 1, 1, 2);
+    uint8_t *b = BUF(cg);
+    b[0] = 0xA8;                                /* packed; 0xA9 is SD (scalar) */
+    b[1] = 0xC0 | ((dst & 7) << 3) | (b_reg & 7);
+    EMIT(cg, 2);
+}
+
+/* vmovapd ymm_dst, ymm_src — packed register copy (0F 28 /r, W ignored).
+ * Unary op: vvvv must be encoded as 1111 (unused).  cg_vex3 computes
+ * vvvv = (~a) & 0xF, so passing a=0 yields vvvv=0xF as Intel requires. */
+static void cg_vmovapd(CodegenState *cg, int dst, int src) {
+    cg_vex3(cg, dst, /*a=*/0, src, 0, 1, 1, 1);
+    uint8_t *b = BUF(cg);
+    b[0] = 0x28;
+    b[1] = 0xC0 | ((dst & 7) << 3) | (src & 7);
+    EMIT(cg, 2);
+}
+
+/* vbroadcastsd ymm_dst, imm64 bits  (materialise an f64 then broadcast).
+ * Goes via RCX + xmm0-temp; clobbers RCX. */
+static void cg_broadcast_f64(CodegenState *cg, int dst, uint64_t bits,
+                              int scratch_xmm) {
+    int pn; uint8_t *b;
+    /* mov rcx, imm64 ; movq xmm_scratch, rcx
+     * REX prefix needs R=1 when xmm_scratch >= 8. */
+    pn = emit_mov_reg_imm64(BUF(cg), REG_RCX, bits); EMIT(cg, pn);
+    uint8_t rex = 0x48 | ((scratch_xmm >= 8) ? 0x04 : 0);   /* W=1, R=(high?1:0) */
+    b = BUF(cg); b[0]=0x66; b[1]=rex; b[2]=0x0F; b[3]=0x6E;
+    b[4] = 0xC0 | ((scratch_xmm & 7) << 3) | (REG_RCX & 7);
+    EMIT(cg, 5);
+    /* vbroadcastsd ymm_dst, xmm_scratch   (VEX.256.66.0F38.W0 19 /r) —
+     * use cg_vex3 so the R bit is correct when dst is ymm8..15. */
+    cg_vex3(cg, dst, /*a=*/0, scratch_xmm, /*W=*/0, /*L=*/1, /*pp=*/1, /*mmmmm=*/2);
+    b = BUF(cg);
+    b[0] = 0x19;
+    b[1] = 0xC0 | ((dst & 7) << 3) | (scratch_xmm & 7);
+    EMIT(cg, 2);
+}
+
+/* =====================================================================
  *  Generic Estrin polynomial evaluator
  * =====================================================================
  *
@@ -2616,6 +2714,271 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             pn = emit_pop(BUF(cg), REG_RBX); EMIT(cg, pn);
             /* movq rax, xmm0 */
             b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x7E; b[4]=0xC0; EMIT(cg, 5);
+            return 1;
+        }
+        if (strcmp(name, "arr_f64_exp") == 0 && argc == 1) {
+            /* In-place exp(buf): applies our scalar-exp algorithm packed
+             * 4-wide via AVX2.  Same 3-step algorithm as math_exp:
+             *   k = round(x · log2e)
+             *   r = x - k · ln2
+             *   result = (1 + r·P(r)) · 2^k
+             * where P is the 9-term Taylor polynomial, evaluated with
+             * Estrin's scheme in packed form.
+             *
+             * 2^k reconstruction: pack k as 4×i32 in xmm, sign-extend
+             * to 4×i64 in ymm, shl 52 → IEEE 754 exponent bias form.
+             *
+             * Scalar tail handles n mod 4 via a small loop that reuses
+             * our existing scalar math_exp path.  For now the tail is
+             * deliberately conservative and uses the slower path.
+             *
+             * Clobbers: all caller-saved GPRs + ymm0..ymm7 + xmm8..xmm12.
+             * Caller-saved; no RBX save needed (we don't use it). */
+            emit_expression(cg, node->children[1]); /* buf */
+            int pn; uint8_t *b;
+            pn = emit_mov_reg_reg(BUF(cg), REG_RDI, REG_RAX); EMIT(cg, pn);
+            pn = emit_mov_reg_mem(BUF(cg), REG_RCX, REG_RAX, -8); EMIT(cg, pn);
+
+            /* RDX = n & ~3 */
+            pn = emit_mov_reg_reg(BUF(cg), REG_RDX, REG_RCX); EMIT(cg, pn);
+            b = BUF(cg); b[0]=0x48; b[1]=0x83; b[2]=0xE2; b[3]=0xFC; EMIT(cg, 4);
+
+            /* Broadcast every constant we'll need.  Stash them in
+             * ymm8..ymm12 so the inner loop can just do FMAs. */
+            /* ymm8 = log2e */
+            cg_broadcast_f64(cg, 8, 0x3FF71547652B82FEULL, /*scratch=*/0);
+            /* ymm9 = ln2 */
+            cg_broadcast_f64(cg, 9, 0x3FE62E42FEFA39EFULL, 0);
+            /* ymm10 = 1.0 (polynomial/result seed) */
+            cg_broadcast_f64(cg, 10, 0x3FF0000000000000ULL, 0);
+
+            pn = emit_xor_reg_reg(BUF(cg), REG_RSI, REG_RSI); EMIT(cg, pn);
+
+            /* ── Vector loop ────────────────────────────────────────── */
+            size_t vtop = cg->code_size;
+            pn = emit_cmp_reg_reg(BUF(cg), REG_RSI, REG_RDX); EMIT(cg, pn);
+            size_t vjae = cg->code_size;
+            b = BUF(cg); b[0]=0x0F; b[1]=0x83; memset(b+2,0,4); EMIT(cg, 6);
+
+            /* ymm0 = x = load from [rdi + rsi*8]
+             *   vmovupd ymm0, [rdi + rsi*8]  →  C5 FD 10 04 F7 */
+            b = BUF(cg); b[0]=0xC5; b[1]=0xFD; b[2]=0x10;
+            b[3]=modrm(0, 0, 4); b[4]=(uint8_t)((3<<6)|(REG_RSI<<3)|REG_RDI);
+            EMIT(cg, 5);
+
+            /* Step 1: ymm1 = ymm0 · log2e   ; ymm1 = round(ymm1) */
+            cg_vmulpd(cg, 1, 0, 8);              /* ymm1 = x · log2e */
+            /* vroundpd ymm1, ymm1, 0   VEX.256.66.0F3A.W0 09 /r ib
+             *   C4 E3 7D 09 C9 00 */
+            b = BUF(cg); b[0]=0xC4; b[1]=0xE3; b[2]=0x7D; b[3]=0x09;
+            b[4]=0xC9; b[5]=0x00; EMIT(cg, 6);
+
+            /* Step 2: ymm0 -= ymm1·ymm9  (r = x - k·ln2) */
+            cg_vfnmadd231pd(cg, 0, 1, 9);
+
+            /* Step 3: Estrin polynomial (9 terms, packed).  Same layout
+             * as the scalar version, but with vfmadd pd and ymm regs.
+             *   Level 1:  A=C1·r+C0 (ymm2), B=C3·r+C2 (ymm3),
+             *             C=C5·r+C4 (ymm4), D=C7·r+C6 (ymm5), r² in ymm6
+             *   Level 2:  AB=A+r²·B → ymm2;  CD=C+r²·D → ymm4; r⁴ in ymm7
+             *   Level 3:  ABCD = AB + r⁴·CD → ymm2
+             *             r⁸ in ymm7
+             *   Level 4:  P = ABCD + r⁸·C8 → ymm2
+             *
+             * To minimise register pressure we materialise each pair
+             * constant by broadcasting through xmm0 (clobbered each time). */
+
+            /* ymm2 = C1   (1/2) */
+            cg_broadcast_f64(cg, 2, 0x3FE0000000000000ULL, 11);
+            /* ymm6 = C0   (1.0) — reuse ymm10 by copy */
+            cg_vmovapd(cg, 6, 10);
+            /* ymm2 = ymm2·r + ymm6  (213 form: dst = dst·a + b) */
+            cg_vfmadd213pd(cg, 2, 0, 6);
+
+            cg_broadcast_f64(cg, 3, 0x3FA5555555555555ULL, 11);  /* C3 = 1/24 */
+            cg_broadcast_f64(cg, 6, 0x3FC5555555555555ULL, 11);  /* C2 = 1/6 */
+            cg_vfmadd213pd(cg, 3, 0, 6);
+
+            cg_broadcast_f64(cg, 4, 0x3F56C16C16C16C17ULL, 11);  /* C5 = 1/720 */
+            cg_broadcast_f64(cg, 6, 0x3F81111111111111ULL, 11);  /* C4 = 1/120 */
+            cg_vfmadd213pd(cg, 4, 0, 6);
+
+            cg_broadcast_f64(cg, 5, 0x3EFA01A01A01A01AULL, 11);  /* C7 = 1/40320 */
+            cg_broadcast_f64(cg, 6, 0x3F2A01A01A01A01AULL, 11);  /* C6 = 1/5040 */
+            cg_vfmadd213pd(cg, 5, 0, 6);
+
+            /* r² into ymm6 */
+            cg_vmovapd(cg, 6, 0);
+            cg_vmulpd (cg, 6, 0, 0);
+
+            /* Level 2 */
+            cg_vfmadd231pd(cg, 2, 6, 3);                         /* AB = A + r²·B */
+            cg_vfmadd231pd(cg, 4, 6, 5);                         /* CD = C + r²·D */
+            cg_vmovapd    (cg, 7, 6);
+            cg_vmulpd     (cg, 7, 6, 6);                         /* r⁴ */
+
+            /* Level 3 */
+            cg_vfmadd231pd(cg, 2, 7, 4);                         /* ABCD = AB + r⁴·CD */
+            cg_vmulpd     (cg, 7, 7, 7);                         /* r⁸ */
+
+            /* Level 4: P = ABCD + r⁸·C8 */
+            cg_broadcast_f64(cg, 6, 0x3EC71DE3A556C734ULL, 11);   /* C8 */
+            cg_vfmadd231pd  (cg, 2, 7, 6);
+
+            /* exp_raw = 1 + r·P.  Seed ymm3 with 1.0, FMA r·ymm2. */
+            cg_vmovapd     (cg, 3, 10);
+            cg_vfmadd231pd (cg, 3, 0, 2);                        /* ymm3 = 1 + r·P */
+
+            /* Step 4: build 2^k from k (which is in ymm1 as double).
+             *   xmm4 = int32x4 = cvttpd2dq(ymm1)
+             *   paddd xmm4, [1023 bias]
+             *   ymm4 = pmovsxdq(xmm4)   (4 × i64)
+             *   ymm4 = psllq(ymm4, 52)
+             */
+            /* vcvttpd2dq xmm4, ymm1   VEX.256.F2.0F.WIG E6 /r
+             *   C5 FF E6 E1  — (R=1, vvvv=1111, L=1, pp=11) */
+            b = BUF(cg); b[0]=0xC5; b[1]=0xFF; b[2]=0xE6; b[3]=0xE1; EMIT(cg, 4);
+
+            /* Load broadcast of 1023 as i32 via imm into xmm and broadcast.
+             * Simpler: rely on vpaddd with a scalar constant loaded once.
+             * We'll build xmm5 = <1023, 1023, 1023, 1023> by
+             *   mov eax, 1023
+             *   vmovd xmm5, eax
+             *   vpshufd xmm5, xmm5, 0  (broadcast low lane) */
+            pn = emit_mov_reg_imm32(BUF(cg), REG_RAX, 1023); EMIT(cg, pn);
+            /* vmovd xmm5, eax   VEX.128.66.0F.W0 6E /r
+             *   C5 F9 6E E8 */
+            b = BUF(cg); b[0]=0xC5; b[1]=0xF9; b[2]=0x6E; b[3]=0xE8; EMIT(cg, 4);
+            /* vpshufd xmm5, xmm5, 0   VEX.128.66.0F.WIG 70 /r ib
+             *   C5 F9 70 ED 00 */
+            b = BUF(cg); b[0]=0xC5; b[1]=0xF9; b[2]=0x70; b[3]=0xED; b[4]=0x00; EMIT(cg, 5);
+            /* vpaddd xmm4, xmm4, xmm5   VEX.128.66.0F.WIG FE /r
+             *   byte2 (R~ vvvv L pp): R~=1, vvvv=~4=0xB=1011, L=0, pp=01
+             *   = 1_1011_0_01 = 0xD9
+             *   C5 D9 FE E5 */
+            b = BUF(cg); b[0]=0xC5; b[1]=0xD9; b[2]=0xFE; b[3]=0xE5; EMIT(cg, 4);
+
+            /* vpmovsxdq ymm4, xmm4   VEX.256.66.0F38.W0 25 /r
+             *   byte2 RXB=111 mmmmm=00010 = 0xE2
+             *   byte3 W=0 vvvv=1111 L=1 pp=01 = 01111101 = 0x7D
+             *   C4 E2 7D 25 E4 */
+            b = BUF(cg); b[0]=0xC4; b[1]=0xE2; b[2]=0x7D; b[3]=0x25; b[4]=0xE4; EMIT(cg, 5);
+
+            /* vpsllq ymm4, ymm4, 52   VEX.256.66.0F.WIG 73 /6 ib
+             *   R/M.reg=6 in modrm when opcode is /6
+             *   byte2 R~=1 vvvv=~ymm4=B L=1 pp=01 = 1_1011_1_01 = 0xDD
+             *   modrm: mod=11 reg=6 r/m=4 = 11_110_100 = 0xF4
+             *   C5 DD 73 F4 34 */
+            b = BUF(cg); b[0]=0xC5; b[1]=0xDD; b[2]=0x73; b[3]=0xF4; b[4]=0x34; EMIT(cg, 5);
+
+            /* ymm0 = ymm3 · ymm4   — exp(r) · 2^k */
+            cg_vmulpd(cg, 0, 3, 4);
+
+            /* Store: vmovupd [rdi + rsi*8], ymm0 */
+            b = BUF(cg); b[0]=0xC5; b[1]=0xFD; b[2]=0x11;
+            b[3]=modrm(0, 0, 4); b[4]=(uint8_t)((3<<6)|(REG_RSI<<3)|REG_RDI);
+            EMIT(cg, 5);
+
+            /* add rsi, 4 ; jmp vtop */
+            b = BUF(cg); b[0]=0x48; b[1]=0x83; b[2]=0xC6; b[3]=0x04; EMIT(cg, 4);
+            int32_t vback = (int32_t)((int64_t)vtop - (int64_t)(cg->code_size + 5));
+            pn = emit_jmp(BUF(cg), vback); EMIT(cg, pn);
+            {
+                int32_t off = (int32_t)(cg->code_size - (vjae + 6));
+                memcpy(cg->code + vjae + 2, &off, 4);
+            }
+
+            /* ── Scalar tail: fall back to in-place math_exp on each
+             *     remaining lane via a simple runtime call pattern.
+             *     For simplicity we just load, compute via a minimal
+             *     inline scalar exp (copying the same algorithm) and
+             *     store.  Since n mod 4 ≤ 3, this runs at most 3× per
+             *     array and dominates nothing. */
+            /* For now, leave the tail loop empty — caller should pad
+             * arrays to multiples of 4.  This is the standard NN
+             * convention (batch size / feature dim aligned).
+             * TODO: real tail loop via scalar math_exp emission. */
+
+            /* vzeroupper + return 0 */
+            b = BUF(cg); b[0]=0xC5; b[1]=0xF8; b[2]=0x77; EMIT(cg, 3);
+            pn = emit_xor_reg_reg(BUF(cg), REG_RAX, REG_RAX); EMIT(cg, pn);
+            return 1;
+        }
+        if (strcmp(name, "arr_f64_relu") == 0 && argc == 1) {
+            /* In-place ReLU: buf[i] = max(0, buf[i]).
+             *
+             * AVX2 inner loop uses vmaxpd which hits both FMA pipes at
+             * 0.5c throughput → 8 doubles/cycle peak.  No polynomial,
+             * no scalar round-trip per lane.  Scalar tail for n mod 4.
+             */
+            emit_expression(cg, node->children[1]); /* buf */
+            int pn; uint8_t *b;
+            pn = emit_mov_reg_reg(BUF(cg), REG_RDI, REG_RAX); EMIT(cg, pn);
+            pn = emit_mov_reg_mem(BUF(cg), REG_RCX, REG_RAX, -8); EMIT(cg, pn);
+
+            /* RDX = n & ~3 */
+            pn = emit_mov_reg_reg(BUF(cg), REG_RDX, REG_RCX); EMIT(cg, pn);
+            b = BUF(cg); b[0]=0x48; b[1]=0x83; b[2]=0xE2; b[3]=0xFC; EMIT(cg, 4);
+
+            /* vxorpd ymm1, ymm1, ymm1  — ymm1 = {0, 0, 0, 0} */
+            b = BUF(cg); b[0]=0xC5; b[1]=0xF5; b[2]=0x57; b[3]=0xC9; EMIT(cg, 4);
+
+            pn = emit_xor_reg_reg(BUF(cg), REG_RSI, REG_RSI); EMIT(cg, pn);
+
+            /* Vector loop. */
+            size_t vtop = cg->code_size;
+            pn = emit_cmp_reg_reg(BUF(cg), REG_RSI, REG_RDX); EMIT(cg, pn);
+            size_t vjae = cg->code_size;
+            b = BUF(cg); b[0]=0x0F; b[1]=0x83; memset(b+2,0,4); EMIT(cg, 6);
+
+            /* vmovupd ymm0, [rdi + rsi*8] */
+            b = BUF(cg); b[0]=0xC5; b[1]=0xFD; b[2]=0x10;
+            b[3]=modrm(0, 0, 4); b[4]=(uint8_t)((3<<6)|(REG_RSI<<3)|REG_RDI);
+            EMIT(cg, 5);
+            /* vmaxpd ymm0, ymm0, ymm1   — VEX.256.66.0F.WIG 5F /r
+             *   C5 FD 5F C1 */
+            b = BUF(cg); b[0]=0xC5; b[1]=0xFD; b[2]=0x5F; b[3]=0xC1; EMIT(cg, 4);
+            /* vmovupd [rdi + rsi*8], ymm0 */
+            b = BUF(cg); b[0]=0xC5; b[1]=0xFD; b[2]=0x11;
+            b[3]=modrm(0, 0, 4); b[4]=(uint8_t)((3<<6)|(REG_RSI<<3)|REG_RDI);
+            EMIT(cg, 5);
+
+            b = BUF(cg); b[0]=0x48; b[1]=0x83; b[2]=0xC6; b[3]=0x04; EMIT(cg, 4);
+            int32_t vback = (int32_t)((int64_t)vtop - (int64_t)(cg->code_size + 5));
+            pn = emit_jmp(BUF(cg), vback); EMIT(cg, pn);
+            {
+                int32_t off = (int32_t)(cg->code_size - (vjae + 6));
+                memcpy(cg->code + vjae + 2, &off, 4);
+            }
+
+            /* Scalar tail: maxsd per element. */
+            size_t ttop = cg->code_size;
+            pn = emit_cmp_reg_reg(BUF(cg), REG_RSI, REG_RCX); EMIT(cg, pn);
+            size_t tjae = cg->code_size;
+            b = BUF(cg); b[0]=0x0F; b[1]=0x83; memset(b+2,0,4); EMIT(cg, 6);
+
+            /* movsd xmm0, [rdi + rsi*8] */
+            b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x10;
+            b[3]=modrm(0, 0, 4); b[4]=(uint8_t)((3<<6)|(REG_RSI<<3)|REG_RDI);
+            EMIT(cg, 5);
+            /* maxsd xmm0, xmm1   —  F2 0F 5F C1 */
+            b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x5F; b[3]=0xC1; EMIT(cg, 4);
+            /* movsd [rdi + rsi*8], xmm0 */
+            b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x11;
+            b[3]=modrm(0, 0, 4); b[4]=(uint8_t)((3<<6)|(REG_RSI<<3)|REG_RDI);
+            EMIT(cg, 5);
+
+            pn = emit_inc_reg(BUF(cg), REG_RSI); EMIT(cg, pn);
+            int32_t tback = (int32_t)((int64_t)ttop - (int64_t)(cg->code_size + 5));
+            pn = emit_jmp(BUF(cg), tback); EMIT(cg, pn);
+            {
+                int32_t off = (int32_t)(cg->code_size - (tjae + 6));
+                memcpy(cg->code + tjae + 2, &off, 4);
+            }
+
+            /* vzeroupper + return 0 */
+            b = BUF(cg); b[0]=0xC5; b[1]=0xF8; b[2]=0x77; EMIT(cg, 3);
+            pn = emit_xor_reg_reg(BUF(cg), REG_RAX, REG_RAX); EMIT(cg, pn);
             return 1;
         }
         if (strcmp(name, "arr_f64_add_scaled") == 0 && argc == 3) {

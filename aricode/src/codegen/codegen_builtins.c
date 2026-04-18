@@ -2516,43 +2516,402 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
         }
 
         if (strcmp(name, "arr_f64_dot") == 0 && argc == 2) {
-            /* SSE2 dot product: sum(a[i]*b[i]) with MULSD+ADDSD */
+            /* AVX2 dot product: result = Σ a[i]·b[i].
+             *
+             * Main loop processes 4 doubles per iteration via a single
+             * VFMADD231PD into a ymm accumulator — Zen 3 can issue
+             * that at 0.5c throughput, so ~8 FMAs/cycle peak.
+             * A scalar tail mops up the last n mod 4 elements.
+             *
+             * Registers in this block:
+             *   RDI = a base,  RBX = b base (callee-saved; pushed),
+             *   RCX = n (length),  RDX = n_vec = n & ~3,
+             *   RSI = i counter in element units,
+             *   ymm0 = packed accumulator, xmm0 = scalar result at end.
+             */
             emit_expression(cg, node->children[2]); /* b */
             int pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
             emit_expression(cg, node->children[1]); /* a */
             pn = emit_pop(BUF(cg), REG_RDX); EMIT(cg, pn);
             uint8_t *b;
-            pn = emit_push(BUF(cg), REG_RBX); EMIT(cg, pn); /* save callee-saved */
-            pn = emit_mov_reg_reg(BUF(cg), REG_RDI, REG_RAX); EMIT(cg, pn); /* a */
-            pn = emit_mov_reg_reg(BUF(cg), REG_RBX, REG_RDX); EMIT(cg, pn); /* b */
+            pn = emit_push(BUF(cg), REG_RBX); EMIT(cg, pn);
+            pn = emit_mov_reg_reg(BUF(cg), REG_RDI, REG_RAX); EMIT(cg, pn);
+            pn = emit_mov_reg_reg(BUF(cg), REG_RBX, REG_RDX); EMIT(cg, pn);
             pn = emit_mov_reg_mem(BUF(cg), REG_RCX, REG_RAX, -8); EMIT(cg, pn);
-            /* xorpd xmm0, xmm0 */
-            b = BUF(cg); b[0]=0x66; b[1]=0x0F; b[2]=0x57; b[3]=0xC0; EMIT(cg, 4);
+
+            /* RDX = n & ~3   (vectorised chunk length in elements). */
+            pn = emit_mov_reg_reg(BUF(cg), REG_RDX, REG_RCX); EMIT(cg, pn);
+            b = BUF(cg); b[0]=0x48; b[1]=0x83; b[2]=0xE2; b[3]=0xFC; EMIT(cg, 4);  /* and rdx, -4 */
+
+            /* vxorpd ymm0, ymm0, ymm0 — clear accumulator. */
+            b = BUF(cg); b[0]=0xC5; b[1]=0xFD; b[2]=0x57; b[3]=0xC0; EMIT(cg, 4);
+
+            /* xor rsi, rsi */
             pn = emit_xor_reg_reg(BUF(cg), REG_RSI, REG_RSI); EMIT(cg, pn);
-            size_t loop_top = cg->code_size;
-            pn = emit_cmp_reg_reg(BUF(cg), REG_RSI, REG_RCX); EMIT(cg, pn);
-            size_t jae_done = cg->code_size;
+
+            /* ── Vector loop: while RSI < RDX { … RSI += 4 } ─────────── */
+            size_t vloop_top = cg->code_size;
+            pn = emit_cmp_reg_reg(BUF(cg), REG_RSI, REG_RDX); EMIT(cg, pn);
+            size_t vloop_jae = cg->code_size;
             b = BUF(cg); b[0]=0x0F; b[1]=0x83; memset(b+2,0,4); EMIT(cg, 6);
-            /* movsd xmm1, [rdi + rsi*8] — a[i] */
+
+            /* vmovupd ymm1, [rdi + rsi*8] */
+            b = BUF(cg); b[0]=0xC5; b[1]=0xFD; b[2]=0x10;
+            b[3]=modrm(0, 1, 4); b[4]=(uint8_t)((3<<6)|(REG_RSI<<3)|REG_RDI);
+            EMIT(cg, 5);
+            /* vmovupd ymm2, [rbx + rsi*8] */
+            b = BUF(cg); b[0]=0xC5; b[1]=0xFD; b[2]=0x10;
+            b[3]=modrm(0, 2, 4); b[4]=(uint8_t)((3<<6)|(REG_RSI<<3)|REG_RBX);
+            EMIT(cg, 5);
+            /* vfmadd231pd ymm0, ymm1, ymm2  →  ymm0 += ymm1·ymm2 */
+            b = BUF(cg); b[0]=0xC4; b[1]=0xE2; b[2]=0xF5; b[3]=0xB8; b[4]=0xC2; EMIT(cg, 5);
+
+            /* add rsi, 4 */
+            b = BUF(cg); b[0]=0x48; b[1]=0x83; b[2]=0xC6; b[3]=0x04; EMIT(cg, 4);
+
+            /* jmp vloop_top */
+            int32_t vback = (int32_t)((int64_t)vloop_top - (int64_t)(cg->code_size + 5));
+            pn = emit_jmp(BUF(cg), vback); EMIT(cg, pn);
+            {
+                int32_t off = (int32_t)(cg->code_size - (vloop_jae + 6));
+                memcpy(cg->code + vloop_jae + 2, &off, 4);
+            }
+
+            /* ── Horizontal sum: ymm0 → scalar xmm0 ──────────────────── */
+            /* vextractf128 xmm1, ymm0, 1 */
+            b = BUF(cg); b[0]=0xC4; b[1]=0xE3; b[2]=0x7D; b[3]=0x19; b[4]=0xC1; b[5]=0x01; EMIT(cg, 6);
+            /* vaddpd xmm0, xmm0, xmm1 */
+            b = BUF(cg); b[0]=0xC5; b[1]=0xF9; b[2]=0x58; b[3]=0xC1; EMIT(cg, 4);
+            /* vhaddpd xmm0, xmm0, xmm0 — sum the two remaining doubles */
+            b = BUF(cg); b[0]=0xC5; b[1]=0xF9; b[2]=0x7C; b[3]=0xC0; EMIT(cg, 4);
+
+            /* ── Scalar tail loop: while RSI < RCX ───────────────────── */
+            size_t tloop_top = cg->code_size;
+            pn = emit_cmp_reg_reg(BUF(cg), REG_RSI, REG_RCX); EMIT(cg, pn);
+            size_t tloop_jae = cg->code_size;
+            b = BUF(cg); b[0]=0x0F; b[1]=0x83; memset(b+2,0,4); EMIT(cg, 6);
+
+            /* movsd xmm1, [rdi + rsi*8] */
             b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x10;
             b[3]=modrm(0, 1, 4); b[4]=(uint8_t)((3<<6)|(REG_RSI<<3)|REG_RDI);
             EMIT(cg, 5);
-            /* movsd xmm2, [rbx + rsi*8] — b[i] */
+            /* movsd xmm2, [rbx + rsi*8] */
             b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x10;
             b[3]=modrm(0, 2, 4); b[4]=(uint8_t)((3<<6)|(REG_RSI<<3)|REG_RBX);
             EMIT(cg, 5);
-            /* mulsd xmm1, xmm2 */
-            pn = emit_mulsd(BUF(cg), 1, 2); EMIT(cg, pn);
-            /* addsd xmm0, xmm1 */
-            pn = emit_addsd(BUF(cg), 0, 1); EMIT(cg, pn);
+            /* vfmadd231sd xmm0, xmm1, xmm2 */
+            b = BUF(cg); b[0]=0xC4; b[1]=0xE2; b[2]=0xF1; b[3]=0xB9; b[4]=0xC2; EMIT(cg, 5);
+
             pn = emit_inc_reg(BUF(cg), REG_RSI); EMIT(cg, pn);
-            int32_t back = (int32_t)((int64_t)loop_top - (int64_t)(cg->code_size + 5));
-            pn = emit_jmp(BUF(cg), back); EMIT(cg, pn);
-            int32_t jae_off = (int32_t)(cg->code_size - (jae_done + 6));
-            memcpy(cg->code + jae_done + 2, &jae_off, 4);
+            int32_t tback = (int32_t)((int64_t)tloop_top - (int64_t)(cg->code_size + 5));
+            pn = emit_jmp(BUF(cg), tback); EMIT(cg, pn);
+            {
+                int32_t off = (int32_t)(cg->code_size - (tloop_jae + 6));
+                memcpy(cg->code + tloop_jae + 2, &off, 4);
+            }
+
+            /* vzeroupper — avoid AVX↔SSE transition penalty on return. */
+            b = BUF(cg); b[0]=0xC5; b[1]=0xF8; b[2]=0x77; EMIT(cg, 3);
+
             pn = emit_pop(BUF(cg), REG_RBX); EMIT(cg, pn);
             /* movq rax, xmm0 */
             b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x7E; b[4]=0xC0; EMIT(cg, 5);
+            return 1;
+        }
+        if (strcmp(name, "arr_f64_add_scaled") == 0 && argc == 3) {
+            /* y[i] += alpha · x[i]   — the SGD weight-update kernel.
+             *
+             * AVX2 inner loop (4 doubles/iter) + scalar tail.  Returns 0.
+             * Register plan (all caller-saved except RBX save):
+             *   RDI = y base, RBX = x base (callee-saved→push),
+             *   RCX = n (from y[-8]), RDX = n_vec, RSI = i,
+             *   ymm3 = vector broadcast of alpha.
+             */
+            emit_expression(cg, node->children[3]); /* alpha (f64 bits) */
+            int pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
+            emit_expression(cg, node->children[2]); /* x */
+            pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
+            emit_expression(cg, node->children[1]); /* y */
+            uint8_t *b;
+            pn = emit_push(BUF(cg), REG_RBX); EMIT(cg, pn);
+            /* After the 3 pushes (alpha, x, rbx_saved), stack is:
+             *   [rsp+0]  = rbx_saved
+             *   [rsp+8]  = x          (we re-load it here)
+             *   [rsp+16] = alpha      (we re-load it here)
+             * RAX holds y. */
+            pn = emit_mov_reg_reg(BUF(cg), REG_RDI, REG_RAX); EMIT(cg, pn);
+            /* mov rbx, [rsp+8]  →  48 8B 5C 24 08 */
+            b = BUF(cg); b[0]=0x48; b[1]=0x8B; b[2]=0x5C; b[3]=0x24; b[4]=0x08; EMIT(cg, 5);
+            /* mov rdx, [rsp+16] →  48 8B 54 24 10 */
+            b = BUF(cg); b[0]=0x48; b[1]=0x8B; b[2]=0x54; b[3]=0x24; b[4]=0x10; EMIT(cg, 5);
+            /* movq xmm3, rdx */
+            b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xDA; EMIT(cg, 5);
+            /* vbroadcastsd ymm3, xmm3:  VEX.256.66.0F38.W0 19 /r
+             *   C4 E2 7D 19 DB  (dst=ymm3, src=xmm3) */
+            b = BUF(cg); b[0]=0xC4; b[1]=0xE2; b[2]=0x7D; b[3]=0x19; b[4]=0xDB; EMIT(cg, 5);
+
+            /* RCX = n (length of y). */
+            pn = emit_mov_reg_mem(BUF(cg), REG_RCX, REG_RDI, -8); EMIT(cg, pn);
+            /* RDX = n & ~3 */
+            pn = emit_mov_reg_reg(BUF(cg), REG_RDX, REG_RCX); EMIT(cg, pn);
+            b = BUF(cg); b[0]=0x48; b[1]=0x83; b[2]=0xE2; b[3]=0xFC; EMIT(cg, 4);
+            pn = emit_xor_reg_reg(BUF(cg), REG_RSI, REG_RSI); EMIT(cg, pn);
+
+            /* ── Vector loop: 4 doubles/iter ─────────────────────────── */
+            size_t vtop = cg->code_size;
+            pn = emit_cmp_reg_reg(BUF(cg), REG_RSI, REG_RDX); EMIT(cg, pn);
+            size_t vjae = cg->code_size;
+            b = BUF(cg); b[0]=0x0F; b[1]=0x83; memset(b+2,0,4); EMIT(cg, 6);
+
+            /* vmovupd ymm0, [rdi + rsi*8]  — y chunk */
+            b = BUF(cg); b[0]=0xC5; b[1]=0xFD; b[2]=0x10;
+            b[3]=modrm(0, 0, 4); b[4]=(uint8_t)((3<<6)|(REG_RSI<<3)|REG_RDI);
+            EMIT(cg, 5);
+            /* vmovupd ymm1, [rbx + rsi*8]  — x chunk */
+            b = BUF(cg); b[0]=0xC5; b[1]=0xFD; b[2]=0x10;
+            b[3]=modrm(0, 1, 4); b[4]=(uint8_t)((3<<6)|(REG_RSI<<3)|REG_RBX);
+            EMIT(cg, 5);
+            /* vfmadd231pd ymm0, ymm3, ymm1  → ymm0 += ymm3·ymm1 (alpha·x) */
+            b = BUF(cg); b[0]=0xC4; b[1]=0xE2; b[2]=0xE5; b[3]=0xB8; b[4]=0xC1; EMIT(cg, 5);
+            /* vmovupd [rdi + rsi*8], ymm0  — store updated y */
+            b = BUF(cg); b[0]=0xC5; b[1]=0xFD; b[2]=0x11;
+            b[3]=modrm(0, 0, 4); b[4]=(uint8_t)((3<<6)|(REG_RSI<<3)|REG_RDI);
+            EMIT(cg, 5);
+
+            /* add rsi, 4 */
+            b = BUF(cg); b[0]=0x48; b[1]=0x83; b[2]=0xC6; b[3]=0x04; EMIT(cg, 4);
+            int32_t vback = (int32_t)((int64_t)vtop - (int64_t)(cg->code_size + 5));
+            pn = emit_jmp(BUF(cg), vback); EMIT(cg, pn);
+            {
+                int32_t off = (int32_t)(cg->code_size - (vjae + 6));
+                memcpy(cg->code + vjae + 2, &off, 4);
+            }
+
+            /* ── Scalar tail ─────────────────────────────────────────── */
+            size_t ttop = cg->code_size;
+            pn = emit_cmp_reg_reg(BUF(cg), REG_RSI, REG_RCX); EMIT(cg, pn);
+            size_t tjae = cg->code_size;
+            b = BUF(cg); b[0]=0x0F; b[1]=0x83; memset(b+2,0,4); EMIT(cg, 6);
+
+            /* movsd xmm0, [rdi + rsi*8] */
+            b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x10;
+            b[3]=modrm(0, 0, 4); b[4]=(uint8_t)((3<<6)|(REG_RSI<<3)|REG_RDI);
+            EMIT(cg, 5);
+            /* movsd xmm1, [rbx + rsi*8] */
+            b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x10;
+            b[3]=modrm(0, 1, 4); b[4]=(uint8_t)((3<<6)|(REG_RSI<<3)|REG_RBX);
+            EMIT(cg, 5);
+            /* vfmadd231sd xmm0, xmm3, xmm1  — xmm0 += alpha·x */
+            b = BUF(cg); b[0]=0xC4; b[1]=0xE2; b[2]=0xE1; b[3]=0xB9; b[4]=0xC1; EMIT(cg, 5);
+            /* movsd [rdi + rsi*8], xmm0 */
+            b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x11;
+            b[3]=modrm(0, 0, 4); b[4]=(uint8_t)((3<<6)|(REG_RSI<<3)|REG_RDI);
+            EMIT(cg, 5);
+
+            pn = emit_inc_reg(BUF(cg), REG_RSI); EMIT(cg, pn);
+            int32_t tback = (int32_t)((int64_t)ttop - (int64_t)(cg->code_size + 5));
+            pn = emit_jmp(BUF(cg), tback); EMIT(cg, pn);
+            {
+                int32_t off = (int32_t)(cg->code_size - (tjae + 6));
+                memcpy(cg->code + tjae + 2, &off, 4);
+            }
+
+            /* vzeroupper + restore RBX + drop the 2 earlier pushed args. */
+            b = BUF(cg); b[0]=0xC5; b[1]=0xF8; b[2]=0x77; EMIT(cg, 3);
+            pn = emit_pop(BUF(cg), REG_RBX); EMIT(cg, pn);
+            /* add rsp, 16  —  discard x + alpha pushes */
+            b = BUF(cg); b[0]=0x48; b[1]=0x83; b[2]=0xC4; b[3]=16; EMIT(cg, 4);
+            pn = emit_xor_reg_reg(BUF(cg), REG_RAX, REG_RAX); EMIT(cg, pn);
+            return 1;
+        }
+        if (strcmp(name, "arr_f64_matvec") == 0 && argc == 6) {
+            /* arr_f64_matvec(W, x, bias, y, m, n)  —  y = W · x + bias.
+             *
+             * W is an m×n row-major matrix stored as a flat f64 array
+             * of length m·n (so W[j·n+i] is row j, column i).  bias/y
+             * have length m, x has length n.
+             *
+             * Inner loop is an AVX2 FMA accumulating 4 doubles per
+             * iteration; a scalar tail mops up n mod 4.  This is the
+             * primary forward-pass kernel for dense NN layers.
+             *
+             * Register usage inside the body (after arg unpack):
+             *   RDI = W base,  RSI = x base,  R14 = bias base,
+             *   R8 = y base,  R9 = m,  R10 = n,  R11 = n_vec,
+             *   RBX = j (outer), R12 = i (inner),
+             *   R13 = row_base_ptr = W + j·n·8,
+             *   ymm0 = packed inner acc,  xmm7 = scalar row acc.
+             *
+             * Saves RBX, R12, R13, R14 at entry (all callee-saved).
+             */
+            /* Evaluate and push all 6 args: push order n, m, y, bias, x, W. */
+            emit_expression(cg, node->children[6]); /* n */
+            int pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
+            emit_expression(cg, node->children[5]); /* m */
+            pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
+            emit_expression(cg, node->children[4]); /* y */
+            pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
+            emit_expression(cg, node->children[3]); /* bias */
+            pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
+            emit_expression(cg, node->children[2]); /* x */
+            pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
+            emit_expression(cg, node->children[1]); /* W → RAX */
+            uint8_t *b;
+
+            /* Save callee-saved registers we'll use. */
+            pn = emit_push(BUF(cg), REG_RBX); EMIT(cg, pn);
+            /* push r12 */
+            b = BUF(cg); b[0]=0x41; b[1]=0x54; EMIT(cg, 2);
+            /* push r13 */
+            b = BUF(cg); b[0]=0x41; b[1]=0x55; EMIT(cg, 2);
+            /* push r14 */
+            b = BUF(cg); b[0]=0x41; b[1]=0x56; EMIT(cg, 2);
+
+            /* Unpack args into registers.  Stack (after 4 saves) grew by
+             * 32 bytes, so the args are at [rsp+32..+72] in reverse push
+             * order: [rsp+32]=x, [rsp+40]=bias, [rsp+48]=y, [rsp+56]=m,
+             * [rsp+64]=n.  RAX already holds W. */
+            pn = emit_mov_reg_reg(BUF(cg), REG_RDI, REG_RAX); EMIT(cg, pn);  /* RDI = W */
+            /* mov rsi, [rsp + 32]    — x */
+            b = BUF(cg); b[0]=0x48; b[1]=0x8B; b[2]=0x74; b[3]=0x24; b[4]=0x20; EMIT(cg, 5);
+            /* mov r14, [rsp + 40]    — bias */
+            b = BUF(cg); b[0]=0x4C; b[1]=0x8B; b[2]=0x74; b[3]=0x24; b[4]=0x28; EMIT(cg, 5);
+            /* mov r8,  [rsp + 48]    — y */
+            b = BUF(cg); b[0]=0x4C; b[1]=0x8B; b[2]=0x44; b[3]=0x24; b[4]=0x30; EMIT(cg, 5);
+            /* mov r9,  [rsp + 56]    — m */
+            b = BUF(cg); b[0]=0x4C; b[1]=0x8B; b[2]=0x4C; b[3]=0x24; b[4]=0x38; EMIT(cg, 5);
+            /* mov r10, [rsp + 64]    — n */
+            b = BUF(cg); b[0]=0x4C; b[1]=0x8B; b[2]=0x54; b[3]=0x24; b[4]=0x40; EMIT(cg, 5);
+
+            /* R11 = n & ~3 */
+            /* mov r11, r10 */
+            b = BUF(cg); b[0]=0x4D; b[1]=0x89; b[2]=0xD3; EMIT(cg, 3);
+            /* and r11, -4 */
+            b = BUF(cg); b[0]=0x49; b[1]=0x83; b[2]=0xE3; b[3]=0xFC; EMIT(cg, 4);
+
+            /* RBX = j = 0 */
+            pn = emit_xor_reg_reg(BUF(cg), REG_RBX, REG_RBX); EMIT(cg, pn);
+
+            /* ── Outer loop: for j = 0..m ─────────────────────────── */
+            size_t outer_top = cg->code_size;
+            /* cmp rbx, r9 */
+            b = BUF(cg); b[0]=0x4C; b[1]=0x39; b[2]=0xCB; EMIT(cg, 3);
+            size_t outer_jae = cg->code_size;
+            b = BUF(cg); b[0]=0x0F; b[1]=0x83; memset(b+2,0,4); EMIT(cg, 6);
+
+            /* Compute row_base_ptr R13 = RDI + (j * n) * 8. */
+            /* mov rax, rbx */
+            b = BUF(cg); b[0]=0x48; b[1]=0x89; b[2]=0xD8; EMIT(cg, 3);
+            /* imul rax, r10 */
+            b = BUF(cg); b[0]=0x49; b[1]=0x0F; b[2]=0xAF; b[3]=0xC2; EMIT(cg, 4);
+            /* lea r13, [rdi + rax*8] */
+            b = BUF(cg); b[0]=0x4C; b[1]=0x8D; b[2]=0x2C; b[3]=0xC7; EMIT(cg, 4);
+
+            /* Seed scalar acc xmm7 with bias[j]:
+             *   movsd xmm7, [r14 + rbx*8]   — F2 41 0F 10 3C DE */
+            b = BUF(cg); b[0]=0xF2; b[1]=0x41; b[2]=0x0F; b[3]=0x10;
+            b[4]=0x3C; b[5]=0xDE; EMIT(cg, 6);
+
+            /* vxorpd ymm0, ymm0, ymm0 */
+            b = BUF(cg); b[0]=0xC5; b[1]=0xFD; b[2]=0x57; b[3]=0xC0; EMIT(cg, 4);
+
+            /* R12 = i = 0 */
+            /* xor r12, r12 */
+            b = BUF(cg); b[0]=0x4D; b[1]=0x31; b[2]=0xE4; EMIT(cg, 3);
+
+            /* ── Vector inner loop: 4 doubles per iter ─────────────── */
+            size_t vloop_top = cg->code_size;
+            /* cmp r12, r11 */
+            b = BUF(cg); b[0]=0x4D; b[1]=0x39; b[2]=0xDC; EMIT(cg, 3);
+            size_t vloop_jae = cg->code_size;
+            b = BUF(cg); b[0]=0x0F; b[1]=0x83; memset(b+2,0,4); EMIT(cg, 6);
+
+            /* vmovupd ymm1, [r13 + r12*8 + 0]  — W row chunk.
+             * Note: SIB base=101 (r13/rbp) with mod=00 means "absolute
+             * disp32, no base" in x86 encoding — so we must use mod=01
+             * with disp8=0 to actually address through R13. */
+            b = BUF(cg); b[0]=0xC4; b[1]=0x81; b[2]=0x7D; b[3]=0x10;
+            b[4]=0x4C; b[5]=0xE5; b[6]=0x00; EMIT(cg, 7);
+            /* vmovupd ymm2, [rsi + r12*8]  — x chunk (rsi base is fine). */
+            b = BUF(cg); b[0]=0xC4; b[1]=0xA1; b[2]=0x7D; b[3]=0x10;
+            b[4]=0x14; b[5]=0xE6; EMIT(cg, 6);
+            /* vfmadd231pd ymm0, ymm1, ymm2 */
+            b = BUF(cg); b[0]=0xC4; b[1]=0xE2; b[2]=0xF5; b[3]=0xB8; b[4]=0xC2; EMIT(cg, 5);
+
+            /* add r12, 4 */
+            b = BUF(cg); b[0]=0x49; b[1]=0x83; b[2]=0xC4; b[3]=0x04; EMIT(cg, 4);
+
+            int32_t vback = (int32_t)((int64_t)vloop_top - (int64_t)(cg->code_size + 5));
+            pn = emit_jmp(BUF(cg), vback); EMIT(cg, pn);
+            {
+                int32_t off = (int32_t)(cg->code_size - (vloop_jae + 6));
+                memcpy(cg->code + vloop_jae + 2, &off, 4);
+            }
+
+            /* Horizontal sum ymm0 → scalar, add to xmm7. */
+            /* vextractf128 xmm3, ymm0, 1 */
+            b = BUF(cg); b[0]=0xC4; b[1]=0xE3; b[2]=0x7D; b[3]=0x19; b[4]=0xC3; b[5]=0x01; EMIT(cg, 6);
+            /* vaddpd xmm0, xmm0, xmm3 */
+            b = BUF(cg); b[0]=0xC5; b[1]=0xF9; b[2]=0x58; b[3]=0xC3; EMIT(cg, 4);
+            /* vhaddpd xmm0, xmm0, xmm0 */
+            b = BUF(cg); b[0]=0xC5; b[1]=0xF9; b[2]=0x7C; b[3]=0xC0; EMIT(cg, 4);
+            /* addsd xmm7, xmm0 */
+            pn = emit_addsd(BUF(cg), 7, 0); EMIT(cg, pn);
+
+            /* ── Scalar tail: while R12 < R10 ──────────────────────── */
+            size_t tloop_top = cg->code_size;
+            /* cmp r12, r10 */
+            b = BUF(cg); b[0]=0x4D; b[1]=0x39; b[2]=0xD4; EMIT(cg, 3);
+            size_t tloop_jae = cg->code_size;
+            b = BUF(cg); b[0]=0x0F; b[1]=0x83; memset(b+2,0,4); EMIT(cg, 6);
+
+            /* movsd xmm1, [r13 + r12*8 + 0]  — same SIB base=101 quirk */
+            b = BUF(cg); b[0]=0xF2; b[1]=0x43; b[2]=0x0F; b[3]=0x10;
+            b[4]=0x4C; b[5]=0xE5; b[6]=0x00; EMIT(cg, 7);
+            /* movsd xmm2, [rsi + r12*8] */
+            b = BUF(cg); b[0]=0xF2; b[1]=0x42; b[2]=0x0F; b[3]=0x10;
+            b[4]=0x14; b[5]=0xE6; EMIT(cg, 6);
+            /* vfmadd231sd xmm7, xmm1, xmm2 */
+            b = BUF(cg); b[0]=0xC4; b[1]=0xE2; b[2]=0xF1; b[3]=0xB9; b[4]=0xFA; EMIT(cg, 5);
+
+            /* inc r12 */
+            b = BUF(cg); b[0]=0x49; b[1]=0xFF; b[2]=0xC4; EMIT(cg, 3);
+            int32_t tback = (int32_t)((int64_t)tloop_top - (int64_t)(cg->code_size + 5));
+            pn = emit_jmp(BUF(cg), tback); EMIT(cg, pn);
+            {
+                int32_t off = (int32_t)(cg->code_size - (tloop_jae + 6));
+                memcpy(cg->code + tloop_jae + 2, &off, 4);
+            }
+
+            /* y[j] = xmm7   →  movsd [r8 + rbx*8], xmm7 */
+            b = BUF(cg); b[0]=0xF2; b[1]=0x41; b[2]=0x0F; b[3]=0x11;
+            b[4]=0x3C; b[5]=0xD8; EMIT(cg, 6);
+
+            /* inc rbx ;  jmp outer_top */
+            b = BUF(cg); b[0]=0x48; b[1]=0xFF; b[2]=0xC3; EMIT(cg, 3);
+            int32_t oback = (int32_t)((int64_t)outer_top - (int64_t)(cg->code_size + 5));
+            pn = emit_jmp(BUF(cg), oback); EMIT(cg, pn);
+            {
+                int32_t off = (int32_t)(cg->code_size - (outer_jae + 6));
+                memcpy(cg->code + outer_jae + 2, &off, 4);
+            }
+
+            /* vzeroupper */
+            b = BUF(cg); b[0]=0xC5; b[1]=0xF8; b[2]=0x77; EMIT(cg, 3);
+
+            /* Restore callee-saved and the 5 pushed args. */
+            /* pop r14 */
+            b = BUF(cg); b[0]=0x41; b[1]=0x5E; EMIT(cg, 2);
+            /* pop r13 */
+            b = BUF(cg); b[0]=0x41; b[1]=0x5D; EMIT(cg, 2);
+            /* pop r12 */
+            b = BUF(cg); b[0]=0x41; b[1]=0x5C; EMIT(cg, 2);
+            pn = emit_pop(BUF(cg), REG_RBX); EMIT(cg, pn);
+            /* drop the 5 remaining args (x, bias, y, m, n): add rsp, 40 */
+            b = BUF(cg); b[0]=0x48; b[1]=0x83; b[2]=0xC4; b[3]=40; EMIT(cg, 4);
+
+            /* Return 0 (no meaningful value, outputs were stored in y). */
+            pn = emit_xor_reg_reg(BUF(cg), REG_RAX, REG_RAX); EMIT(cg, pn);
             return 1;
         }
         if (strcmp(name, "arr_f64_scale") == 0 && argc == 2) {

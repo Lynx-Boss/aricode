@@ -24,6 +24,7 @@ SRCS = \
 	$(PARSER_DIR)/parser.c \
 	$(PARSER_DIR)/ast.c \
 	$(PARSER_DIR)/struct_registry.c \
+	$(PARSER_DIR)/enum_registry.c \
 	$(ERRORS_DIR)/error_system.c \
 	$(ERRORS_DIR)/error_registry.c \
 	$(ERRORS_DIR)/podium.c \

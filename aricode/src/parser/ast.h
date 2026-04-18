@@ -59,6 +59,10 @@ typedef enum {
     NODE_STRUCT_INIT,       /* Name { x: val, y: val }            */
     NODE_FIELD_ACCESS,      /* p.x  (reads/writes struct field)   */
 
+    /* Enums */
+    NODE_ENUM_DECL,         /* enum Name { Variant, ... }         */
+    NODE_ENUM_VARIANT,      /* Name::Variant  (loads int constant) */
+
     /* Types */
     NODE_TYPE_ANNOTATION,   /* : i32, : str, : Option<i32>  */
 

@@ -99,11 +99,13 @@ typedef enum {
     TOKEN_RBRACKET,      /* ] */
     TOKEN_SEMICOLON,     /* ; */
     TOKEN_COLON,         /* : */
+    TOKEN_COLONCOLON,    /* :: */
     TOKEN_COMMA,         /* , */
     TOKEN_DOT,           /* . */
     TOKEN_ARROW,         /* -> */
     TOKEN_FAT_ARROW,     /* => */
 
+    TOKEN_ENUM,          /* enum keyword (placed at end to avoid renumbering) */
     TOKEN_COUNT          /* total number of token types */
 } TokenType;
 
@@ -132,6 +134,8 @@ static const char *token_type_names[] = {
     [TOKEN_EXPORT]            = "export",
     [TOKEN_IN]                = "in",
     [TOKEN_STRUCT]            = "struct",
+    [TOKEN_ENUM]              = "enum",
+    [TOKEN_COLONCOLON]        = "::",
     [TOKEN_BREAK]             = "break",
     [TOKEN_CONTINUE]          = "continue",
     [TOKEN_TRUE]              = "true",

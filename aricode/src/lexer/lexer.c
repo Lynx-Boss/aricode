@@ -94,6 +94,7 @@ static const KWEntry keywords[] = {
     { "export", TOKEN_EXPORT },
     { "in",     TOKEN_IN },
     { "struct", TOKEN_STRUCT },
+    { "enum",   TOKEN_ENUM },
     { "break",    TOKEN_BREAK },
     { "continue", TOKEN_CONTINUE },
     { "true",   TOKEN_TRUE },
@@ -475,7 +476,11 @@ static Token lex_token(Lexer *lex)
         case '[': return make_token(TOKEN_LBRACKET, "[", line, col, lex->filename);
         case ']': return make_token(TOKEN_RBRACKET, "]", line, col, lex->filename);
         case ';': return make_token(TOKEN_SEMICOLON,";", line, col, lex->filename);
-        case ':': return make_token(TOKEN_COLON,    ":", line, col, lex->filename);
+        case ':':
+            if (current(lex) == ':') { advance(lex);
+                return make_token(TOKEN_COLONCOLON, "::", line, col, lex->filename);
+            }
+            return make_token(TOKEN_COLON, ":", line, col, lex->filename);
         case ',': return make_token(TOKEN_COMMA,    ",", line, col, lex->filename);
         case '.': return make_token(TOKEN_DOT,      ".", line, col, lex->filename);
         default:  break;

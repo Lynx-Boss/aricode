@@ -1400,6 +1400,18 @@ int emit_expression(CodegenState *cg, const ASTNode *node) {
     case NODE_FIELD_ACCESS:
         emit_field_access(cg, node);
         return 0;
+    case NODE_ENUM_VARIANT: {
+        /* Variants are plain integer constants: MOV RAX, imm32 */
+        int32_t val = (int32_t)node->int_val;
+        uint8_t *b = BUF(cg);
+        b[0] = 0x48; b[1] = 0xC7; b[2] = 0xC0;
+        b[3] = (uint8_t)(val);
+        b[4] = (uint8_t)(val >> 8);
+        b[5] = (uint8_t)(val >> 16);
+        b[6] = (uint8_t)(val >> 24);
+        EMIT(cg, 7);
+        return 0;
+    }
     default:
         cg_error(cg, "unsupported expression node type %s at %d:%d",
                  node_type_name(node->type), node->line, node->col);

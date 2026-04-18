@@ -9,6 +9,7 @@
 
 #include "analyzer.h"
 #include "../parser/struct_registry.h"
+#include "../parser/enum_registry.h"
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -83,6 +84,10 @@ static AriType *resolve_type_annotation(Analyzer *a, ASTNode *node) {
         /* Allow user-defined struct types: if it appears in the struct
          * registry, treat it like an i32 (struct handle is a heap ptr). */
         if (struct_registry_get(name)) {
+            return type_create(TYPE_I32);
+        }
+        /* Allow enum types: each enum is a plain i32 at runtime. */
+        if (enum_registry_is_enum(name)) {
             return type_create(TYPE_I32);
         }
         emit_error(a, ARI_LEVEL_LOGIC, ARI_L006_CODE, ARI_L006_FIX,
@@ -571,6 +576,10 @@ static AriType *analyze_expr(Analyzer *a, ASTNode *node) {
             type_free(analyze_expr(a, node->children[0]));
         return type_create(TYPE_I32);
     }
+
+    case NODE_ENUM_VARIANT:
+        /* Enum variants are plain i32 constants resolved at parse time. */
+        return type_create(TYPE_I32);
 
     default:
         /* For other node types, analyze children */
@@ -1108,8 +1117,9 @@ static void analyze_stmt(Analyzer *a, ASTNode *node) {
         break;
 
     case NODE_STRUCT_DECL:
-        /* Struct decls are registered at parse time; nothing to check
-         * at semantic level beyond what the parser already did. */
+    case NODE_ENUM_DECL:
+        /* Struct/enum decls are registered at parse time; nothing to
+         * check at semantic level beyond what the parser already did. */
         break;
 
     default:

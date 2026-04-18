@@ -43,6 +43,8 @@ static const char *_node_type_names[] = {
     [NODE_STRUCT_DECL]     = "STRUCT_DECL",
     [NODE_STRUCT_INIT]     = "STRUCT_INIT",
     [NODE_FIELD_ACCESS]    = "FIELD_ACCESS",
+    [NODE_ENUM_DECL]       = "ENUM_DECL",
+    [NODE_ENUM_VARIANT]    = "ENUM_VARIANT",
     [NODE_TYPE_ANNOTATION] = "TYPE_ANNOTATION",
 };
 
@@ -146,6 +148,14 @@ void ast_print(const ASTNode *node, int indent) {
     case NODE_FIELD_ACCESS:
         if (node->string_val)
             printf(" field='%s'", node->string_val);
+        break;
+    case NODE_ENUM_DECL:
+        if (node->string_val)
+            printf(" enum='%s'", node->string_val);
+        break;
+    case NODE_ENUM_VARIANT:
+        if (node->string_val)
+            printf(" variant='%s' value=%ld", node->string_val, (long)node->int_val);
         break;
     case NODE_ERROR_RAISE:
         if (node->string_val)

@@ -43,6 +43,7 @@
 
 #include "parser.h"
 #include "struct_registry.h"
+#include "enum_registry.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -425,6 +426,34 @@ static ASTNode *try_parse_struct_init(Parser *p, ASTNode *expr) {
 
 static ASTNode *parse_call(Parser *p) {
     ASTNode *expr = parse_primary(p);
+
+    /* Enum variant access: Name::Variant.  Lowered eagerly to the variant
+     * index so downstream code sees a plain integer.  We still emit a
+     * NODE_ENUM_VARIANT with the resolved value so debug printing is
+     * informative, but it carries no runtime semantics beyond an int. */
+    if (expr && expr->type == NODE_IDENTIFIER && expr->string_val &&
+        check(p, TOKEN_COLONCOLON)) {
+        advance(p); /* consume :: */
+        const ParserToken *vname = expect(p, TOKEN_IDENTIFIER, "variant name after '::'");
+        int idx = -1;
+        const char *enum_name = expr->string_val;
+        if (vname && vname->lexeme) {
+            idx = enum_registry_variant_index(enum_name, vname->lexeme);
+            if (idx < 0) {
+                parser_error(p, vname->line, vname->col,
+                             "unknown enum or variant '%s::%s'",
+                             enum_name, vname->lexeme);
+                idx = 0;
+            }
+        }
+        ASTNode *var = ast_create_node(NODE_ENUM_VARIANT,
+                                       expr->line, expr->col);
+        var->op         = str_dup(enum_name);
+        var->string_val = vname ? str_dup(vname->lexeme) : str_dup("");
+        var->int_val    = idx;
+        ast_free(expr);
+        expr = var;
+    }
 
     /* Struct literal: Name { x: 1, y: 2 } */
     {
@@ -1184,6 +1213,60 @@ static ASTNode *parse_struct_declaration(Parser *p) {
     return node;
 }
 
+/* ================================================================== */
+/*  Enum declarations                                                  */
+/* ================================================================== */
+/*
+ * enum Name { Variant1, Variant2, ... }
+ *
+ * AST layout for NODE_ENUM_DECL:
+ *   string_val = enum name
+ *   children[i] = NODE_IDENTIFIER (variant name)
+ *
+ * Each variant is registered in the enum registry with its zero-based
+ * index so that later expressions can lower `Name::Variant` to an int.
+ */
+static ASTNode *parse_enum_declaration(Parser *p) {
+    const ParserToken *kw = previous(p);
+    const ParserToken *name = expect(p, TOKEN_IDENTIFIER, "enum name");
+
+    ASTNode *node = ast_create_node(NODE_ENUM_DECL, kw->line, kw->col);
+    node->string_val = name ? str_dup(name->lexeme) : str_dup("");
+
+    if (name && name->lexeme) {
+        if (!enum_registry_add(name->lexeme)) {
+            parser_error(p, name->line, name->col,
+                         "duplicate enum declaration '%s'", name->lexeme);
+        }
+    }
+
+    expect(p, TOKEN_LBRACE, "'{' to open enum body");
+
+    while (!check(p, TOKEN_RBRACE) && !check(p, TOKEN_EOF)) {
+        const ParserToken *vname = expect(p, TOKEN_IDENTIFIER, "variant name");
+        if (vname) {
+            ASTNode *vnode = ast_create_node(NODE_IDENTIFIER, vname->line, vname->col);
+            vnode->string_val = str_dup(vname->lexeme);
+            ast_add_child(node, vnode);
+
+            if (name && name->lexeme && vname->lexeme) {
+                if (!enum_registry_add_variant(name->lexeme, vname->lexeme)) {
+                    parser_error(p, vname->line, vname->col,
+                                 "duplicate variant '%s' in enum '%s'",
+                                 vname->lexeme, name->lexeme);
+                }
+            }
+        }
+
+        if (!match(p, TOKEN_COMMA) && !check(p, TOKEN_RBRACE)) {
+            match(p, TOKEN_SEMICOLON);
+        }
+    }
+
+    expect(p, TOKEN_RBRACE, "'}' to close enum body");
+    return node;
+}
+
 /* --- Top-level declaration dispatcher ----------------------------- */
 
 static ASTNode *parse_declaration(Parser *p) {
@@ -1197,6 +1280,8 @@ static ASTNode *parse_declaration(Parser *p) {
         node = parse_var_declaration(p, true);
     } else if (match(p, TOKEN_STRUCT)) {
         node = parse_struct_declaration(p);
+    } else if (match(p, TOKEN_ENUM)) {
+        node = parse_enum_declaration(p);
     } else {
         node = parse_statement(p);
     }

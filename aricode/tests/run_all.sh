@@ -269,6 +269,42 @@ fn main() -> i32 {
 EOF
 run_test "first_class_struct" "/tmp/aritest_struct_fc.ari" "" "20"
 
+cat > /tmp/aritest_enum.ari << 'EOF'
+enum Color {
+    Red,
+    Green,
+    Blue,
+}
+
+enum Direction {
+    North,
+    South,
+    East,
+    West,
+}
+
+fn score(c: i32) -> i32 {
+    if (c == Color::Red) {
+        return 10;
+    }
+    if (c == Color::Green) {
+        return 20;
+    }
+    return 30;
+}
+
+fn main() -> i32 {
+    let c: Color = Color::Green;
+    print_int(c);                       // 1
+    print_int(score(Color::Red));       // 10
+    print_int(score(Color::Blue));      // 30
+    let d: Direction = Direction::West;
+    print_int(d);                       // 3
+    return 0;
+}
+EOF
+run_test "enums"          "/tmp/aritest_enum.ari" "" "30"
+
 # ── Error Handling ──
 echo -e "${BOLD}--- Error Handling ---${RESET}"
 run_test "try_catch"      "$EXAMPLES/error_handling.ari" "" "ERROR caught!"

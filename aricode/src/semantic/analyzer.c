@@ -296,6 +296,8 @@ static AriType *builtin_return_type(const char *name) {
         {"arr_f64_add_scaled", TYPE_I32},
         {"arr_f64_relu",    TYPE_I32},
         {"arr_f64_exp",     TYPE_I32},
+        {"arr_f64_sigmoid", TYPE_I32},
+        {"arr_f64_tanh",    TYPE_I32},
         /* i32 — threading */
         {"thread_spawn",    TYPE_I32},
         {"thread_wait",     TYPE_I32},

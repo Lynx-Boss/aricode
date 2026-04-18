@@ -3136,20 +3136,29 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             /* In-place softmax: buf[i] = exp(buf[i] - max) / Σ exp(…)
              *
              * Three passes over the array:
-             *   1. horizontal max            (ymm_max)
-             *   2. shifted exp into buf, sum (ymm_sum)
-             *   3. multiply by 1/sum (scalar inverse, broadcast)
+             *   1. horizontal max            (ymm11, xmm11 for scalar tail)
+             *   2. shifted exp into buf, sum (ymm12, xmm12 for scalar tail)
+             *   3. multiply by 1/sum
              *
-             * Numerically stable (shift by max keeps `exp` in (0, 1]).
-             * Reuses emit_vec_exp_body_avx2 so the Estrin poly stays in
-             * one place.  Scalar tail skipped (callers pad to mul 4).
+             * Handles arbitrary n (including n < 4).  The AVX2 body runs
+             * over the largest mul-of-4 prefix; a scalar tail finishes
+             * the last 0-3 elements.  When n < 4 the AVX2 prefix is
+             * empty — the initial ymm11 seed is replaced with a scalar
+             * load so we never read past the buffer.
+             *
+             * RBX holds `n` across the whole routine so that callees
+             * (emit_vec_exp_body_avx2 clobbers RCX) can't disturb our
+             * loop limit.
              *
              * Clobbers: all caller-saved GPRs + ymm0..ymm15.  Saves RBX.
              */
             emit_expression(cg, node->children[1]);
             int pn; uint8_t *b;
+            pn = emit_push(BUF(cg), REG_RBX); EMIT(cg, pn);
             pn = emit_mov_reg_reg(BUF(cg), REG_RDI, REG_RAX); EMIT(cg, pn);
             pn = emit_mov_reg_mem(BUF(cg), REG_RCX, REG_RAX, -8); EMIT(cg, pn);
+            /* rbx = n (callee-saved, stable across vec_exp clobbers).  */
+            pn = emit_mov_reg_reg(BUF(cg), REG_RBX, REG_RCX); EMIT(cg, pn);
             pn = emit_mov_reg_reg(BUF(cg), REG_RDX, REG_RCX); EMIT(cg, pn);
             b = BUF(cg); b[0]=0x48; b[1]=0x83; b[2]=0xE2; b[3]=0xFC; EMIT(cg, 4);  /* rdx = n_vec */
 
@@ -3160,14 +3169,12 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             emit_exp_coeff_stack_setup(cg);
 
             /* ── PASS 1: horizontal max ──────────────────────────────
-             * Seed ymm11 with buf[0..3], loop vmaxpd, then reduce ymm
-             * to a scalar via extract/shuffle. */
-            /* vmovupd ymm11, [rdi]   (byte2 R~=0 for ymm11: 0x7D) */
-            b = BUF(cg); b[0]=0xC5; b[1]=0x7D; b[2]=0x10;
-            b[3]=modrm(0, 3, REG_RDI); EMIT(cg, 4);     /* mod=00, reg=011 (ymm11 low), r/m=rdi */
-            /* rsi = 4 */
-            b = BUF(cg); b[0]=0x48; b[1]=0xC7; b[2]=0xC6;
-            memcpy(b+3, (int32_t[]){4}, 4); EMIT(cg, 7);
+             * Seed ymm11 with broadcast(-inf) so the vec + scalar passes
+             * can process the full [0, n) range uniformly.  Pre-seeding
+             * from buf[0..3] would save one vmaxpd iteration but breaks
+             * for n < 4 (reads past the buffer). */
+            cg_broadcast_f64(cg, 11, 0xFFF0000000000000ULL, /*scratch=*/0);
+            pn = emit_xor_reg_reg(BUF(cg), REG_RSI, REG_RSI); EMIT(cg, pn);
 
             CgCountedLoop mx = cg_loop_begin(cg, REG_RSI, REG_RDX);
             /* vmovupd ymm0, [rdi + rsi*8] */
@@ -3177,16 +3184,11 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             b = BUF(cg); b[0]=0x5F; b[1]=0xC0 | ((11&7)<<3) | (0&7); EMIT(cg, 2);
             cg_loop_end(cg, mx, 4);
 
-            /* Horizontal max reduction of ymm11 → scalar → broadcast back.
-             *   vextractf128 xmm0, ymm11, 1
-             *   vmaxpd xmm11, xmm11, xmm0
-             *   vshufpd xmm0, xmm11, xmm11, 1
-             *   vmaxpd xmm11, xmm11, xmm0
-             *   vbroadcastsd ymm11, xmm11 */
+            /* Horizontal max reduction of ymm11 → xmm11 low lane. */
             /* vextractf128 xmm0, ymm11, 1 */
             b = BUF(cg); b[0]=0xC4; b[1]=0x63; b[2]=0x7D; b[3]=0x19;
             b[4]=0xD8; b[5]=0x01; EMIT(cg, 6);   /* mod=11 reg=ymm11(3) r/m=xmm0(0), with R~ from byte2 */
-            /* vmaxpd xmm11, xmm11, xmm0    (need 3-byte VEX for high dst) */
+            /* vmaxpd xmm11, xmm11, xmm0 */
             cg_vex3(cg, 11, 11, 0, 0, /*L=*/0, 1, 1);
             b = BUF(cg); b[0]=0x5F; b[1]=0xC0 | ((11&7)<<3) | 0; EMIT(cg, 2);
             /* vshufpd xmm0, xmm11, xmm11, 1 */
@@ -3195,10 +3197,24 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             /* vmaxpd xmm11, xmm11, xmm0 */
             cg_vex3(cg, 11, 11, 0, 0, 0, 1, 1);
             b = BUF(cg); b[0]=0x5F; b[1]=0xC0 | ((11&7)<<3) | 0; EMIT(cg, 2);
-            /* vbroadcastsd ymm11, xmm11 */
+
+            /* Scalar tail: fold buf[rdx..n) into xmm11 low via maxsd.
+             * RSI is sitting at rdx from the vec loop; RBX holds n.   */
+            {
+                CgCountedLoop t1 = cg_loop_begin(cg, REG_RSI, REG_RBX);
+                /* maxsd xmm11, [rdi + rsi*8]
+                 *   F2 44 0F 5F  [modrm=0x1C  mod=00 reg=011 r/m=100]  [sib=0xF7] */
+                b = BUF(cg);
+                b[0] = 0xF2; b[1] = 0x44; b[2] = 0x0F; b[3] = 0x5F;
+                b[4] = (uint8_t)(0 | ((11 & 7) << 3) | 4);
+                b[5] = (uint8_t)((3 << 6) | (REG_RSI << 3) | REG_RDI);
+                EMIT(cg, 6);
+                cg_loop_end(cg, t1, 1);
+            }
+
+            /* vbroadcastsd ymm11, xmm11 — splat max into all lanes. */
             cg_vex3(cg, 11, 0, 11, 0, 1, 1, 2);
             b = BUF(cg); b[0]=0x19; b[1]=0xC0 | ((11&7)<<3) | (11&7); EMIT(cg, 2);
-            /* Now ymm11 holds broadcast of max across all 4 lanes. */
 
             /* ── PASS 2: buf[i] = exp(buf[i] - max) ; sum into ymm12 ── */
             /* vxorpd ymm12, ymm12, ymm12  (clear sum) */
@@ -3225,7 +3241,7 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
 
             cg_loop_end(cg, ex, 4);
 
-            /* Horizontal sum of ymm12 → scalar → ymm12 = broadcast(1/sum). */
+            /* Horizontal sum of ymm12 → xmm12 low lane. */
             /* vextractf128 xmm0, ymm12, 1 */
             b = BUF(cg); b[0]=0xC4; b[1]=0x63; b[2]=0x7D; b[3]=0x19;
             b[4]=0xE0; b[5]=0x01; EMIT(cg, 6);
@@ -3238,6 +3254,35 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             /* vaddsd xmm12, xmm12, xmm0 — scalar add to finish */
             cg_vex3(cg, 12, 12, 0, 1, 0, 3, 1);
             b = BUF(cg); b[0]=0x58; b[1]=0xC0 | ((12&7)<<3) | 0; EMIT(cg, 2);
+
+            /* Scalar tail: for rsi in [rdx, rbx), compute exp(buf[i] - max),
+             * store back, fold into xmm12.  emit_vec_exp_body_avx2 runs
+             * on a broadcast of the single element — 3 lanes of wasted
+             * work, but only called for 1-3 tail elements, so the setup
+             * cost of a dedicated scalar exp helper isn't worth it.
+             * RSI is at rdx from the vec loop. */
+            {
+                CgCountedLoop t2 = cg_loop_begin(cg, REG_RSI, REG_RBX);
+                /* movsd xmm0, [rdi + rsi*8] */
+                cg_movsd_xmm_base_idx(cg, 0, REG_RDI, REG_RSI, 0x10);
+                /* vsubsd xmm0, xmm0, xmm11  — subtract max (lane 0).
+                 *   VEX.LIG.F2.0F 5C /r */
+                cg_vex3(cg, 0, 0, 11, 0, 0, 3, 1);
+                b = BUF(cg); b[0] = 0x5C; b[1] = 0xC0 | (0<<3) | (11&7); EMIT(cg, 2);
+                /* vbroadcastsd ymm0, xmm0 — splat scalar to all 4 lanes. */
+                cg_vex3(cg, 0, 0, 0, 0, 1, 1, 2);
+                b = BUF(cg); b[0] = 0x19; b[1] = 0xC0; EMIT(cg, 2);
+
+                emit_vec_exp_body_avx2(cg);     /* ymm0 = exp in all lanes */
+
+                /* Store lane 0: movsd [rdi + rsi*8], xmm0 */
+                cg_movsd_xmm_base_idx(cg, 0, REG_RDI, REG_RSI, 0x11);
+                /* vaddsd xmm12, xmm12, xmm0 — fold into scalar sum. */
+                cg_vex3(cg, 12, 12, 0, 0, 0, 3, 1);
+                b = BUF(cg); b[0] = 0x58; b[1] = 0xC0 | ((12&7)<<3) | 0; EMIT(cg, 2);
+                cg_loop_end(cg, t2, 1);
+            }
+
             /* xmm12 low now = total sum.  Compute 1/sum:
              *   vdivsd xmm12, xmm10_low, xmm12   (ymm10 low lane has 1.0) */
             cg_vex3(cg, 12, 10, 12, 1, 0, 3, 1);
@@ -3258,8 +3303,22 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             cg_vmovupd_ymm_base_idx(cg, 0, REG_RDI, REG_RSI, 0x11);
             cg_loop_end(cg, nm, 4);
 
+            /* Scalar tail for pass 3: rsi is at rdx, rbx = n. */
+            {
+                CgCountedLoop t3 = cg_loop_begin(cg, REG_RSI, REG_RBX);
+                /* movsd xmm0, [rdi + rsi*8] */
+                cg_movsd_xmm_base_idx(cg, 0, REG_RDI, REG_RSI, 0x10);
+                /* vmulsd xmm0, xmm0, xmm12 */
+                cg_vex3(cg, 0, 0, 12, 0, 0, 3, 1);
+                b = BUF(cg); b[0] = 0x59; b[1] = 0xC0 | (0<<3) | (12&7); EMIT(cg, 2);
+                /* store */
+                cg_movsd_xmm_base_idx(cg, 0, REG_RDI, REG_RSI, 0x11);
+                cg_loop_end(cg, t3, 1);
+            }
+
             emit_exp_coeff_stack_teardown(cg);
             b = BUF(cg); b[0]=0xC5; b[1]=0xF8; b[2]=0x77; EMIT(cg, 3);
+            pn = emit_pop(BUF(cg), REG_RBX); EMIT(cg, pn);
             pn = emit_xor_reg_reg(BUF(cg), REG_RAX, REG_RAX); EMIT(cg, pn);
             return 1;
         }

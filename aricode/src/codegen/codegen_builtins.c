@@ -204,8 +204,47 @@ static void cg_vmovapd(CodegenState *cg, int dst, int src) {
     EMIT(cg, 2);
 }
 
+/* vbroadcastsd ymm_dst, [rsp + disp8]  — memory-source broadcast.
+ *
+ * This is the inner-loop-friendly broadcast: one instruction, no GPR
+ * traffic, no cross-domain move.  Callers that need loop-invariant
+ * f64 constants should pre-populate stack slots at builtin entry with
+ * `mov rax, imm64 ; mov [rsp+k*8], rax` (15 bytes once), then use
+ * this helper inside the hot loop.
+ *
+ * Encoding: VEX.256.66.0F38.W0 19 /r with a SIB-addressed memory form
+ *   C4 [RXB.00010] [0.1111.1.01] 19 [modrm.reg=dst.r/m=100] [sib=rsp] [disp8]
+ */
+static void cg_vbroadcastsd_rsp(CodegenState *cg, int dst, int disp8) {
+    uint8_t *b = BUF(cg);
+    b[0] = 0xC4;
+    /* byte2: R~ X~ B~ mmmmm.  R~=0 if dst>=8, else 1. X~=B~=1. mmmmm=00010. */
+    b[1] = (uint8_t)((dst < 8 ? 0xE2 : 0x62));
+    /* byte3: W=0 vvvv=1111 L=1 pp=01 = 0x7D */
+    b[2] = 0x7D;
+    b[3] = 0x19;                                      /* opcode */
+    b[4] = (uint8_t)(0x44 | ((dst & 7) << 3));        /* mod=01, reg=dst, r/m=100 (SIB) */
+    b[5] = 0x24;                                      /* SIB: scale=0, index=none, base=rsp */
+    b[6] = (uint8_t)disp8;
+    EMIT(cg, 7);
+}
+
+/* Store imm64 at [rsp + disp8]:
+ *   mov rax, imm64      (10 bytes)
+ *   mov [rsp+disp8], rax (5 bytes)
+ */
+static void cg_store_imm64_rsp(CodegenState *cg, uint64_t bits, int disp8) {
+    int pn; uint8_t *b;
+    pn = emit_mov_reg_imm64(BUF(cg), REG_RAX, bits); EMIT(cg, pn);
+    b = BUF(cg);
+    b[0] = 0x48; b[1] = 0x89; b[2] = 0x44; b[3] = 0x24;
+    b[4] = (uint8_t)disp8;
+    EMIT(cg, 5);
+}
+
 /* vbroadcastsd ymm_dst, imm64 bits  (materialise an f64 then broadcast).
- * Goes via RCX + xmm0-temp; clobbers RCX. */
+ * Goes via RCX + xmm0-temp; clobbers RCX.  Use this only OUTSIDE hot
+ * loops — see cg_vbroadcastsd_rsp for the fast path. */
 static void cg_broadcast_f64(CodegenState *cg, int dst, uint64_t bits,
                               int scratch_xmm) {
     int pn; uint8_t *b;
@@ -566,6 +605,30 @@ static void emit_sincos_body(CodegenState *cg, int is_cos) {
     (void)pn;
 }
 
+/*
+ * Reserve 64 bytes on the stack and spill the 8 exp-polynomial
+ * coefficients (C1..C8) into it.  Reads happen via cg_vbroadcastsd_rsp
+ * inside emit_vec_exp_body_avx2.  The teardown reclaims the bytes.
+ */
+static void emit_exp_coeff_stack_setup(CodegenState *cg) {
+    uint8_t *b;
+    /* sub rsp, 64 */
+    b = BUF(cg); b[0]=0x48; b[1]=0x83; b[2]=0xEC; b[3]=64; EMIT(cg, 4);
+    cg_store_imm64_rsp(cg, 0x3FE0000000000000ULL,  0);  /* C1 = 1/2       */
+    cg_store_imm64_rsp(cg, 0x3FC5555555555555ULL,  8);  /* C2 = 1/6       */
+    cg_store_imm64_rsp(cg, 0x3FA5555555555555ULL, 16);  /* C3 = 1/24      */
+    cg_store_imm64_rsp(cg, 0x3F81111111111111ULL, 24);  /* C4 = 1/120     */
+    cg_store_imm64_rsp(cg, 0x3F56C16C16C16C17ULL, 32);  /* C5 = 1/720     */
+    cg_store_imm64_rsp(cg, 0x3F2A01A01A01A01AULL, 40);  /* C6 = 1/5040    */
+    cg_store_imm64_rsp(cg, 0x3EFA01A01A01A01AULL, 48);  /* C7 = 1/40320   */
+    cg_store_imm64_rsp(cg, 0x3EC71DE3A556C734ULL, 56);  /* C8 = 1/362880  */
+}
+
+static void emit_exp_coeff_stack_teardown(CodegenState *cg) {
+    /* add rsp, 64 */
+    uint8_t *b = BUF(cg); b[0]=0x48; b[1]=0x83; b[2]=0xC4; b[3]=64; EMIT(cg, 4);
+}
+
 /* =====================================================================
  *  Packed AVX2 exp(x) — reusable body for arr_f64_exp, sigmoid, tanh, …
  * =====================================================================
@@ -575,16 +638,31 @@ static void emit_sincos_body(CodegenState *cg, int is_cos) {
  * P is the 9-term Taylor polynomial evaluated with Estrin's scheme
  * (matches the scalar math_exp bit-for-bit in limit).
  *
- * Input preconditions:
+ * Input preconditions (caller responsibility):
  *   ymm0  = x (4 packed f64 lanes)
  *   ymm8  = broadcast(log2e)
  *   ymm9  = broadcast(ln2)
  *   ymm10 = broadcast(1.0)
+ *   [rsp + 0 .. +56]  holds the 7 polynomial coefficients C2..C8 as
+ *                     plain f64 values (see EXP_STACK_* offsets below).
+ *                     C0 = 1.0 is read from ymm10; C1 = 1/2 is read
+ *                     via a separate stack slot to minimise setup.
+ *
+ * Stack layout the caller must populate before the hot loop:
+ *   [rsp +  0] = C1  (0.5)
+ *   [rsp +  8] = C2  (1/6)
+ *   [rsp + 16] = C3  (1/24)
+ *   [rsp + 24] = C4  (1/120)
+ *   [rsp + 32] = C5  (1/720)
+ *   [rsp + 40] = C6  (1/5040)
+ *   [rsp + 48] = C7  (1/40320)
+ *   [rsp + 56] = C8  (1/362880)
+ *   (8 × 8 = 64 bytes — keeps the stack 16-byte aligned.)
  *
  * Output:
  *   ymm0  = exp(x)
  *
- * Clobbers: ymm1..ymm7, xmm11 (broadcast scratch), RAX, RCX.
+ * Clobbers: ymm1..ymm7, RAX, RCX.
  *
  * Register plan inside the body:
  *   ymm1 — k_f (after vroundpd)          → later: recycled for 2^k bit-build
@@ -607,23 +685,27 @@ static void emit_vec_exp_body_avx2(CodegenState *cg) {
     /* Step 2: ymm0 = x - k · ln2 = r. */
     cg_vfnmadd231pd(cg, 0, 1, 9);
 
-    /* Step 3: Estrin 9-term polynomial P(r).  Coefficients are the same
-     * 1/(k+1)! values the scalar math_exp path uses. */
-    cg_broadcast_f64(cg, 2, 0x3FE0000000000000ULL, 11);    /* C1 = 1/2 */
-    cg_vmovapd     (cg, 6, 10);                            /* ymm6 = 1.0 */
-    cg_vfmadd213pd (cg, 2, 0, 6);                          /* A = C1·r + C0 */
+    /* Step 3: Estrin 9-term polynomial P(r) with broadcasts read from
+     * the caller's stack slots.  Each broadcast is a single VEX-encoded
+     * 7-byte instruction (vs the old 20-byte mov-imm64+movq+broadcast
+     * triple), and the decoded µops do not contend with any other
+     * inner-loop work — critical on Zen 3 where the front-end bandwidth
+     * dominates tight FMA chains. */
+    cg_vbroadcastsd_rsp(cg, 2,  0);                        /* ymm2 = C1 */
+    cg_vmovapd         (cg, 6, 10);                         /* ymm6 = C0 = 1.0 */
+    cg_vfmadd213pd     (cg, 2,  0, 6);                      /* A = C1·r + C0 */
 
-    cg_broadcast_f64(cg, 3, 0x3FA5555555555555ULL, 11);    /* C3 = 1/24 */
-    cg_broadcast_f64(cg, 6, 0x3FC5555555555555ULL, 11);    /* C2 = 1/6  */
-    cg_vfmadd213pd  (cg, 3, 0, 6);                          /* B = C3·r + C2 */
+    cg_vbroadcastsd_rsp(cg, 3, 16);                        /* ymm3 = C3 */
+    cg_vbroadcastsd_rsp(cg, 6,  8);                        /* ymm6 = C2 */
+    cg_vfmadd213pd     (cg, 3,  0, 6);                      /* B = C3·r + C2 */
 
-    cg_broadcast_f64(cg, 4, 0x3F56C16C16C16C17ULL, 11);    /* C5 = 1/720 */
-    cg_broadcast_f64(cg, 6, 0x3F81111111111111ULL, 11);    /* C4 = 1/120 */
-    cg_vfmadd213pd  (cg, 4, 0, 6);                          /* C = C5·r + C4 */
+    cg_vbroadcastsd_rsp(cg, 4, 32);                        /* ymm4 = C5 */
+    cg_vbroadcastsd_rsp(cg, 6, 24);                        /* ymm6 = C4 */
+    cg_vfmadd213pd     (cg, 4,  0, 6);                      /* C = C5·r + C4 */
 
-    cg_broadcast_f64(cg, 5, 0x3EFA01A01A01A01AULL, 11);    /* C7 = 1/40320 */
-    cg_broadcast_f64(cg, 6, 0x3F2A01A01A01A01AULL, 11);    /* C6 = 1/5040 */
-    cg_vfmadd213pd  (cg, 5, 0, 6);                          /* D = C7·r + C6 */
+    cg_vbroadcastsd_rsp(cg, 5, 48);                        /* ymm5 = C7 */
+    cg_vbroadcastsd_rsp(cg, 6, 40);                        /* ymm6 = C6 */
+    cg_vfmadd213pd     (cg, 5,  0, 6);                      /* D = C7·r + C6 */
 
     /* r² in ymm6 */
     cg_vmovapd(cg, 6, 0);
@@ -640,8 +722,8 @@ static void emit_vec_exp_body_avx2(CodegenState *cg) {
     cg_vmulpd     (cg, 7, 7, 7);
 
     /* Level 4: P = ABCD + r⁸·C8 */
-    cg_broadcast_f64(cg, 6, 0x3EC71DE3A556C734ULL, 11);    /* C8 = 1/362880 */
-    cg_vfmadd231pd  (cg, 2, 7, 6);
+    cg_vbroadcastsd_rsp(cg, 6, 56);                         /* ymm6 = C8 */
+    cg_vfmadd231pd     (cg, 2, 7, 6);
 
     /* exp_raw = 1 + r · P.  Seed ymm3 with 1.0, FMA r·P into it. */
     cg_vmovapd    (cg, 3, 10);
@@ -2846,6 +2928,8 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             cg_broadcast_f64(cg, 13, 0xC000000000000000ULL, 0);    /* -2.0  */
             cg_broadcast_f64(cg, 14, 0x4000000000000000ULL, 0);    /*  2.0  */
 
+            emit_exp_coeff_stack_setup(cg);
+
             pn = emit_xor_reg_reg(BUF(cg), REG_RSI, REG_RSI); EMIT(cg, pn);
 
             size_t vtop = cg->code_size;
@@ -2887,6 +2971,8 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
                 memcpy(cg->code + vjae + 2, &off, 4);
             }
 
+            emit_exp_coeff_stack_teardown(cg);
+
             b = BUF(cg); b[0]=0xC5; b[1]=0xF8; b[2]=0x77; EMIT(cg, 3);
             pn = emit_xor_reg_reg(BUF(cg), REG_RAX, REG_RAX); EMIT(cg, pn);
             return 1;
@@ -2906,12 +2992,15 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             pn = emit_mov_reg_reg(BUF(cg), REG_RDX, REG_RCX); EMIT(cg, pn);
             b = BUF(cg); b[0]=0x48; b[1]=0x83; b[2]=0xE2; b[3]=0xFC; EMIT(cg, 4);
 
-            /* Broadcast the usual exp-pipeline constants plus a sign-bit
-             * mask in ymm12 for the initial negation. */
+            /* Broadcast pipeline constants.  The sign-bit mask lives in
+             * ymm12 for the pre-exp negation. */
             cg_broadcast_f64(cg, 8,  0x3FF71547652B82FEULL, 0);
             cg_broadcast_f64(cg, 9,  0x3FE62E42FEFA39EFULL, 0);
             cg_broadcast_f64(cg, 10, 0x3FF0000000000000ULL, 0);
             cg_broadcast_f64(cg, 12, 0x8000000000000000ULL, 0);
+
+            /* Spill polynomial coefficients for memory-broadcast in loop. */
+            emit_exp_coeff_stack_setup(cg);
 
             pn = emit_xor_reg_reg(BUF(cg), REG_RSI, REG_RSI); EMIT(cg, pn);
 
@@ -2925,31 +3014,19 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             b[3]=modrm(0, 0, 4); b[4]=(uint8_t)((3<<6)|(REG_RSI<<3)|REG_RDI);
             EMIT(cg, 5);
 
-            /* ymm0 = -x via vxorpd ymm0, ymm0, ymm12.
-             *   VEX.256.66.0F.WIG 57 /r — use cg_vex3 because ymm12 is high. */
-            cg_vex3(cg, /*dst=*/0, /*a=*/0, /*b_reg=*/12, /*W=*/0, /*L=*/1, /*pp=*/1, /*mmmmm=*/1);
-            b = BUF(cg);
-            b[0] = 0x57;
-            b[1] = 0xC0 | ((0 & 7) << 3) | (12 & 7);
-            EMIT(cg, 2);
+            /* ymm0 = -x  via vxorpd ymm0, ymm0, ymm12. */
+            cg_vex3(cg, 0, 0, 12, 0, 1, 1, 1);
+            b = BUF(cg); b[0] = 0x57; b[1] = 0xC0 | (0 << 3) | (12 & 7); EMIT(cg, 2);
 
-            /* ymm0 = exp(-x). */
-            emit_vec_exp_body_avx2(cg);
+            emit_vec_exp_body_avx2(cg);                              /* exp(-x) */
 
-            /* ymm0 = 1 + exp(-x) via vaddpd ymm0, ymm0, ymm10.
-             *   opcode 0x58, VEX.256.66.0F.WIG. */
+            /* 1 + exp(-x)  via vaddpd ymm0, ymm0, ymm10. */
             cg_vex3(cg, 0, 0, 10, 0, 1, 1, 1);
-            b = BUF(cg);
-            b[0] = 0x58;
-            b[1] = 0xC0 | ((0 & 7) << 3) | (10 & 7);
-            EMIT(cg, 2);
+            b = BUF(cg); b[0] = 0x58; b[1] = 0xC0 | (0 << 3) | (10 & 7); EMIT(cg, 2);
 
-            /* ymm0 = 1.0 / ymm0  via vdivpd ymm0, ymm10, ymm0  (opcode 0x5E). */
+            /* σ = 1 / (1 + exp(-x))  via vdivpd ymm0, ymm10, ymm0. */
             cg_vex3(cg, 0, 10, 0, 0, 1, 1, 1);
-            b = BUF(cg);
-            b[0] = 0x5E;
-            b[1] = 0xC0 | ((0 & 7) << 3) | (0 & 7);
-            EMIT(cg, 2);
+            b = BUF(cg); b[0] = 0x5E; b[1] = 0xC0 | (0 << 3) | (0 & 7); EMIT(cg, 2);
 
             /* Store. */
             b = BUF(cg); b[0]=0xC5; b[1]=0xFD; b[2]=0x11;
@@ -2963,6 +3040,8 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
                 int32_t off = (int32_t)(cg->code_size - (vjae + 6));
                 memcpy(cg->code + vjae + 2, &off, 4);
             }
+
+            emit_exp_coeff_stack_teardown(cg);
 
             b = BUF(cg); b[0]=0xC5; b[1]=0xF8; b[2]=0x77; EMIT(cg, 3);  /* vzeroupper */
             pn = emit_xor_reg_reg(BUF(cg), REG_RAX, REG_RAX); EMIT(cg, pn);
@@ -2995,14 +3074,16 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             pn = emit_mov_reg_reg(BUF(cg), REG_RDX, REG_RCX); EMIT(cg, pn);
             b = BUF(cg); b[0]=0x48; b[1]=0x83; b[2]=0xE2; b[3]=0xFC; EMIT(cg, 4);
 
-            /* Broadcast every constant we'll need.  Stash them in
-             * ymm8..ymm12 so the inner loop can just do FMAs. */
-            /* ymm8 = log2e */
-            cg_broadcast_f64(cg, 8, 0x3FF71547652B82FEULL, /*scratch=*/0);
-            /* ymm9 = ln2 */
-            cg_broadcast_f64(cg, 9, 0x3FE62E42FEFA39EFULL, 0);
-            /* ymm10 = 1.0 (polynomial/result seed) */
+            /* Broadcast loop-invariant scalars (log2e, ln2, 1.0) to ymm. */
+            cg_broadcast_f64(cg, 8,  0x3FF71547652B82FEULL, /*scratch=*/0);
+            cg_broadcast_f64(cg, 9,  0x3FE62E42FEFA39EFULL, 0);
             cg_broadcast_f64(cg, 10, 0x3FF0000000000000ULL, 0);
+
+            /* Spill the 8 Estrin coefficients to the stack once; each
+             * vec-loop iteration reads them via 1-instruction
+             * vbroadcastsd [rsp+k*8] instead of a 3-instruction
+             * mov-imm64 + movq + vbroadcastsd chain. */
+            emit_exp_coeff_stack_setup(cg);
 
             pn = emit_xor_reg_reg(BUF(cg), REG_RSI, REG_RSI); EMIT(cg, pn);
 
@@ -3017,9 +3098,6 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             b[3]=modrm(0, 0, 4); b[4]=(uint8_t)((3<<6)|(REG_RSI<<3)|REG_RDI);
             EMIT(cg, 5);
 
-            /* All the heavy lifting (range reduce + Estrin + 2^k build)
-             * lives in the shared helper, which is also used by the
-             * sigmoid / tanh / softmax builtins. */
             emit_vec_exp_body_avx2(cg);
 
             /* Store: vmovupd [rdi + rsi*8], ymm0 */
@@ -3036,16 +3114,10 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
                 memcpy(cg->code + vjae + 2, &off, 4);
             }
 
-            /* ── Scalar tail: fall back to in-place math_exp on each
-             *     remaining lane via a simple runtime call pattern.
-             *     For simplicity we just load, compute via a minimal
-             *     inline scalar exp (copying the same algorithm) and
-             *     store.  Since n mod 4 ≤ 3, this runs at most 3× per
-             *     array and dominates nothing. */
-            /* For now, leave the tail loop empty — caller should pad
-             * arrays to multiples of 4.  This is the standard NN
-             * convention (batch size / feature dim aligned).
-             * TODO: real tail loop via scalar math_exp emission. */
+            /* Scalar tail intentionally left empty — callers pad arrays
+             * to multiples of 4 (standard NN batching convention). */
+
+            emit_exp_coeff_stack_teardown(cg);
 
             /* vzeroupper + return 0 */
             b = BUF(cg); b[0]=0xC5; b[1]=0xF8; b[2]=0x77; EMIT(cg, 3);

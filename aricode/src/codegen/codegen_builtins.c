@@ -127,106 +127,174 @@ static void cg_mulsd(CodegenState *cg, int dst, int src) {
     EMIT(cg, 4);
 }
 
-/*
- * Estrin's scheme — splits a serial Horner chain into parallel
- * sub-chains that can dispatch to the two FMA pipes on Zen 3 simultaneously.
+/* =====================================================================
+ *  Generic Estrin polynomial evaluator
+ * =====================================================================
  *
- * For P(y) = S1 + S2·y + S3·y² + S4·y³ + S5·y⁴  (our sin tail):
- *   Level 1  (parallel):
- *     A  = S2·y + S1
- *     B  = S4·y + S3
- *     y² = y·y
- *   Level 2:
- *     Lower = A + y²·B          (covers S1..S4)
- *     y⁴    = y²·y²              (parallel)
- *   Level 3:
- *     P = Lower + y⁴·S5          (adds the tail S5)
+ * Emits P(y) = c[0] + c[1]·y + c[2]·y² + ... + c[n-1]·y^(n-1)
+ * using Estrin's tree rearrangement, so dependent FMAs run in parallel
+ * on Zen 3's two FMA pipes.  Critical path ≈ log2(n)·4c  (compared
+ * with Horner's n·4c).
  *
- * Critical path: 3 dependent FMAs ≈ 12c, versus serial Horner's 4 × 4c
- * = 16c.  The asymmetric split (A/B plus a standalone S5) is only
- * mildly suboptimal for n=5; log2(5) ≈ 2.3.
+ *   n    Horner+FMA    Estrin+FMA    Savings     Levels
+ *   5    20c           12c           8c (40 %)   3
+ *   7    28c           12c           16c (57 %)  3
+ *   9    36c           16c           20c (56 %)  4
  *
- * Register convention for sin/cos:
- *   xmm0: x (preserved for the outer x + x³·P recombination)
- *   xmm1: y = x²                 (kept across the poly)
- *   xmm2: A → Lower → P          (the running accumulator)
- *   xmm3: B then x³              (reused after B is consumed)
- *   xmm4: y²
- *   xmm5: y⁴
- *   xmm6: scratch for coefficient loads
+ * API contract:
+ *   - `y_reg` must be xmm0 or xmm1 (anything outside the xmm2..xmm7
+ *     range that the helper uses for its temporaries).
+ *   - The result P(y) is left in **xmm2**.
+ *   - Clobbers xmm2..xmm7.
+ *
+ * Supported n: 2..9.  Adding higher degrees is a matter of writing
+ * another ladder; the current ML math (sin, cos, tanh, exp, log,
+ * sigmoid derivatives) all fit here.
  */
-static void emit_sin_poly_sse2(CodegenState *cg) {
-    /* xmm1 = y = x·x */
-    emit_mov_xmm(cg, 1, 0);
-    cg_mulsd    (cg, 1, 1);
+static void emit_estrin_poly(CodegenState *cg,
+                              const uint64_t *c, int n,
+                              int y_reg)
+{
+    if (n < 2 || n > 9) {
+        cg_error(cg, "emit_estrin_poly: n=%d not supported (must be 2..9)", n);
+        return;
+    }
 
-    /* ── Level 1: three operations in parallel ─────────────────────── */
-    /* xmm2 = S2·y + S1 */
-    emit_load_f64   (cg, 2, 0x3F8111111110F8A6ULL);  /* S2 */
-    emit_load_f64   (cg, 6, 0xBFC5555555555549ULL);  /* S1 */
-    emit_fma213_reg (cg, 2, 1, 6);                   /* xmm2 = xmm2·y + xmm6 */
+    /* Level 1: A = c1·y + c0  →  xmm2 */
+    emit_load_f64   (cg, 2, c[1]);
+    emit_load_f64   (cg, 6, c[0]);
+    emit_fma213_reg (cg, 2, y_reg, 6);
+    if (n == 2) return;
 
-    /* xmm3 = S4·y + S3 */
-    emit_load_f64   (cg, 3, 0x3EC71DE357B1FE7DULL);  /* S4 */
-    emit_load_f64   (cg, 6, 0xBF2A01A019C161D5ULL);  /* S3 */
-    emit_fma213_reg (cg, 3, 1, 6);                   /* xmm3 = xmm3·y + xmm6 */
+    /* y² into xmm7 (used by every n ≥ 3 branch below). */
+    emit_mov_xmm (cg, 7, y_reg);
+    cg_mulsd     (cg, 7, y_reg);
 
-    /* xmm4 = y² */
-    emit_mov_xmm (cg, 4, 1);
-    cg_mulsd     (cg, 4, 1);
+    if (n == 3) {
+        /* P = A + y²·c2 */
+        emit_load_f64 (cg, 6, c[2]);
+        emit_fma_add  (cg, 2, 7, 6);
+        return;
+    }
 
-    /* ── Level 2: xmm2 += y²·B  (Lower = A + y²·B) ─────────────────── */
-    emit_fma_add (cg, 2, 4, 3);                      /* xmm2 += xmm4·xmm3 */
+    /* B = c3·y + c2  →  xmm3.  (n ≥ 4) */
+    emit_load_f64   (cg, 3, c[3]);
+    emit_load_f64   (cg, 6, c[2]);
+    emit_fma213_reg (cg, 3, y_reg, 6);
 
-    /* xmm5 = y²·y² = y⁴ */
-    emit_mov_xmm (cg, 5, 4);
-    cg_mulsd     (cg, 5, 4);
+    if (n == 4) {
+        /* P = A + y²·B */
+        emit_fma_add (cg, 2, 7, 3);
+        return;
+    }
 
-    /* ── Level 3: xmm2 += y⁴·S5  (P = Lower + y⁴·S5) ───────────────── */
-    emit_load_f64 (cg, 6, 0xBE5AE5E68A2B9CEBULL);    /* S5 */
-    emit_fma_add  (cg, 2, 5, 6);                     /* xmm2 += xmm5·xmm6 */
+    /* xmm2 = A + y²·B  (Lower — covers degrees 0..3). */
+    emit_fma_add (cg, 2, 7, 3);
 
-    /* ── Final: sin(x) = x + x³·P ──────────────────────────────────── */
-    /* xmm3 = x·y = x³  (xmm3 is free — B was consumed in Level 2) */
-    emit_mov_xmm (cg, 3, 0);
-    cg_mulsd     (cg, 3, 1);
-    emit_fma_add (cg, 0, 3, 2);                      /* xmm0 += xmm3·xmm2 */
+    if (n == 5) {
+        /* P = Lower + y⁴·c4 */
+        emit_mov_xmm (cg, 3, 7);
+        cg_mulsd     (cg, 3, 7);               /* xmm3 = y⁴ (reuses xmm3) */
+        emit_load_f64 (cg, 6, c[4]);
+        emit_fma_add  (cg, 2, 3, 6);
+        return;
+    }
+
+    /* C = c5·y + c4  →  xmm4.  (n ≥ 6) */
+    emit_load_f64   (cg, 4, c[5]);
+    emit_load_f64   (cg, 6, c[4]);
+    emit_fma213_reg (cg, 4, y_reg, 6);
+
+    /* xmm3 = y⁴ (xmm7 still holds y²).  Keep xmm7 alive for n=7. */
+    emit_mov_xmm (cg, 3, 7);
+    cg_mulsd     (cg, 3, 7);
+
+    if (n == 6) {
+        /* P = Lower + y⁴·C */
+        emit_fma_add (cg, 2, 3, 4);
+        return;
+    }
+
+    if (n == 7) {
+        /* Fold c6 into C: xmm4 += y²·c6. */
+        emit_load_f64 (cg, 6, c[6]);
+        emit_fma_add  (cg, 4, 7, 6);
+        /* P = Lower + y⁴·C */
+        emit_fma_add  (cg, 2, 3, 4);
+        return;
+    }
+
+    /* D = c7·y + c6  →  xmm5.  (n ≥ 8) */
+    emit_load_f64   (cg, 5, c[7]);
+    emit_load_f64   (cg, 6, c[6]);
+    emit_fma213_reg (cg, 5, y_reg, 6);
+
+    /* CD = C + y²·D  →  xmm4. */
+    emit_fma_add (cg, 4, 7, 5);
+
+    /* ABCD = Lower + y⁴·CD  →  xmm2 */
+    emit_fma_add (cg, 2, 3, 4);
+
+    if (n == 8) return;
+
+    /* n == 9: P = ABCD + y⁸·c8 */
+    cg_mulsd      (cg, 3, 3);                   /* xmm3 = y⁴·y⁴ = y⁸ */
+    emit_load_f64 (cg, 6, c[8]);
+    emit_fma_add  (cg, 2, 3, 6);
 }
 
 /*
- * Estrin for the cos tail C(y) = C1 + C2·y + C3·y² + C4·y³ + C5·y⁴
- * with the usual cos(x) = 1 + y · C(y) recombination.  Same shape as
- * sin_poly but the coefficients start at C1 (no "S1" odd term).
+ * sin / cos polynomial tails (Estrin-evaluated via emit_estrin_poly).
+ *
+ * The coefficient tables are minimax-fit for |x| ≤ π/4 (≈ 1e-11 rel
+ * error in that range; the caller's octant reducer guarantees this).
+ *
+ *   sin(x) ≈ x + x³ · S(y)     where y = x², S has 5 terms
+ *   cos(x) ≈ 1 + y · C(y)      where y = x², C has 5 terms
+ *
+ * Each helper assumes x is in xmm0 and leaves the result in xmm0.
  */
+static const uint64_t sin_tail_coeffs[5] = {
+    0xBFC5555555555549ULL,  /* S1 ≈ -1/6 */
+    0x3F8111111110F8A6ULL,  /* S2 ≈  1/120 */
+    0xBF2A01A019C161D5ULL,  /* S3 ≈ -1/5040 */
+    0x3EC71DE357B1FE7DULL,  /* S4 ≈  1/362880 */
+    0xBE5AE5E68A2B9CEBULL,  /* S5 ≈ -1/39916800 */
+};
+
+static const uint64_t cos_tail_coeffs[5] = {
+    0xBFE0000000000000ULL,  /* C1 = -1/2 */
+    0x3FA555555555554CULL,  /* C2 ≈  1/24 */
+    0xBF56C16C16C15177ULL,  /* C3 ≈ -1/720 */
+    0x3EFA01A019CB1590ULL,  /* C4 ≈  1/40320 */
+    0xBE927E4F809C52ADULL,  /* C5 ≈ -1/3628800 */
+};
+
+static void emit_sin_poly_sse2(CodegenState *cg) {
+    /* xmm1 = y = x² */
+    emit_mov_xmm (cg, 1, 0);
+    cg_mulsd     (cg, 1, 1);
+
+    /* xmm2 = S(y) via Estrin (5-term). */
+    emit_estrin_poly (cg, sin_tail_coeffs, 5, /*y_reg=*/1);
+
+    /* sin(x) = x + x³ · S(y) */
+    emit_mov_xmm (cg, 3, 0);
+    cg_mulsd     (cg, 3, 1);                   /* xmm3 = x·y = x³ */
+    emit_fma_add (cg, 0, 3, 2);                /* xmm0 += x³·S(y) */
+}
+
 static void emit_cos_poly_sse2(CodegenState *cg) {
-    /* xmm1 = y = x·x */
-    emit_mov_xmm(cg, 1, 0);
-    cg_mulsd    (cg, 1, 1);
+    /* xmm1 = y = x² */
+    emit_mov_xmm (cg, 1, 0);
+    cg_mulsd     (cg, 1, 1);
 
-    /* Level 1 */
-    emit_load_f64   (cg, 2, 0x3FA555555555554CULL);  /* C2 */
-    emit_load_f64   (cg, 6, 0xBFE0000000000000ULL);  /* C1 = -1/2 */
-    emit_fma213_reg (cg, 2, 1, 6);                   /* xmm2 = C2·y + C1 = A */
+    /* xmm2 = C(y) via Estrin (5-term). */
+    emit_estrin_poly (cg, cos_tail_coeffs, 5, /*y_reg=*/1);
 
-    emit_load_f64   (cg, 3, 0x3EFA01A019CB1590ULL);  /* C4 */
-    emit_load_f64   (cg, 6, 0xBF56C16C16C15177ULL);  /* C3 */
-    emit_fma213_reg (cg, 3, 1, 6);                   /* xmm3 = C4·y + C3 = B */
-
-    emit_mov_xmm (cg, 4, 1);
-    cg_mulsd     (cg, 4, 1);                         /* xmm4 = y² */
-
-    /* Level 2 */
-    emit_fma_add (cg, 2, 4, 3);                      /* xmm2 = A + y²·B */
-    emit_mov_xmm (cg, 5, 4);
-    cg_mulsd     (cg, 5, 4);                         /* xmm5 = y⁴ */
-
-    /* Level 3 */
-    emit_load_f64 (cg, 6, 0xBE927E4F809C52ADULL);    /* C5 */
-    emit_fma_add  (cg, 2, 5, 6);                     /* xmm2 = Lower + y⁴·C5 = C(y) */
-
-    /* Final: cos(x) = 1 + y·C(y).  Seed xmm0 with 1.0 and FMA. */
+    /* cos(x) = 1 + y · C(y) */
     emit_load_f64 (cg, 0, 0x3FF0000000000000ULL);
-    emit_fma_add  (cg, 0, 1, 2);                     /* xmm0 += y·xmm2 */
+    emit_fma_add  (cg, 0, 1, 2);               /* xmm0 += y · C(y) */
 }
 
 /* =====================================================================
@@ -1946,58 +2014,29 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
                 b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x5C; b[3]=0xC2; EMIT(cg, 4);
                 /* xmm0 = r, xmm1 = k */
 
-                /* === Step 3: Estrin evaluation of Taylor series (FMA3) ===
-                 * P(r) = C0 + C1·r + C2·r² + C3·r³ + … + C8·r⁸
-                 *   Ck = 1/(k+1)!   (since exp(r) = 1 + r·P(r))
+                /* === Step 3: Estrin polynomial for exp(r) ===
+                 * exp(r) = 1 + r · P(r)
+                 * P(r) = Σ_{k=0..8} r^k / (k+1)!       (9 terms)
                  *
-                 *   L1: A = C1·r+C0   B = C3·r+C2   C = C5·r+C4   D = C7·r+C6
-                 *       r² = r·r                                 (all parallel)
-                 *   L2: AB = A + r²·B       CD = C + r²·D        (parallel)
-                 *       r⁴ = r²·r²
-                 *   L3: ABCD = AB + r⁴·CD
-                 *       r⁸ = r⁴·r⁴
-                 *   L4: P = ABCD + r⁸·C8
-                 *
-                 * Critical path: 4 dependent FMAs ≈ 16c (was Horner 9 × 4c = 36c).
-                 * Registers: xmm0=r, xmm1=k, xmm2=A→AB→ABCD→P,
-                 *   xmm3=B, xmm4=C→CD, xmm5=D, xmm6=r²/scratch, xmm7=r⁴→r⁸.
+                 * Delegates to the generic Estrin evaluator.  Critical
+                 * path 4 dependent FMAs ≈ 16c (was Horner 9×4c = 36c).
                  */
+                {
+                    static const uint64_t exp_P_coeffs[9] = {
+                        0x3FF0000000000000ULL,  /* C0 = 1       → 1/1! */
+                        0x3FE0000000000000ULL,  /* C1 = 1/2     → 1/2! */
+                        0x3FC5555555555555ULL,  /* C2 = 1/6     → 1/3! */
+                        0x3FA5555555555555ULL,  /* C3 = 1/24    → 1/4! */
+                        0x3F81111111111111ULL,  /* C4 = 1/120   → 1/5! */
+                        0x3F56C16C16C16C17ULL,  /* C5 = 1/720   → 1/6! */
+                        0x3F2A01A01A01A01AULL,  /* C6 = 1/5040  → 1/7! */
+                        0x3EFA01A01A01A01AULL,  /* C7 = 1/40320 → 1/8! */
+                        0x3EC71DE3A556C734ULL,  /* C8 = 1/362880→ 1/9! */
+                    };
+                    emit_estrin_poly(cg, exp_P_coeffs, 9, /*y_reg=*/0);
+                }
 
-                /* ── Level 1: four parallel pairs + r² ──────────────── */
-                emit_load_f64   (cg, 2, 0x3FE0000000000000ULL);  /* C1 = 1/2 */
-                emit_load_f64   (cg, 6, 0x3FF0000000000000ULL);  /* C0 = 1   */
-                emit_fma213_reg (cg, 2, 0, 6);                   /* A = C1·r + C0 */
-
-                emit_load_f64   (cg, 3, 0x3FA5555555555555ULL);  /* C3 = 1/24  */
-                emit_load_f64   (cg, 6, 0x3FC5555555555555ULL);  /* C2 = 1/6   */
-                emit_fma213_reg (cg, 3, 0, 6);                   /* B = C3·r + C2 */
-
-                emit_load_f64   (cg, 4, 0x3F56C16C16C16C17ULL);  /* C5 = 1/720 */
-                emit_load_f64   (cg, 6, 0x3F81111111111111ULL);  /* C4 = 1/120 */
-                emit_fma213_reg (cg, 4, 0, 6);                   /* C = C5·r + C4 */
-
-                emit_load_f64   (cg, 5, 0x3EFA01A01A01A01AULL);  /* C7 = 1/40320 */
-                emit_load_f64   (cg, 6, 0x3F2A01A01A01A01AULL);  /* C6 = 1/5040  */
-                emit_fma213_reg (cg, 5, 0, 6);                   /* D = C7·r + C6 */
-
-                emit_mov_xmm (cg, 6, 0);
-                cg_mulsd     (cg, 6, 0);                         /* xmm6 = r² */
-
-                /* ── Level 2: AB, CD, r⁴ ────────────────────────────── */
-                emit_fma_add (cg, 2, 6, 3);                      /* xmm2 = A + r²·B */
-                emit_fma_add (cg, 4, 6, 5);                      /* xmm4 = C + r²·D */
-                emit_mov_xmm (cg, 7, 6);
-                cg_mulsd     (cg, 7, 6);                         /* xmm7 = r⁴ */
-
-                /* ── Level 3: ABCD, r⁸ ──────────────────────────────── */
-                emit_fma_add (cg, 2, 7, 4);                      /* xmm2 = AB + r⁴·CD */
-                cg_mulsd     (cg, 7, 7);                         /* xmm7 = r⁸ */
-
-                /* ── Level 4: P = ABCD + r⁸·C8 ──────────────────────── */
-                emit_load_f64 (cg, 6, 0x3EC71DE3A556C734ULL);    /* C8 = 1/362880 */
-                emit_fma_add  (cg, 2, 7, 6);                     /* xmm2 = P(r) */
-
-                /* Final: exp(r) = 1 + r·P.  Seed xmm3 = 1.0, fma r·xmm2. */
+                /* exp(r) = 1 + r · P(r).  Seed xmm3 = 1.0, fma r·xmm2. */
                 emit_load_f64 (cg, 3, 0x3FF0000000000000ULL);
                 emit_fma_add  (cg, 3, 0, 2);                     /* xmm3 = 1 + r·P */
                 emit_mov_xmm  (cg, 2, 3);                        /* xmm2 = exp(r) */
@@ -2095,43 +2134,27 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
                  * = 2*s*(1 + s^2*(1/3 + s^2*(1/5 + s^2*(1/7 + s^2*(1/9 + s^2*(1/11 + s^2/13))))))
                  * z = s^2 */
 
-                /* xmm4 = s^2 */
-                /* movapd xmm4, xmm0 */
-                b = BUF(cg); b[0]=0x66; b[1]=0x0F; b[2]=0x28; b[3]=0xE0; EMIT(cg, 4);
-                /* mulsd xmm4, xmm4 */
-                b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x59; b[3]=0xE4; EMIT(cg, 4);
+                /* xmm1 = z = s².  The Estrin helper uses xmm2..xmm7
+                 * as temps, so we keep the input outside that range. */
+                emit_mov_xmm (cg, 1, 0);
+                cg_mulsd     (cg, 1, 0);
 
-                /* Estrin for P(z) = 1 + z/3 + z²/5 + z³/7 + z⁴/9 + z⁵/11 + z⁶/13
-                 * where z = s².  7 terms, degree 6.  Factorize:
-                 *   A = C1·z + C0   (1/3·z + 1)
-                 *   B = C3·z + C2   (1/7·z + 1/5)
-                 *   C = C5·z + C4   (1/11·z + 1/9)
-                 *   D = C6 = 1/13
-                 *   P = (A + z²·B) + z⁴·(C + z²·D)
-                 * Critical path: 3 dependent FMAs ≈ 12c (was 7×4c = 28c).
-                 * Registers: xmm4=z, xmm2=A→AB→P, xmm3=B, xmm5=C→CD, xmm6=D/const, xmm7=z²→z⁴. */
-
-                emit_load_f64   (cg, 2, 0x3FD5555555555555ULL);  /* C1 = 1/3 */
-                emit_load_f64   (cg, 6, 0x3FF0000000000000ULL);  /* C0 = 1   */
-                emit_fma213_reg (cg, 2, 4, 6);                   /* A = C1·z + C0 */
-
-                emit_load_f64   (cg, 3, 0x3FC2492492492492ULL);  /* C3 = 1/7 */
-                emit_load_f64   (cg, 6, 0x3FC999999999999AULL);  /* C2 = 1/5 */
-                emit_fma213_reg (cg, 3, 4, 6);                   /* B = C3·z + C2 */
-
-                emit_load_f64   (cg, 5, 0x3FB745D1745D1746ULL);  /* C5 = 1/11 */
-                emit_load_f64   (cg, 6, 0x3FBC71C71C71C71CULL);  /* C4 = 1/9  */
-                emit_fma213_reg (cg, 5, 4, 6);                   /* C = C5·z + C4 */
-
-                emit_load_f64 (cg, 6, 0x3FB3B13B13B13B14ULL);    /* D = C6 = 1/13 */
-                emit_mov_xmm  (cg, 7, 4);
-                cg_mulsd      (cg, 7, 4);                        /* xmm7 = z² */
-
-                emit_fma_add  (cg, 2, 7, 3);                     /* xmm2 = A + z²·B */
-                emit_fma_add  (cg, 5, 7, 6);                     /* xmm5 = C + z²·D */
-                cg_mulsd      (cg, 7, 7);                        /* xmm7 = z⁴ */
-
-                emit_fma_add  (cg, 2, 7, 5);                     /* xmm2 = AB + z⁴·CD = P(z) */
+                /* Estrin for P(z) = 1 + z/3 + z²/5 + ... + z⁶/13
+                 * (7 terms, atanh series rescaled for log(1+f) via s).
+                 * Critical path 3 FMAs ≈ 12c (was 7×4c = 28c). */
+                {
+                    static const uint64_t log_P_coeffs[7] = {
+                        0x3FF0000000000000ULL,  /* C0 = 1     */
+                        0x3FD5555555555555ULL,  /* C1 = 1/3   */
+                        0x3FC999999999999AULL,  /* C2 = 1/5   */
+                        0x3FC2492492492492ULL,  /* C3 = 1/7   */
+                        0x3FBC71C71C71C71CULL,  /* C4 = 1/9   */
+                        0x3FB745D1745D1746ULL,  /* C5 = 1/11  */
+                        0x3FB3B13B13B13B14ULL,  /* C6 = 1/13  */
+                    };
+                    emit_estrin_poly(cg, log_P_coeffs, 7, /*y_reg=*/1);
+                }
+                /* xmm2 = P(z) */
 
                 /* xmm0 = 2*s * xmm2 = log(1+f) */
                 /* mulsd xmm2, xmm0 — xmm2 *= s */

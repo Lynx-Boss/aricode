@@ -4,7 +4,7 @@ Honest, number-backed picture of what the compiler can do, what's
 fast, what's slow, and what's still on the backlog.  Updated after
 each performance or feature push.
 
-Last updated: 2026-04-19 (AVX2 `arr_f64_adam_apply` shipped)
+Last updated: 2026-04-19 (AVX2 `arr_f64_log` / `log1p` / `adam_apply` shipped)
 
 ---
 
@@ -83,14 +83,15 @@ Compiler-side AVX2 tensor builtins (`arr_f64_*`):
 
 | Shipped        | Not shipped yet |
 |----------------|------------------|
-| `arr_f64_new`, `get`, `set`          | `arr_f64_log`        |
-| `arr_f64_matvec`, `matvec_T`         | `arr_f64_log1p`      |
-| `arr_f64_outer_accum`                | `arr_f64_conv2d`     |
-| `arr_f64_add_scaled`, `scale`        | `arr_f64_max_pool`   |
+| `arr_f64_new`, `get`, `set`          | `arr_f64_conv2d`     |
+| `arr_f64_matvec`, `matvec_T`         | `arr_f64_max_pool`   |
+| `arr_f64_outer_accum`                |                      |
+| `arr_f64_add_scaled`, `scale`        |                      |
 | `arr_f64_mul`, `sub`                 |                      |
 | `arr_f64_dot`, `sum`, `sum_kahan`    |                      |
 | `arr_f64_relu`, `sigmoid`, `tanh`    |                      |
 | `arr_f64_exp`, `arr_f64_expm1`       |                      |
+| `arr_f64_log`, `arr_f64_log1p`       |                      |
 | `arr_f64_softmax`                    |                      |
 | `arr_f64_adam_apply`                 |                      |
 

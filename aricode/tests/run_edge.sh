@@ -187,6 +187,90 @@ fn main() -> i32 {
 EOF
 run_test "vec_expm1_moderate" /tmp/edge_vec_expm1.ari "1.7182"
 
+# #7a  arr_f64_log — packed ln(x) spot-check across exponent ranges.
+# Covers k=-1 (x=0.5), k=0 (x=e), k=3 (x=10) branches of the magic-based
+# k extraction.
+cat > /tmp/edge_vec_log.ari << 'EOF'
+fn main() -> i32 {
+    let a: i32 = arr_f64_new(4);
+    arr_f64_set(a, 0, 1.0);
+    arr_f64_set(a, 1, 2.718281828459045);
+    arr_f64_set(a, 2, 10.0);
+    arr_f64_set(a, 3, 0.5);
+    arr_f64_log(a);
+    print_f64(arr_f64_get(a, 0), 6);    // 0
+    print_f64(arr_f64_get(a, 1), 4);    // ~1
+    print_f64(arr_f64_get(a, 2), 4);    // 2.3026
+    print_f64(arr_f64_get(a, 3), 4);    // -0.6931
+    return 0;
+}
+EOF
+run_test "vec_log_spot_check" /tmp/edge_vec_log.ari "0.000000
+0.9999
+2.3025
+-0.6931" "covers k=-1, k=0, k=3 exponent paths"
+
+# #7b  arr_f64_log bit-exact vs runtime scalar math_log.  Both paths use
+# the same SSE2 7-term atanh series, so lane-0 must match bit-for-bit.
+# Call math_log via a variable (not literal) to defeat the compiler's
+# compile-time constant folding through glibc log().
+cat > /tmp/edge_vec_log_vs_scalar.ari << 'EOF'
+fn main() -> i32 {
+    let a: i32 = arr_f64_new(4);
+    arr_f64_set(a, 0, 1.5);
+    arr_f64_set(a, 1, 3.7);
+    arr_f64_set(a, 2, 0.42);
+    arr_f64_set(a, 3, 128.0);
+
+    // Scalar reference via runtime path (reads values from array so the
+    // optimizer can't fold math_log at compile time).
+    let v0: f64 = arr_f64_get(a, 0);
+    let v1: f64 = arr_f64_get(a, 1);
+    let v2: f64 = arr_f64_get(a, 2);
+    let v3: f64 = arr_f64_get(a, 3);
+    let s0: f64 = math_log(v0);
+    let s1: f64 = math_log(v1);
+    let s2: f64 = math_log(v2);
+    let s3: f64 = math_log(v3);
+
+    arr_f64_log(a);
+
+    let d0: f64 = arr_f64_get(a, 0) - s0;  if (d0 < 0.0) { d0 = 0.0 - d0; }
+    let d1: f64 = arr_f64_get(a, 1) - s1;  if (d1 < 0.0) { d1 = 0.0 - d1; }
+    let d2: f64 = arr_f64_get(a, 2) - s2;  if (d2 < 0.0) { d2 = 0.0 - d2; }
+    let d3: f64 = arr_f64_get(a, 3) - s3;  if (d3 < 0.0) { d3 = 0.0 - d3; }
+    let m: f64 = d0;
+    if (d1 > m) { m = d1; }
+    if (d2 > m) { m = d2; }
+    if (d3 > m) { m = d3; }
+    if (m == 0.0) { print_int(1); } else { print_int(0); }
+    return 0;
+}
+EOF
+run_test "vec_log_vs_scalar" /tmp/edge_vec_log_vs_scalar.ari "1" \
+  "vec log bit-exact with runtime scalar math_log (same 7-term atanh)"
+
+# #7c  arr_f64_log1p — log(1+x) for a few representative inputs.
+cat > /tmp/edge_vec_log1p.ari << 'EOF'
+fn main() -> i32 {
+    let a: i32 = arr_f64_new(4);
+    arr_f64_set(a, 0, 0.0);                      // log1p(0) = 0
+    arr_f64_set(a, 1, 1.0);                      // log1p(1) = ln(2) ≈ 0.6931
+    arr_f64_set(a, 2, 9.0);                      // log1p(9) = ln(10) ≈ 2.3026
+    arr_f64_set(a, 3, 1.718281828459045);        // log1p(e-1) = 1
+    arr_f64_log1p(a);
+    print_f64(arr_f64_get(a, 0), 6);
+    print_f64(arr_f64_get(a, 1), 4);
+    print_f64(arr_f64_get(a, 2), 4);
+    print_f64(arr_f64_get(a, 3), 4);
+    return 0;
+}
+EOF
+run_test "vec_log1p_moderate" /tmp/edge_vec_log1p.ari "0.000000
+0.6931
+2.3025
+0.9999"
+
 # #7b  arr_f64_adam_apply — bit-exact match with scalar reference across
 # the vec/tail boundary (n=5 takes one vec step + one scalar iter).
 # With w=1.0, m=0.5, v=0.25, lr=0.2, eps=0: step = 0.2 * 0.5 / 0.5 = 0.2

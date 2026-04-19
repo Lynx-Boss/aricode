@@ -920,6 +920,147 @@ static void emit_vec_exp_body_avx2(CodegenState *cg) {
     cg_vmulpd(cg, 0, 3, 4);
 }
 
+/*
+ * Reserve 48 bytes on the stack and spill the 6 log-polynomial
+ * coefficients (1/3, 1/5, 1/7, 1/9, 1/11, 1/13) for broadcast reads.
+ * 48 is 16-byte aligned so we keep stack alignment.
+ */
+static void emit_log_coeff_stack_setup(CodegenState *cg) {
+    uint8_t *b;
+    b = BUF(cg); b[0]=0x48; b[1]=0x83; b[2]=0xEC; b[3]=48; EMIT(cg, 4); /* sub rsp, 48 */
+    cg_store_imm64_rsp(cg, 0x3FD5555555555555ULL,  0);  /* 1/3  */
+    cg_store_imm64_rsp(cg, 0x3FC999999999999AULL,  8);  /* 1/5  */
+    cg_store_imm64_rsp(cg, 0x3FC2492492492492ULL, 16);  /* 1/7  */
+    cg_store_imm64_rsp(cg, 0x3FBC71C71C71C71CULL, 24);  /* 1/9  */
+    cg_store_imm64_rsp(cg, 0x3FB745D1745D1746ULL, 32);  /* 1/11 */
+    cg_store_imm64_rsp(cg, 0x3FB3B13B13B13B14ULL, 40);  /* 1/13 */
+}
+
+static void emit_log_coeff_stack_teardown(CodegenState *cg) {
+    uint8_t *b = BUF(cg); b[0]=0x48; b[1]=0x83; b[2]=0xC4; b[3]=48; EMIT(cg, 4); /* add rsp, 48 */
+}
+
+/* =====================================================================
+ *  Packed AVX2 log(x) — reusable body for arr_f64_log, arr_f64_log1p.
+ * =====================================================================
+ *
+ * Algorithm mirrors scalar math_log (atanh-based series, same coeffs):
+ *   1. Split x = 2^k · m with m ∈ [1, 2).
+ *        m   = bits & 0x000F...FFFF | 0x3FF0000000000000
+ *        k   = exponent_field(x) - 1023
+ *   2. f = m - 1,  s = f / (2 + f),  z = s²
+ *   3. P(z) = 1 + z/3 + z²/5 + z³/7 + z⁴/9 + z⁵/11 + z⁶/13    (7 terms)
+ *   4. log(1 + f) = 2·s·P(z)
+ *   5. log(x) = k·ln2 + log(1 + f)
+ *
+ * Integer-to-double for k uses the "magic constant" trick to avoid a
+ * packed int64→f64 conversion:
+ *     bits(k_f64) = (bits(x) >> 52) | 0x4330000000000000
+ *     k_f64       = bits_as_double(...) - (2^52 + 1023)
+ * That hands us k as a proper double in 3 packed ops.
+ *
+ * Input preconditions:
+ *   ymm0 = x (4 f64 lanes, all > 0 — no NaN/Inf/zero guard)
+ *   ymm8  = broadcast(ln2)
+ *   ymm9  = broadcast(mantissa mask 0x000F..FFFF)
+ *   ymm10 = broadcast(1.0 bits 0x3FF0000000000000)
+ *   ymm11 = broadcast(2^52 + 1023 = 0x43300000000003FF)
+ *   ymm12 = broadcast(2^52       = 0x4330000000000000)
+ *   [rsp + 0 .. +40] holds the 6 polynomial coefficients (see setup).
+ *
+ * Output: ymm0 = log(x).  Clobbers ymm1..ymm7.
+ */
+static void emit_vec_log_body_avx2(CodegenState *cg) {
+    uint8_t *b;
+
+    /* ── Mantissa: ymm2 = (bits(x) & mantissa_mask) | one_bits ── */
+    /* vpand ymm2, ymm0, ymm9  —  VEX.256.66.0F DB /r */
+    cg_vex3(cg, 2, 0, 9, 0, 1, 1, 1);
+    b = BUF(cg); b[0]=0xDB; b[1]=0xC0 | ((2&7)<<3) | (9&7); EMIT(cg, 2);
+    /* vpor  ymm2, ymm2, ymm10 —  VEX.256.66.0F EB /r */
+    cg_vex3(cg, 2, 2, 10, 0, 1, 1, 1);
+    b = BUF(cg); b[0]=0xEB; b[1]=0xC0 | ((2&7)<<3) | (10&7); EMIT(cg, 2);
+
+    /* ── k as f64: ymm1 = (bits(x) >> 52 | magic_bits) - (magic+1023) ── */
+    /* vpsrlq ymm1, ymm0, 52  —  VEX.256.66.0F 73 /2 ib.  Here dst=2 (the
+     * /2 opcode extension), a=1 (VEX.vvvv encodes the shift destination),
+     * b_reg=0 (modrm.r/m = shift source). */
+    cg_vex3(cg, /*dst=*/2, /*a=*/1, /*b_reg=*/0, 0, 1, 1, 1);
+    b = BUF(cg); b[0]=0x73; b[1]=0xC0 | (2<<3) | (0&7); b[2]=52; EMIT(cg, 3);
+    /* vpor ymm1, ymm1, ymm12  — OR in 2^52 bits */
+    cg_vex3(cg, 1, 1, 12, 0, 1, 1, 1);
+    b = BUF(cg); b[0]=0xEB; b[1]=0xC0 | ((1&7)<<3) | (12&7); EMIT(cg, 2);
+    /* vsubpd ymm1, ymm1, ymm11  — subtract 2^52 + 1023 → k as f64 */
+    cg_vex3(cg, 1, 1, 11, 0, 1, 1, 1);
+    b = BUF(cg); b[0]=0x5C; b[1]=0xC0 | ((1&7)<<3) | (11&7); EMIT(cg, 2);
+
+    /* ── f = m - 1, 2+f = m + 1, s = f/(2+f) ── */
+    /* vsubpd ymm0, ymm2, ymm10  — ymm0 = f */
+    cg_vex3(cg, 0, 2, 10, 0, 1, 1, 1);
+    b = BUF(cg); b[0]=0x5C; b[1]=0xC0 | ((0&7)<<3) | (10&7); EMIT(cg, 2);
+    /* vaddpd ymm3, ymm2, ymm10  — ymm3 = 2 + f (= m + 1) */
+    cg_vex3(cg, 3, 2, 10, 0, 1, 1, 1);
+    b = BUF(cg); b[0]=0x58; b[1]=0xC0 | ((3&7)<<3) | (10&7); EMIT(cg, 2);
+    /* vdivpd ymm0, ymm0, ymm3  — ymm0 = s */
+    cg_vex3(cg, 0, 0, 3, 0, 1, 1, 1);
+    b = BUF(cg); b[0]=0x5E; b[1]=0xC0 | ((0&7)<<3) | (3&7); EMIT(cg, 2);
+
+    /* ── z = s² in ymm6 ── */
+    cg_vmulpd(cg, 6, 0, 0);
+
+    /* ── Estrin P(z), 7 terms (matches emit_estrin_poly n==7 shape) ──
+     *   A = C1·z + C0   → ymm2      (C0 = 1.0 from ymm10)
+     *   B = C3·z + C2   → ymm3
+     *   C = C5·z + C4   → ymm4
+     *   Lower = A + z²·B        (z² kept in ymm7)
+     *   C    += z²·C6            (fold last coefficient into C)
+     *   z⁴ in ymm5
+     *   P    = Lower + z⁴·C      → ymm2
+     */
+    cg_vbroadcastsd_rsp(cg, 2,  0);            /* ymm2 = 1/3  = C1 */
+    cg_vmovapd         (cg, 7, 10);            /* ymm7 = 1.0 = C0 */
+    cg_vfmadd213pd     (cg, 2,  6, 7);         /* A = C1·z + C0 */
+
+    cg_vbroadcastsd_rsp(cg, 3, 16);            /* ymm3 = 1/7  = C3 */
+    cg_vbroadcastsd_rsp(cg, 7,  8);            /* ymm7 = 1/5  = C2 */
+    cg_vfmadd213pd     (cg, 3,  6, 7);         /* B = C3·z + C2 */
+
+    cg_vbroadcastsd_rsp(cg, 4, 32);            /* ymm4 = 1/11 = C5 */
+    cg_vbroadcastsd_rsp(cg, 7, 24);            /* ymm7 = 1/9  = C4 */
+    cg_vfmadd213pd     (cg, 4,  6, 7);         /* C = C5·z + C4 */
+
+    /* ymm7 = z² */
+    cg_vmovapd(cg, 7, 6);
+    cg_vmulpd (cg, 7, 6, 6);
+
+    /* Lower = A + z²·B  →  ymm2 */
+    cg_vfmadd231pd(cg, 2, 7, 3);
+
+    /* Fold c6 into C: C += z²·C6 */
+    cg_vbroadcastsd_rsp(cg, 5, 40);            /* ymm5 = 1/13 = C6 */
+    cg_vfmadd231pd     (cg, 4, 7, 5);
+
+    /* ymm5 = z⁴ */
+    cg_vmovapd(cg, 5, 7);
+    cg_vmulpd (cg, 5, 7, 7);
+
+    /* P = Lower + z⁴·C  → ymm2 */
+    cg_vfmadd231pd(cg, 2, 5, 4);
+
+    /* ── log(1 + f) = 2·s·P(z) ── */
+    /* vmulpd ymm2, ymm2, ymm0 — ymm2 = s·P */
+    cg_vmulpd(cg, 2, 2, 0);
+    /* vaddpd ymm2, ymm2, ymm2 — ymm2 *= 2  (2·s·P = log(1+f)) */
+    cg_vex3(cg, 2, 2, 2, 0, 1, 1, 1);
+    b = BUF(cg); b[0]=0x58; b[1]=0xC0 | ((2&7)<<3) | (2&7); EMIT(cg, 2);
+
+    /* ── result = k·ln2 + log(1+f)  →  ymm0 ── */
+    /* vfmadd231pd ymm2, ymm1, ymm8  — ymm2 += k · ln2 */
+    cg_vfmadd231pd(cg, 2, 1, 8);
+    /* vmovapd ymm0, ymm2 */
+    cg_vmovapd(cg, 0, 2);
+}
+
 int emit_builtin(CodegenState *cg, const ASTNode *node,
                  const char *name, size_t argc) {
         if (strcmp(name, "print_int") == 0 && argc == 1) {
@@ -3651,6 +3792,90 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             b = BUF(cg); b[0]=0xC5; b[1]=0xF8; b[2]=0x77; EMIT(cg, 3);
             pn = emit_pop(BUF(cg), REG_RBX); EMIT(cg, pn);
             b = BUF(cg); b[0]=0x48; b[1]=0x83; b[2]=0xC4; b[3]=32; EMIT(cg, 4);
+            pn = emit_xor_reg_reg(BUF(cg), REG_RAX, REG_RAX); EMIT(cg, pn);
+            return 1;
+        }
+        if (strcmp(name, "arr_f64_log") == 0 && argc == 1) {
+            /* In-place log(buf): AVX2-packed natural log.  Algorithm
+             * matches scalar math_log (atanh series).  Assumes all
+             * elements > 0 — no NaN / Inf / zero / negative guard.
+             * Callers pad n to multiples of 4 (same contract as exp). */
+            emit_expression(cg, node->children[1]); /* buf */
+            int pn; uint8_t *b;
+            pn = emit_mov_reg_reg(BUF(cg), REG_RDI, REG_RAX); EMIT(cg, pn);
+            pn = emit_mov_reg_mem(BUF(cg), REG_RCX, REG_RAX, -8); EMIT(cg, pn);
+
+            /* RDX = n & ~3 */
+            pn = emit_mov_reg_reg(BUF(cg), REG_RDX, REG_RCX); EMIT(cg, pn);
+            b = BUF(cg); b[0]=0x48; b[1]=0x83; b[2]=0xE2; b[3]=0xFC; EMIT(cg, 4);
+
+            /* Loop-invariant broadcasts. */
+            cg_broadcast_f64(cg, 8,  0x3FE62E42FEFA39EFULL, /*scratch=*/0); /* ln2 */
+            cg_broadcast_f64(cg, 9,  0x000FFFFFFFFFFFFFULL, 0);             /* mantissa mask */
+            cg_broadcast_f64(cg, 10, 0x3FF0000000000000ULL, 0);             /* 1.0 bits */
+            cg_broadcast_f64(cg, 11, 0x43300000000003FFULL, 0);             /* 2^52 + 1023 */
+            cg_broadcast_f64(cg, 12, 0x4330000000000000ULL, 0);             /* 2^52 */
+
+            emit_log_coeff_stack_setup(cg);
+
+            pn = emit_xor_reg_reg(BUF(cg), REG_RSI, REG_RSI); EMIT(cg, pn);
+
+            CgCountedLoop vec = cg_loop_begin(cg, REG_RSI, REG_RDX);
+
+            /* ymm0 = load */
+            cg_vmovupd_ymm_base_idx(cg, 0, REG_RDI, REG_RSI, 0x10);
+            emit_vec_log_body_avx2(cg);
+            /* store */
+            cg_vmovupd_ymm_base_idx(cg, 0, REG_RDI, REG_RSI, 0x11);
+
+            cg_loop_end(cg, vec, 4);
+
+            emit_log_coeff_stack_teardown(cg);
+
+            b = BUF(cg); b[0]=0xC5; b[1]=0xF8; b[2]=0x77; EMIT(cg, 3);  /* vzeroupper */
+            pn = emit_xor_reg_reg(BUF(cg), REG_RAX, REG_RAX); EMIT(cg, pn);
+            return 1;
+        }
+        if (strcmp(name, "arr_f64_log1p") == 0 && argc == 1) {
+            /* In-place log1p(buf) = log(1 + buf[i]).  Computes u = 1 + x
+             * and feeds it through the same vec-log body.  Precision
+             * caveat: for |x| < ~2^-53, 1 + x rounds to 1.0 and the
+             * result collapses to 0.  Callers needing full precision
+             * near zero should use scalar math_log1p. */
+            emit_expression(cg, node->children[1]); /* buf */
+            int pn; uint8_t *b;
+            pn = emit_mov_reg_reg(BUF(cg), REG_RDI, REG_RAX); EMIT(cg, pn);
+            pn = emit_mov_reg_mem(BUF(cg), REG_RCX, REG_RAX, -8); EMIT(cg, pn);
+
+            pn = emit_mov_reg_reg(BUF(cg), REG_RDX, REG_RCX); EMIT(cg, pn);
+            b = BUF(cg); b[0]=0x48; b[1]=0x83; b[2]=0xE2; b[3]=0xFC; EMIT(cg, 4);
+
+            cg_broadcast_f64(cg, 8,  0x3FE62E42FEFA39EFULL, /*scratch=*/0);
+            cg_broadcast_f64(cg, 9,  0x000FFFFFFFFFFFFFULL, 0);
+            cg_broadcast_f64(cg, 10, 0x3FF0000000000000ULL, 0);
+            cg_broadcast_f64(cg, 11, 0x43300000000003FFULL, 0);
+            cg_broadcast_f64(cg, 12, 0x4330000000000000ULL, 0);
+
+            emit_log_coeff_stack_setup(cg);
+
+            pn = emit_xor_reg_reg(BUF(cg), REG_RSI, REG_RSI); EMIT(cg, pn);
+
+            CgCountedLoop vec = cg_loop_begin(cg, REG_RSI, REG_RDX);
+
+            /* ymm0 = load; ymm0 += 1.0 (vaddpd with ymm10). */
+            cg_vmovupd_ymm_base_idx(cg, 0, REG_RDI, REG_RSI, 0x10);
+            cg_vex3(cg, 0, 0, 10, 0, 1, 1, 1);
+            b = BUF(cg); b[0]=0x58; b[1]=0xC0 | ((0&7)<<3) | (10&7); EMIT(cg, 2);
+
+            emit_vec_log_body_avx2(cg);
+
+            cg_vmovupd_ymm_base_idx(cg, 0, REG_RDI, REG_RSI, 0x11);
+
+            cg_loop_end(cg, vec, 4);
+
+            emit_log_coeff_stack_teardown(cg);
+
+            b = BUF(cg); b[0]=0xC5; b[1]=0xF8; b[2]=0x77; EMIT(cg, 3);
             pn = emit_xor_reg_reg(BUF(cg), REG_RAX, REG_RAX); EMIT(cg, pn);
             return 1;
         }

@@ -4,7 +4,7 @@ Honest, number-backed picture of what the compiler can do, what's
 fast, what's slow, and what's still on the backlog.  Updated after
 each performance or feature push.
 
-Last updated: 2026-04-19
+Last updated: 2026-04-19 (AVX2 `arr_f64_adam_apply` shipped)
 
 ---
 
@@ -87,11 +87,12 @@ Compiler-side AVX2 tensor builtins (`arr_f64_*`):
 | `arr_f64_matvec`, `matvec_T`         | `arr_f64_log1p`      |
 | `arr_f64_outer_accum`                | `arr_f64_conv2d`     |
 | `arr_f64_add_scaled`, `scale`        | `arr_f64_max_pool`   |
-| `arr_f64_mul`, `sub`                 | `arr_f64_adam_apply` |
+| `arr_f64_mul`, `sub`                 |                      |
 | `arr_f64_dot`, `sum`, `sum_kahan`    |                      |
 | `arr_f64_relu`, `sigmoid`, `tanh`    |                      |
 | `arr_f64_exp`, `arr_f64_expm1`       |                      |
 | `arr_f64_softmax`                    |                      |
+| `arr_f64_adam_apply`                 |                      |
 
 ### MNIST demo — 97.15 % test accuracy
 
@@ -168,10 +169,14 @@ caught in under 100 ms.
   practical purposes.  Values below `−700` lose the small-scale
   distinction between them — acceptable for softmax, but if you need
   honest `exp(−2000)` use scalar `math_exp`.
-- **Adam optimizer** ships but is not yet the default in MNIST;
-  mini-batch SGD with lr decay is beating a vanilla Adam setup in
-  wall-clock to a given accuracy, and Adam with warmup + schedule
-  hasn't been tuned yet.
+- **Adam optimizer** ships (including the AVX2 `arr_f64_adam_apply`
+  fused kernel and `adam_apply_fast` wrapper) but is not yet the
+  default in MNIST.  A vanilla Adam drop-in (just swap the update
+  rule) lands around 84–87 % where tuned SGD+decay hits 97.15 %.
+  Closing that gap needs the full recipe — input standardization
+  (mean 0.1307 / std 0.3081), label smoothing (~0.05), and AdamW-style
+  decoupled weight decay (1e-4, weights only) — layered together.
+  Builtin is ready; tuning is the pending piece.
 - **No CNN builtins** — MNIST runs as an MLP.  Conv2d and max-pool
   are the next big additions when someone needs ~99 %.
 

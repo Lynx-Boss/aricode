@@ -742,6 +742,75 @@ static void emit_binary_op(CodegenState *cg, const ASTNode *node) {
     int n;
 
     /*
+     * Short-circuit logical AND / OR.
+     *   a && b  →  if a is false, result = 0, skip b
+     *   a || b  →  if a is true,  result = 1, skip b
+     *
+     * Side effects in the right operand are NOT evaluated when the
+     * left operand already determines the result, matching C / Rust /
+     * most languages with short-circuit semantics.
+     *
+     * Handled before the float and integer paths because the control
+     * flow is the same regardless of operand types — the comparisons
+     * are against 0 (truthy) and the result is always a 0/1 integer.
+     */
+    if (strcmp(op, "&&") == 0 || strcmp(op, "||") == 0) {
+        int is_and = (strcmp(op, "&&") == 0);
+
+        /* Evaluate left → rax. */
+        emit_expression(cg, left);
+        n = emit_cmp_reg_imm(BUF(cg), REG_RAX, 0); EMIT(cg, n);
+
+        /* &&: jump-on-zero short-circuit; ||: jump-on-nonzero.          */
+        size_t jcc1 = cg->code_size;
+        {
+            uint8_t *b = BUF(cg);
+            b[0] = 0x0F;
+            b[1] = (uint8_t)(is_and ? 0x84 : 0x85);
+            memset(b + 2, 0, 4);
+            EMIT(cg, 6);
+        }
+
+        /* Evaluate right → rax; same short-circuit check. */
+        emit_expression(cg, right);
+        n = emit_cmp_reg_imm(BUF(cg), REG_RAX, 0); EMIT(cg, n);
+        size_t jcc2 = cg->code_size;
+        {
+            uint8_t *b = BUF(cg);
+            b[0] = 0x0F;
+            b[1] = (uint8_t)(is_and ? 0x84 : 0x85);
+            memset(b + 2, 0, 4);
+            EMIT(cg, 6);
+        }
+
+        /* Fall-through — for &&: both non-zero → result 1.
+         *                for ||: both zero    → result 0. */
+        if (is_and) {
+            n = emit_mov_reg_imm32(BUF(cg), REG_RAX, 1); EMIT(cg, n);
+        } else {
+            n = emit_xor_reg_reg(BUF(cg), REG_RAX, REG_RAX); EMIT(cg, n);
+        }
+
+        /* Jump over the sink. */
+        size_t jmp_end = cg->code_size;
+        n = emit_jmp(BUF(cg), 0); EMIT(cg, n);
+
+        /* Sink: both short-circuit jumps land here.
+         *   && sink: result 0
+         *   || sink: result 1 */
+        cg_patch_jcc_near(cg, jcc1);
+        cg_patch_jcc_near(cg, jcc2);
+        if (is_and) {
+            n = emit_xor_reg_reg(BUF(cg), REG_RAX, REG_RAX); EMIT(cg, n);
+        } else {
+            n = emit_mov_reg_imm32(BUF(cg), REG_RAX, 1); EMIT(cg, n);
+        }
+
+        cg_patch_jmp_rel32(cg, jmp_end);
+        return;
+    }
+
+    /*
      * FLOAT PATH: If either operand is float, use SSE instructions.
      * Recursively check the entire expression tree for float types.
      */

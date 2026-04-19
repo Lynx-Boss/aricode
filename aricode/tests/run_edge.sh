@@ -379,6 +379,59 @@ run_test "softmax_repeated" /tmp/edge_repeated_softmax.ari "1" \
   "no state bleed across 100 calls"
 
 # ────────────────────────────────────────────────────────────────────
+echo -e "\n${BOLD}--- Short-circuit && and || ---${RESET}"
+
+# #19  && short-circuits when left is false: right must not evaluate
+# its side effects.
+cat > /tmp/edge_and_sc.ari << 'EOF'
+fn sideffect(counter: i32) -> i32 {
+    arr_set(counter, 0, arr_get(counter, 0) + 1);
+    return 1;
+}
+fn main() -> i32 {
+    let c: i32 = arr_new(1);
+    arr_set(c, 0, 0);
+    if (0 == 1 && sideffect(c) > 0) { print_int(99); }
+    print_int(arr_get(c, 0));    // expect 0 — right never ran
+    return 0;
+}
+EOF
+run_test "and_short_circuit" /tmp/edge_and_sc.ari "0" \
+  "right not evaluated when left is false"
+
+# #20  || short-circuits when left is true.
+cat > /tmp/edge_or_sc.ari << 'EOF'
+fn sideffect(counter: i32) -> i32 {
+    arr_set(counter, 0, arr_get(counter, 0) + 1);
+    return 1;
+}
+fn main() -> i32 {
+    let c: i32 = arr_new(1);
+    arr_set(c, 0, 0);
+    if (1 == 1 || sideffect(c) > 0) { print_int(1); }
+    print_int(arr_get(c, 0));    // expect 0 — right never ran
+    return 0;
+}
+EOF
+run_test "or_short_circuit" /tmp/edge_or_sc.ari "0" \
+  "right not evaluated when left is true"
+
+# #21  Chained && and ||.
+cat > /tmp/edge_chain_and_or.ari << 'EOF'
+fn main() -> i32 {
+    if (1 == 1 && 2 == 2 && 3 == 3) { print_int(11); }
+    if (0 == 1 || 0 == 1 || 1 == 1) { print_int(22); }
+    if (1 == 1 && 2 == 2 && 0 == 1) { print_int(33); }  // should NOT print
+    if (0 == 1 || 0 == 1 || 0 == 1) { print_int(44); }  // should NOT print
+    print_int(99);
+    return 0;
+}
+EOF
+run_test "and_or_chains" /tmp/edge_chain_and_or.ari "11
+22
+99" "three-way chains, no false positives"
+
+# ────────────────────────────────────────────────────────────────────
 
 echo ""
 echo -e "${BOLD}${CYAN}============================================================${RESET}"

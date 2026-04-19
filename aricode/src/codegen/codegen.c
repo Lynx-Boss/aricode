@@ -1599,6 +1599,19 @@ static void emit_tail_call(CodegenState *cg, const ASTNode *call_node) {
     n = emit_pop(BUF(cg), REG_RBP);
     EMIT(cg, n);
 
+    /* If we pushed r12..r15 in the prologue, pop them before jumping.
+     * Currently unreachable — a tail-call requires self-recursion,
+     * which is itself a NODE_CALL that forces the cold path — but keep
+     * this symmetric with emit_return so broadening the xmm-safe
+     * whitelist doesn't silently grow the stack by one quartet per
+     * self-recursion. */
+    if (cg->in_xmm_safe_fn) {
+        n = emit_pop(BUF(cg), REG_R15); EMIT(cg, n);
+        n = emit_pop(BUF(cg), REG_R14); EMIT(cg, n);
+        n = emit_pop(BUF(cg), REG_R13); EMIT(cg, n);
+        n = emit_pop(BUF(cg), REG_R12); EMIT(cg, n);
+    }
+
     /* JMP to function entry (instead of CALL + RET) */
     int32_t rel = (int32_t)((int64_t)cg->current_fn_entry -
                             (int64_t)(cg->code_size + 5));

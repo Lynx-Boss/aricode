@@ -4,7 +4,7 @@ Honest, number-backed picture of what the compiler can do, what's
 fast, what's slow, and what's still on the backlog.  Updated after
 each performance or feature push.
 
-Last updated: 2026-04-19 (MNIST AdamW variant at 98.14 %)
+Last updated: 2026-04-19 (MNIST AdamW variant at 98.61 %)
 
 ---
 
@@ -95,7 +95,7 @@ Compiler-side AVX2 tensor builtins (`arr_f64_*`):
 | `arr_f64_softmax`                    |                      |
 | `arr_f64_adam_apply`                 |                      |
 
-### MNIST demo — up to 98.14 % test accuracy
+### MNIST demo — up to 98.61 % test accuracy
 
 End-to-end digit classifier in `aricode-ml/examples/mnist/`,
 784 → 128 → 10 MLP, He init, full 60 K / 10 K MNIST.  Two variants:
@@ -111,18 +111,21 @@ mini-batch SGD (batch 64, lr 0.1, exponential 0.85 decay), 10 epochs.
 
 33 s wall-clock, 21 KB binary.
 
-**`mnist_adam.ari`** — AdamW + full recipe.  Input standardization
-(mean 0.1307 / std 0.3081), label smoothing α = 0.05, AdamW
-(lr 1e-3, β₁ 0.9, β₂ 0.999, ε 1e-8, wd 1e-3 on weights only),
-10 epochs.  Uses the fused AVX2 `arr_f64_adam_apply` kernel.
+**`mnist_adam.ari`** — AdamW + full recipe.  Hidden 256, input
+standardization (mean 0.1307 / std 0.3081), label smoothing α = 0.05,
+AdamW (β₁ 0.9, β₂ 0.999, ε 1e-8, wd 1e-3 on weights only), cosine lr
+from 1e-3 down to 1e-5 over 20 epochs.  Uses the fused AVX2
+`arr_f64_adam_apply` kernel.
 
 | Epoch | train NLL | test acc |
 |-------|-----------|----------|
-|   1   | 0.2926    | 95.98 %  |
-|   5   | 0.1070    | 97.99 %  |
-|  10   | 0.0846    | **98.14 %** |
+|   1   | 0.2658    | 96.75 %  |
+|   5   | 0.0910    | 98.32 %  |
+|  10   | 0.0697    | 98.41 %  |
+|  15   | 0.0637    | 98.53 %  |
+|  20   | 0.0619    | **98.61 %** |
 
-36 s wall-clock, ~47 KB binary.  Accuracy still climbing at epoch 10.
+137 s wall-clock, ~50 KB binary.
 
 ---
 
@@ -211,7 +214,7 @@ cd aricode-stdlib/aricode-ml/examples/mnist
 aric mnist.ari -o mnist
 ./mnist                                 # 33 s, 97.15 % accuracy
 
-# Or AdamW variant (98.14 %)
+# Or AdamW variant (98.61 %)
 aric mnist_adam.ari -o mnist_adam
-./mnist_adam                            # 36 s, 98.14 % accuracy
+./mnist_adam                            # 137 s, 98.61 % accuracy
 ```

@@ -187,6 +187,33 @@ fn main() -> i32 {
 EOF
 run_test "vec_expm1_moderate" /tmp/edge_vec_expm1.ari "1.7182"
 
+# #7b  arr_f64_adam_apply — bit-exact match with scalar reference across
+# the vec/tail boundary (n=5 takes one vec step + one scalar iter).
+# With w=1.0, m=0.5, v=0.25, lr=0.2, eps=0: step = 0.2 * 0.5 / 0.5 = 0.2
+# so every w becomes 0.8.
+cat > /tmp/edge_adam_apply.ari << 'EOF'
+fn main() -> i32 {
+    let n: i32 = 5;
+    let w: i32 = arr_f64_new(n);
+    let m: i32 = arr_f64_new(n);
+    let v: i32 = arr_f64_new(n);
+    let i: i32 = 0;
+    while (i < n) {
+        arr_f64_set(w, i, 1.0);
+        arr_f64_set(m, i, 0.5);
+        arr_f64_set(v, i, 0.25);
+        i += 1;
+    }
+    arr_f64_adam_apply(w, m, v, 0.2, 0.0);
+    // Print both a vec-lane element (idx 0) and the scalar-tail element (idx 4).
+    print_f64(arr_f64_get(w, 0), 4);
+    print_f64(arr_f64_get(w, 4), 4);
+    return 0;
+}
+EOF
+run_test "adam_apply_bit_exact" /tmp/edge_adam_apply.ari "0.8000
+0.8000" "vec lane and scalar tail agree on w - lr*m/(sqrt(v)+eps)"
+
 # ────────────────────────────────────────────────────────────────────
 echo -e "\n${BOLD}--- f64 return contract (xmm0 AND rax) ---${RESET}"
 # Every builtin that returns f64 MUST leave the result in both xmm0 and

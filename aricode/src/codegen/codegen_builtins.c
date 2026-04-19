@@ -3528,6 +3528,132 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             pn = emit_xor_reg_reg(BUF(cg), REG_RAX, REG_RAX); EMIT(cg, pn);
             return 1;
         }
+        if (strcmp(name, "arr_f64_adam_apply") == 0 && argc == 5) {
+            /* Adam's per-element weight update, vectorised:
+             *
+             *   w[i] -= lr · m[i] / (sqrt(v[i]) + eps)
+             *
+             * m and v are the bias-corrected first- and second-moment
+             * estimates; lr absorbs the 1/(1−β₁ᵗ) factor.  Caller
+             * owns the moments; this kernel only touches w.
+             *
+             * Register plan (after arg unpack; push order mirrors
+             * arr_f64_add_scaled):
+             *   RDI  = w base      RBX = v base (callee-saved; pushed)
+             *   R8   = m base
+             *   RCX  = n           RDX = n_vec = n & ~3
+             *   RSI  = i (loop index)
+             *   ymm13 = broadcast(lr)
+             *   ymm14 = broadcast(eps)
+             *   xmm13/14 low lanes carry scalar copies for the tail.
+             *
+             * Stack after the 4 arg pushes + push rbx:
+             *   [rsp+0]  = rbx_saved
+             *   [rsp+8]  = m
+             *   [rsp+16] = v
+             *   [rsp+24] = lr  (f64 bits)
+             *   [rsp+32] = eps (f64 bits)
+             */
+            emit_expression(cg, node->children[5]); /* eps */
+            int pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
+            emit_expression(cg, node->children[4]); /* lr */
+            pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
+            emit_expression(cg, node->children[3]); /* v */
+            pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
+            emit_expression(cg, node->children[2]); /* m */
+            pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
+            emit_expression(cg, node->children[1]); /* w → RAX */
+            uint8_t *b;
+
+            pn = emit_push(BUF(cg), REG_RBX); EMIT(cg, pn);
+            pn = emit_mov_reg_reg(BUF(cg), REG_RDI, REG_RAX); EMIT(cg, pn);
+
+            /* mov r8,  [rsp+8]   — m base     (REX.W=1, R=1 for r8) */
+            b = BUF(cg); b[0]=0x4C; b[1]=0x8B; b[2]=0x44; b[3]=0x24; b[4]=0x08; EMIT(cg, 5);
+            /* mov rbx, [rsp+16]  — v base */
+            b = BUF(cg); b[0]=0x48; b[1]=0x8B; b[2]=0x5C; b[3]=0x24; b[4]=0x10; EMIT(cg, 5);
+            /* mov rcx, [rsp+24]  — lr bits    (temp, then broadcast)  */
+            b = BUF(cg); b[0]=0x48; b[1]=0x8B; b[2]=0x4C; b[3]=0x24; b[4]=0x18; EMIT(cg, 5);
+            /* movq xmm13, rcx: 66 4C 0F 6E E9   (REX.WR for xmm13 dst) */
+            b = BUF(cg); b[0]=0x66; b[1]=0x4C; b[2]=0x0F; b[3]=0x6E; b[4]=0xE9; EMIT(cg, 5);
+            /* vbroadcastsd ymm13, xmm13 */
+            cg_vex3(cg, 13, 0, 13, 0, 1, 1, 2);
+            b = BUF(cg); b[0]=0x19; b[1]=0xC0 | ((13&7)<<3) | (13&7); EMIT(cg, 2);
+
+            /* mov rcx, [rsp+32]  — eps bits */
+            b = BUF(cg); b[0]=0x48; b[1]=0x8B; b[2]=0x4C; b[3]=0x24; b[4]=0x20; EMIT(cg, 5);
+            /* movq xmm14, rcx: 66 4C 0F 6E F1   (REX.WR for xmm14) */
+            b = BUF(cg); b[0]=0x66; b[1]=0x4C; b[2]=0x0F; b[3]=0x6E; b[4]=0xF1; EMIT(cg, 5);
+            /* vbroadcastsd ymm14, xmm14 */
+            cg_vex3(cg, 14, 0, 14, 0, 1, 1, 2);
+            b = BUF(cg); b[0]=0x19; b[1]=0xC0 | ((14&7)<<3) | (14&7); EMIT(cg, 2);
+
+            /* RCX = n = w[-8]; RDX = n & ~3. */
+            pn = emit_mov_reg_mem(BUF(cg), REG_RCX, REG_RDI, -8); EMIT(cg, pn);
+            pn = emit_mov_reg_reg(BUF(cg), REG_RDX, REG_RCX); EMIT(cg, pn);
+            b = BUF(cg); b[0]=0x48; b[1]=0x83; b[2]=0xE2; b[3]=0xFC; EMIT(cg, 4);
+            pn = emit_xor_reg_reg(BUF(cg), REG_RSI, REG_RSI); EMIT(cg, pn);
+
+            /* ── Vector loop ──────────────────────────────────────── */
+            CgCountedLoop vec = cg_loop_begin(cg, REG_RSI, REG_RDX);
+
+            /* ymm2 = m chunk */
+            cg_vmovupd_ymm_base_idx(cg, 2, 8 /* R8 */, REG_RSI, 0x10);
+            /* ymm3 = v chunk */
+            cg_vmovupd_ymm_base_idx(cg, 3, REG_RBX, REG_RSI, 0x10);
+            /* vsqrtpd ymm3, ymm3   —  VEX.256.66.0F 51 /r */
+            cg_vex3(cg, 3, 0, 3, 0, 1, 1, 1);
+            b = BUF(cg); b[0]=0x51; b[1]=0xC0 | ((3&7)<<3) | (3&7); EMIT(cg, 2);
+            /* vaddpd ymm3, ymm3, ymm14   — sqrt(v) + eps */
+            cg_vex3(cg, 3, 3, 14, 0, 1, 1, 1);
+            b = BUF(cg); b[0]=0x58; b[1]=0xC0 | ((3&7)<<3) | (14&7); EMIT(cg, 2);
+            /* vdivpd ymm2, ymm2, ymm3   — m / (sqrt(v)+eps) */
+            cg_vex3(cg, 2, 2, 3, 0, 1, 1, 1);
+            b = BUF(cg); b[0]=0x5E; b[1]=0xC0 | ((2&7)<<3) | (3&7); EMIT(cg, 2);
+            /* vmulpd ymm2, ymm2, ymm13   — lr · … */
+            cg_vex3(cg, 2, 2, 13, 0, 1, 1, 1);
+            b = BUF(cg); b[0]=0x59; b[1]=0xC0 | ((2&7)<<3) | (13&7); EMIT(cg, 2);
+            /* ymm4 = w chunk */
+            cg_vmovupd_ymm_base_idx(cg, 4, REG_RDI, REG_RSI, 0x10);
+            /* vsubpd ymm4, ymm4, ymm2 */
+            cg_vex3(cg, 4, 4, 2, 0, 1, 1, 1);
+            b = BUF(cg); b[0]=0x5C; b[1]=0xC0 | ((4&7)<<3) | (2&7); EMIT(cg, 2);
+            /* store w chunk */
+            cg_vmovupd_ymm_base_idx(cg, 4, REG_RDI, REG_RSI, 0x11);
+
+            cg_loop_end(cg, vec, 4);
+
+            /* ── Scalar tail ──────────────────────────────────────── */
+            CgCountedLoop tail = cg_loop_begin(cg, REG_RSI, REG_RCX);
+
+            /* xmm0 = m[i] */
+            cg_movsd_xmm_base_idx(cg, 0, 8 /* R8 */, REG_RSI, 0x10);
+            /* xmm1 = v[i] */
+            cg_movsd_xmm_base_idx(cg, 1, REG_RBX, REG_RSI, 0x10);
+            /* sqrtsd xmm1, xmm1 */
+            pn = emit_sqrtsd(BUF(cg), 1, 1); EMIT(cg, pn);
+            /* addsd xmm1, xmm14   — xmm14 low = eps scalar */
+            b = BUF(cg); b[0]=0xF2; b[1]=0x41; b[2]=0x0F; b[3]=0x58; b[4]=0xCE; EMIT(cg, 5);
+            /* divsd xmm0, xmm1 */
+            pn = emit_divsd(BUF(cg), 0, 1); EMIT(cg, pn);
+            /* mulsd xmm0, xmm13   — xmm13 low = lr scalar */
+            b = BUF(cg); b[0]=0xF2; b[1]=0x41; b[2]=0x0F; b[3]=0x59; b[4]=0xC5; EMIT(cg, 5);
+            /* xmm2 = w[i] */
+            cg_movsd_xmm_base_idx(cg, 2, REG_RDI, REG_RSI, 0x10);
+            /* subsd xmm2, xmm0 */
+            pn = emit_subsd(BUF(cg), 2, 0); EMIT(cg, pn);
+            /* store xmm2 back to w[i] */
+            cg_movsd_xmm_base_idx(cg, 2, REG_RDI, REG_RSI, 0x11);
+
+            cg_loop_end(cg, tail, 1);
+
+            /* vzeroupper + restore RBX + drop 4 pushed args. */
+            b = BUF(cg); b[0]=0xC5; b[1]=0xF8; b[2]=0x77; EMIT(cg, 3);
+            pn = emit_pop(BUF(cg), REG_RBX); EMIT(cg, pn);
+            b = BUF(cg); b[0]=0x48; b[1]=0x83; b[2]=0xC4; b[3]=32; EMIT(cg, 4);
+            pn = emit_xor_reg_reg(BUF(cg), REG_RAX, REG_RAX); EMIT(cg, pn);
+            return 1;
+        }
         if (strcmp(name, "arr_f64_expm1") == 0 && argc == 1) {
             /* In-place expm1(buf) = exp(x) - 1, AVX2 packed.  Reuses the
              * vec-exp body and subtracts broadcast 1.0 at the end.

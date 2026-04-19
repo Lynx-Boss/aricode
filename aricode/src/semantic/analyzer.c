@@ -295,6 +295,7 @@ static AriType *builtin_return_type(const char *name) {
         {"arr_f64_matvec",  TYPE_I32},
         {"arr_f64_add_scaled", TYPE_I32},
         {"arr_f64_relu",    TYPE_I32},
+        {"arr_f64_adam_apply", TYPE_I32},
         {"arr_f64_exp",     TYPE_I32},
         {"arr_f64_expm1",   TYPE_I32},
         {"arr_f64_sigmoid", TYPE_I32},

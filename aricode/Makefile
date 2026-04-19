@@ -5,7 +5,9 @@
 #
 # Targets:
 #   make all        - build everything (lexer, parser, errors, compiler)
-#   make test       - run ALL test suites
+#   make test       - run MODULE unit tests (lexer, parser, errors)
+#   make test-e2e   - run END-TO-END aricode suites (run_all.sh + run_edge.sh)
+#   make test-all   - run BOTH: module unit tests + end-to-end suites
 #   make clean      - clean all build artifacts
 #   make compiler   - build just the aric compiler
 #   make install    - copy aric to /usr/local/bin (requires sudo)
@@ -21,7 +23,7 @@ ERRORS_DIR  = src/errors
 
 # ── Phony targets ─────────────────────────────────────────────
 
-.PHONY: all test clean compiler install lexer parser errors
+.PHONY: all test test-e2e test-all clean compiler install lexer parser errors
 
 # ── Default: build everything ─────────────────────────────────
 
@@ -73,6 +75,33 @@ test:
 	@echo ""
 	@echo "========================================"
 	@echo "  ALL TEST SUITES PASSED"
+	@echo "========================================"
+
+# ── End-to-end suites (compile .ari programs, run binaries) ─
+
+test-e2e:
+	@echo ""
+	@echo "========================================"
+	@echo "  ARICODE - End-to-End Test Suites"
+	@echo "========================================"
+	@if [ ! -x src/compiler/aric ]; then \
+	    echo "ERROR: aric compiler not built at src/compiler/aric"; \
+	    echo "Run: cd src/compiler && make"; \
+	    exit 1; \
+	fi
+	@echo ""
+	@echo "--- Functional tests (run_all.sh, 39 cases) ---"
+	@bash tests/run_all.sh
+	@echo ""
+	@echo "--- Edge-case regressions (run_edge.sh, 21 cases) ---"
+	@bash tests/run_edge.sh
+
+# ── The whole kitchen sink ──────────────────────────────────
+
+test-all: test test-e2e
+	@echo ""
+	@echo "========================================"
+	@echo "  MODULE UNIT TESTS + E2E SUITES PASSED"
 	@echo "========================================"
 
 # ── Clean ─────────────────────────────────────────────────────

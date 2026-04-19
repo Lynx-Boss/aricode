@@ -4,7 +4,7 @@ Honest, number-backed picture of what the compiler can do, what's
 fast, what's slow, and what's still on the backlog.  Updated after
 each performance or feature push.
 
-Last updated: 2026-04-19 (AVX2 `arr_f64_log` / `log1p` / `adam_apply` shipped)
+Last updated: 2026-04-19 (MNIST AdamW variant at 98.14 %)
 
 ---
 
@@ -95,11 +95,13 @@ Compiler-side AVX2 tensor builtins (`arr_f64_*`):
 | `arr_f64_softmax`                    |                      |
 | `arr_f64_adam_apply`                 |                      |
 
-### MNIST demo — 97.15 % test accuracy
+### MNIST demo — up to 98.14 % test accuracy
 
-End-to-end digit classifier in `aricode-ml/examples/mnist/`:
-784 → 128 → 10 MLP, He init, mini-batch SGD (batch 64, lr 0.1,
-exponential 0.85 decay), 10 epochs on full 60 K / 10 K MNIST.
+End-to-end digit classifier in `aricode-ml/examples/mnist/`,
+784 → 128 → 10 MLP, He init, full 60 K / 10 K MNIST.  Two variants:
+
+**`mnist.ari`** — SGD baseline.  Raw pixels scaled to `[0, 1]`,
+mini-batch SGD (batch 64, lr 0.1, exponential 0.85 decay), 10 epochs.
 
 | Epoch | train NLL | test acc |
 |-------|-----------|----------|
@@ -107,7 +109,20 @@ exponential 0.85 decay), 10 epochs on full 60 K / 10 K MNIST.
 |   5   | 0.1126    | 96.67 %  |
 |  10   | 0.0885    | **97.15 %** |
 
-33 s wall-clock, 21 KB binary, zero dynamic dependencies.
+33 s wall-clock, 21 KB binary.
+
+**`mnist_adam.ari`** — AdamW + full recipe.  Input standardization
+(mean 0.1307 / std 0.3081), label smoothing α = 0.05, AdamW
+(lr 1e-3, β₁ 0.9, β₂ 0.999, ε 1e-8, wd 1e-3 on weights only),
+10 epochs.  Uses the fused AVX2 `arr_f64_adam_apply` kernel.
+
+| Epoch | train NLL | test acc |
+|-------|-----------|----------|
+|   1   | 0.2926    | 95.98 %  |
+|   5   | 0.1070    | 97.99 %  |
+|  10   | 0.0846    | **98.14 %** |
+
+36 s wall-clock, ~47 KB binary.  Accuracy still climbing at epoch 10.
 
 ---
 
@@ -170,14 +185,12 @@ caught in under 100 ms.
   practical purposes.  Values below `−700` lose the small-scale
   distinction between them — acceptable for softmax, but if you need
   honest `exp(−2000)` use scalar `math_exp`.
-- **Adam optimizer** ships (including the AVX2 `arr_f64_adam_apply`
-  fused kernel and `adam_apply_fast` wrapper) but is not yet the
-  default in MNIST.  A vanilla Adam drop-in (just swap the update
-  rule) lands around 84–87 % where tuned SGD+decay hits 97.15 %.
-  Closing that gap needs the full recipe — input standardization
-  (mean 0.1307 / std 0.3081), label smoothing (~0.05), and AdamW-style
-  decoupled weight decay (1e-4, weights only) — layered together.
-  Builtin is ready; tuning is the pending piece.
+- **Adam optimizer** ships (AVX2 `arr_f64_adam_apply` kernel +
+  `adam_apply_fast` wrapper) and is wired into `mnist_adam.ari`
+  with the full recipe (input standardization, label smoothing,
+  AdamW weight decay).  Earlier notes said Adam couldn't beat SGD
+  here — that was before the recipe was layered on.  With all three
+  knobs in place it reaches 98.14 % vs SGD's 97.15 %.
 - **No CNN builtins** — MNIST runs as an MLP.  Conv2d and max-pool
   are the next big additions when someone needs ~99 %.
 
@@ -192,9 +205,13 @@ cd aricode/src/compiler && make
 # Test
 cd aricode && make test-all
 
-# Train MNIST
+# Train MNIST (SGD baseline, 97.15 %)
 cd aricode-stdlib/aricode-ml/examples/mnist
 ./get_data.sh                           # one-time fetch
 aric mnist.ari -o mnist
 ./mnist                                 # 33 s, 97.15 % accuracy
+
+# Or AdamW variant (98.14 %)
+aric mnist_adam.ari -o mnist_adam
+./mnist_adam                            # 36 s, 98.14 % accuracy
 ```

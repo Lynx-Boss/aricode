@@ -217,6 +217,7 @@ LocalVar *add_local(CodegenState *cg, const char *name) {
     v->name        = name;
     v->rbp_off     = cg->stack_offset;
     v->is_float    = 0;  /* default to integer — set to 1 by caller if f64 */
+    v->hot_xmm     = -1; /* no xmm cache by default (assigned in emit_var_decl) */
     v->struct_type = NULL;
     return v;
 }
@@ -492,14 +493,20 @@ static int emit_identifier(CodegenState *cg, const ASTNode *node) {
     }
     int n;
     if (v->is_float) {
-        /* Two parallel loads instead of load+cross-domain-move:
-         *   movsd xmm0, [rbp+off]   ; 4c direct, no GP→FP penalty
-         *   mov   rax, [rbp+off]    ; 4c, same cache line, issues in
-         *                           ; parallel on Zen 3's two load ports
-         * Previous `mov rax, [rbp]; movq xmm0, rax` chained ~6c because
-         * the GP→FP movq couldn't start until the GP load retired. */
-        n = emit_movsd_xmm_mem(BUF(cg), 0, REG_RBP, v->rbp_off); EMIT(cg, n);
-        n = emit_mov_reg_mem (BUF(cg), REG_RAX, REG_RBP, v->rbp_off); EMIT(cg, n);
+        if (v->hot_xmm >= 0) {
+            /* Hot-var cache hit: value lives in xmm[hot_xmm] — avoid
+             * the memory load entirely.  movapd is a rename on Zen 3.
+             * Still populate RAX in parallel (cheap, and some callers
+             * — push rax in the binop fallback, return value — still
+             * need it).  The memory access frees a load port vs the
+             * cold path's `movsd xmm0, [rbp+off]`. */
+            n = emit_movapd_xmm_xmm(BUF(cg), 0, v->hot_xmm); EMIT(cg, n);
+            n = emit_mov_reg_mem  (BUF(cg), REG_RAX, REG_RBP, v->rbp_off); EMIT(cg, n);
+        } else {
+            /* Cold path: two parallel loads (one per port on Zen 3). */
+            n = emit_movsd_xmm_mem(BUF(cg), 0, REG_RBP, v->rbp_off); EMIT(cg, n);
+            n = emit_mov_reg_mem  (BUF(cg), REG_RAX, REG_RBP, v->rbp_off); EMIT(cg, n);
+        }
     } else {
         n = emit_mov_reg_mem(BUF(cg), REG_RAX, REG_RBP, v->rbp_off); EMIT(cg, n);
     }
@@ -589,6 +596,41 @@ static int subtree_has_call(const ASTNode *n) {
     if (n->type == NODE_CALL) return 1;
     for (size_t i = 0; i < n->child_count; i++)
         if (subtree_has_call(n->children[i])) return 1;
+    return 0;
+}
+
+/*
+ * A handful of builtins compile down to straight-line code that only
+ * touches xmm0/rax — they're safe for function-wide hot-var caching
+ * because they can't clobber the xmm8..xmm15 slots we use as a cache.
+ */
+static int call_is_xmm_safe(const char *fn) {
+    if (!fn) return 0;
+    return strcmp(fn, "float_to_int") == 0
+        || strcmp(fn, "int_to_float") == 0
+        || strcmp(fn, "math_abs")     == 0;
+}
+
+/*
+ * Does any call in this subtree go to something other than our
+ * xmm-safe whitelist?  Used to enable hot-var mode: if the whole
+ * function body is call-free (apart from whitelisted builtins), we
+ * can pin f64 locals to xmm8..xmm15 for the entire body without
+ * worrying about a call trashing them.
+ */
+static int subtree_has_xmm_clobbering_call(const ASTNode *n) {
+    if (!n) return 0;
+    if (n->type == NODE_CALL) {
+        const ASTNode *callee = n->child_count > 0 ? n->children[0] : NULL;
+        const char *name = callee ? callee->string_val : NULL;
+        if (!call_is_xmm_safe(name)) return 1;
+        /* Safe call itself, but check its args for nested calls. */
+        for (size_t i = 1; i < n->child_count; i++)
+            if (subtree_has_xmm_clobbering_call(n->children[i])) return 1;
+        return 0;
+    }
+    for (size_t i = 0; i < n->child_count; i++)
+        if (subtree_has_xmm_clobbering_call(n->children[i])) return 1;
     return 0;
 }
 
@@ -1619,6 +1661,21 @@ static void emit_var_decl(CodegenState *cg, const ASTNode *node) {
             n = emit_mov_mem_reg(BUF(cg), REG_RBP, v->rbp_off, REG_RAX);
         }
         EMIT(cg, n);
+
+        /* Hot-var mode: pin this f64 to a free xmm8..xmm15 slot.  The
+         * initialiser left its value in xmm0 — copy it to the hot
+         * slot so subsequent reads can go direct.  Stack remains the
+         * source of truth (we keep writing to it) so reloads are
+         * still correct if we ever re-enter from a clobbering path. */
+        if (v->is_float && cg->next_hot_xmm < 16) {
+            v->hot_xmm = cg->next_hot_xmm++;
+            /* If the rvalue was int (e.g. `let x: f64 = 5;`), xmm0
+             * holds garbage — sync it from rax first. */
+            if (expr_type != 1) {
+                n = emit_movq_xmm_reg(BUF(cg), 0, REG_RAX); EMIT(cg, n);
+            }
+            n = emit_movapd_xmm_xmm(BUF(cg), v->hot_xmm, 0); EMIT(cg, n);
+        }
     }
 }
 
@@ -1817,7 +1874,7 @@ static void emit_assignment(CodegenState *cg, const ASTNode *node) {
     }
 
     /* Evaluate rvalue -> RAX (and xmm0 if float). */
-    emit_expression(cg, node->children[1]);
+    int rhs_is_float = emit_expression(cg, node->children[1]);
 
     int n;
     /* If the variable is float and the rvalue just ended with
@@ -1829,6 +1886,15 @@ static void emit_assignment(CodegenState *cg, const ASTNode *node) {
         n = emit_mov_mem_reg(BUF(cg), REG_RBP, v->rbp_off, REG_RAX);
     }
     EMIT(cg, n);
+
+    /* Keep the hot-var xmm cache in sync with the stack store. */
+    if (v->hot_xmm >= 0) {
+        /* If the rvalue was int, xmm0 has garbage — refresh from rax. */
+        if (!rhs_is_float) {
+            n = emit_movq_xmm_reg(BUF(cg), 0, REG_RAX); EMIT(cg, n);
+        }
+        n = emit_movapd_xmm_xmm(BUF(cg), v->hot_xmm, 0); EMIT(cg, n);
+    }
 }
 
 /*
@@ -2189,6 +2255,18 @@ static void emit_function(CodegenState *cg, const ASTNode *node) {
     cg->local_count  = 0;
     cg->stack_offset = 0;
 
+    /* Enable hot-var mode for this function if the body is xmm-safe.
+     * When enabled, f64 locals get pinned to xmm8..xmm15 across the
+     * whole function body, avoiding per-read memory loads in tight
+     * loops.  Disabled (-1) means "no xmm cache — every read/write
+     * round-trips through the stack slot". */
+    const ASTNode *body_for_scan = node->children[node->child_count - 1];
+    if (!subtree_has_xmm_clobbering_call(body_for_scan)) {
+        cg->next_hot_xmm = 8;              /* xmm8..xmm15, 8 slots */
+    } else {
+        cg->next_hot_xmm = 16;             /* pool empty → no caching */
+    }
+
     /* Parse parameters */
     const ASTNode *params = node->children[0]; /* child 0 = param block */
     fe->param_cnt = (int)params->child_count;
@@ -2238,6 +2316,15 @@ static void emit_function(CodegenState *cg, const ASTNode *node) {
         n = emit_mov_mem_reg(BUF(cg), REG_RBP, v->rbp_off,
                              SYS_V_ARG_REGS[i]);
         EMIT(cg, n);
+
+        /* Hot-var mode: pin this f64 parameter into an xmm cache
+         * slot.  The f64 bits arrived via an integer arg register;
+         * movq moves them into the target xmm in one op. */
+        if (v->is_float && cg->next_hot_xmm < 16) {
+            v->hot_xmm = cg->next_hot_xmm++;
+            n = emit_movq_xmm_reg(BUF(cg), v->hot_xmm, SYS_V_ARG_REGS[i]);
+            EMIT(cg, n);
+        }
     }
 
     /* Find the body block (last child) */

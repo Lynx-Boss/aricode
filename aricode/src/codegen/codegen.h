@@ -41,6 +41,11 @@ typedef struct {
     const char *name;      /* variable name (borrowed from AST)       */
     int32_t     rbp_off;   /* offset from RBP (negative = locals)     */
     int         is_float;  /* 1 if f64/f32, 0 if integer/bool        */
+    int         hot_xmm;   /* if >=0, this f64 var is cached in that
+                            * xmm reg (range xmm8..xmm15) across the
+                            * function body — set when the whole
+                            * function is xmm-safe (no calls that
+                            * clobber xmm8+).  -1 = stack-only.    */
     const char *struct_type; /* if not NULL, this variable is a struct
                               * (borrowed name of the struct type) */
 } LocalVar;
@@ -102,6 +107,11 @@ typedef struct {
      * operand can sit there during right-operand evaluation instead of
      * round-tripping through the stack.  Capped at 6 levels. */
     int         float_depth;
+
+    /* Register-allocated f64 locals live in xmm8..xmm15.  `next_hot_xmm`
+     * is the next free slot while emitting the current function body; it
+     * resets to 8 at function entry, and gets to 16 if we run out. */
+    int         next_hot_xmm;
 
     /* Error tracking */
     int         had_error;

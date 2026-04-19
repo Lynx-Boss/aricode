@@ -749,12 +749,16 @@ static void emit_binary_op(CodegenState *cg, const ASTNode *node) {
         int use_xmm_stash = (cg->float_depth < 6) && !subtree_has_call(right);
 
         if (use_xmm_stash) {
+            /* If left ended with a wasted `movq rax, xmm0` — the exit
+             * pattern from any float binop and from emit_identifier's
+             * hot path — drop it before stashing.  In the xmm-stash
+             * path rax is never read, so this is safe. */
+            peephole_drop_movq_rax_xmm0(cg);
             n = emit_movapd_xmm_xmm(BUF(cg), stash_xmm, 0); EMIT(cg, n);
             cg->float_depth++;
             emit_expression(cg, right);
             cg->float_depth--;
-            /* If right ended with a wasted `movq rax, xmm0` (e.g. from
-             * another float binop), drop it and use an xmm-domain move. */
+            /* Same treatment for right. */
             peephole_drop_movq_rax_xmm0(cg);
             n = emit_movapd_xmm_xmm(BUF(cg), 1, 0); EMIT(cg, n);
             n = emit_movapd_xmm_xmm(BUF(cg), 0, stash_xmm); EMIT(cg, n);

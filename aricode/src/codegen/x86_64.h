@@ -836,6 +836,26 @@ static inline int emit_movsd_xmm_xmm(uint8_t *buf, int dst, int src) {
 }
 
 /*
+ * MOVAPD xmm, xmm  (move aligned packed double — register-to-register).
+ * Opcode: 66 0F 28 /r
+ *
+ * Prefer this over MOVSD for register-to-register copies on Zen 3:
+ * MOVSD preserves the upper 64 bits of the destination, creating a
+ * false merge dependency that defeats the zero-latency renamer.
+ * MOVAPD is treated as a pure rename (zero latency, no port use).
+ */
+static inline int emit_movapd_xmm_xmm(uint8_t *buf, int dst, int src) {
+    int off = 0;
+    buf[off++] = 0x66;
+    if (reg_ext(dst) || reg_ext(src))
+        buf[off++] = rex(0, reg_ext(dst), 0, reg_ext(src));
+    buf[off++] = 0x0F;
+    buf[off++] = 0x28;
+    buf[off++] = modrm(3, dst & 7, src & 7);
+    return off;
+}
+
+/*
  * MOVSD xmm, [base + disp32]  (load f64 from memory)
  * Opcode: F2 [REX] 0F 10 /r
  */

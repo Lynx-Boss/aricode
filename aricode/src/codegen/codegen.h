@@ -97,6 +97,12 @@ typedef struct {
     int         loop_is_for[32];   /* 1=for loop, 0=while loop           */
     int         loop_depth;
 
+    /* Nesting depth of float binary ops currently being emitted.  Used
+     * to pick a free xmm as a stash register (xmm2 + depth) so the left
+     * operand can sit there during right-operand evaluation instead of
+     * round-tripping through the stack.  Capped at 6 levels. */
+    int         float_depth;
+
     /* Error tracking */
     int         had_error;
     char        error_msg[512];

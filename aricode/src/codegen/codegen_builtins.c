@@ -2534,6 +2534,8 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
 
                 /* movq rax, xmm2 — result back to RAX */
                 b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x7E; b[4]=0xD0; EMIT(cg, 5);
+                /* Sync xmm0 with rax (contract: f64 return in both). */
+                b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xC0; EMIT(cg, 5);
             }
             return 1;
         }
@@ -2670,6 +2672,8 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
                 b = BUF(cg); b[0]=0xDD; b[1]=0x1C; b[2]=0x24; EMIT(cg, 3); /* fstp [rsp] */
                 b = BUF(cg); b[0]=0x48; b[1]=0x8B; b[2]=0x04; b[3]=0x24; EMIT(cg, 4);
                 b = BUF(cg); b[0]=0x48; b[1]=0x83; b[2]=0xC4; b[3]=16; EMIT(cg, 4);
+                /* x87 path leaves result in RAX only; sync xmm0 for callers. */
+                b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xC0; EMIT(cg, 5);
             } else {
                 /* SSE2 path: octant reduce + sin_poly / cos_poly select.
                  * See emit_sincos_body above for details.  Delivers ~10^-11
@@ -2691,6 +2695,8 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
                 b = BUF(cg); b[0]=0xDD; b[1]=0x1C; b[2]=0x24; EMIT(cg, 3); /* fstp [rsp] */
                 b = BUF(cg); b[0]=0x48; b[1]=0x8B; b[2]=0x04; b[3]=0x24; EMIT(cg, 4);
                 b = BUF(cg); b[0]=0x48; b[1]=0x83; b[2]=0xC4; b[3]=16; EMIT(cg, 4);
+                /* Sync xmm0 for callers. */
+                b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xC0; EMIT(cg, 5);
             } else {
                 /* SSE2 path: octant reduce + sin_poly / cos_poly select.
                  * cos(x) = sin(x + π/2), so we reuse the sin body with an
@@ -2874,7 +2880,9 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             return 1;
         }
         if (strcmp(name, "arr_f64_get") == 0 && argc == 2) {
-            /* Load f64 from [base + idx*8], return as f64 bits in RAX */
+            /* Load f64 from [base + idx*8], return as f64 bits in RAX AND xmm0.
+             * Callers that follow up with a float binop expect the value in
+             * xmm0; returning only in RAX breaks the contract. */
             emit_expression(cg, node->children[2]); /* idx */
             int pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
             emit_expression(cg, node->children[1]); /* base */
@@ -2884,6 +2892,10 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             b[1] = 0x8B; b[2] = modrm(0, REG_RAX & 7, 4);
             b[3] = (uint8_t)((3 << 6) | ((REG_RCX & 7) << 3) | (REG_RAX & 7));
             EMIT(cg, 4);
+            /* Sync xmm0 with RAX so the caller's float_is_in_xmm0
+             * invariant holds (movq xmm0, rax  →  66 48 0F 6E C0). */
+            b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xC0;
+            EMIT(cg, 5);
             return 1;
         }
         if (strcmp(name, "arr_f64_set") == 0 && argc == 3) {

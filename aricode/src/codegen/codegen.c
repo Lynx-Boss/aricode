@@ -490,14 +490,18 @@ static int emit_identifier(CodegenState *cg, const ASTNode *node) {
                  node->string_val, node->line, node->col);
         return 0;
     }
-    /* Load from stack: mov rax, [rbp + offset] */
-    int n = emit_mov_reg_mem(BUF(cg), REG_RAX, REG_RBP, v->rbp_off);
-    EMIT(cg, n);
-
-    /* If float, also load into xmm0 */
+    int n;
     if (v->is_float) {
-        n = emit_movq_xmm_reg(BUF(cg), 0, REG_RAX);
-        EMIT(cg, n);
+        /* Two parallel loads instead of load+cross-domain-move:
+         *   movsd xmm0, [rbp+off]   ; 4c direct, no GP→FP penalty
+         *   mov   rax, [rbp+off]    ; 4c, same cache line, issues in
+         *                           ; parallel on Zen 3's two load ports
+         * Previous `mov rax, [rbp]; movq xmm0, rax` chained ~6c because
+         * the GP→FP movq couldn't start until the GP load retired. */
+        n = emit_movsd_xmm_mem(BUF(cg), 0, REG_RBP, v->rbp_off); EMIT(cg, n);
+        n = emit_mov_reg_mem (BUF(cg), REG_RAX, REG_RBP, v->rbp_off); EMIT(cg, n);
+    } else {
+        n = emit_mov_reg_mem(BUF(cg), REG_RAX, REG_RBP, v->rbp_off); EMIT(cg, n);
     }
     return v->is_float;
 }
@@ -574,6 +578,39 @@ static int expr_is_float(CodegenState *cg, const ASTNode *node) {
     return 0;
 }
 
+/*
+ * Does the expression tree contain any NODE_CALL?  Used to decide
+ * whether stashing a value in an xmm register across the evaluation
+ * of a sub-expression is safe — a call clobbers all caller-saved
+ * xmm registers, so we fall back to the stack in that case.
+ */
+static int subtree_has_call(const ASTNode *n) {
+    if (!n) return 0;
+    if (n->type == NODE_CALL) return 1;
+    for (size_t i = 0; i < n->child_count; i++)
+        if (subtree_has_call(n->children[i])) return 1;
+    return 0;
+}
+
+/*
+ * Peephole: if the last 5 bytes of the code buffer are `movq rax, xmm0`
+ * (66 48 0F 7E C0), strip them.  Used when the caller is about to do
+ * something that only cares about xmm0 — typically a movsd store or a
+ * movapd xmm1, xmm0 — and the preceding RAX round-trip is wasted.
+ *
+ * Returns 1 if the peephole fired, 0 otherwise.
+ */
+static int peephole_drop_movq_rax_xmm0(CodegenState *cg) {
+    if (cg->code_size < 5) return 0;
+    const uint8_t *p = cg->code + cg->code_size - 5;
+    if (p[0] == 0x66 && p[1] == 0x48 && p[2] == 0x0F &&
+        p[3] == 0x7E && p[4] == 0xC0) {
+        cg->code_size -= 5;
+        return 1;
+    }
+    return 0;
+}
+
 static void emit_binary_op(CodegenState *cg, const ASTNode *node) {
     const char *op = node->op;
     if (!op || node->child_count < 2) {
@@ -593,27 +630,38 @@ static void emit_binary_op(CodegenState *cg, const ASTNode *node) {
     int right_is_float = expr_is_float(cg, right);
 
     if (left_is_float || right_is_float) {
-        /* Evaluate left → result in RAX (f64 bits) or xmm0
-         * All expressions ultimately leave f64 bits in RAX.
-         * Push RAX to save the left value on the stack. */
+        /* Evaluate left → xmm0 (also rax). */
         emit_expression(cg, left);
-        /* Ensure f64 bits are in RAX (if came from xmm0, move it) */
-        if (left->type == NODE_FLOAT_LITERAL ||
-            (left->type == NODE_IDENTIFIER && find_local(cg, left->string_val) &&
-             find_local(cg, left->string_val)->is_float)) {
-            /* Value was loaded into xmm0 AND RAX by emit_expression */
+
+        int stash_xmm = 2 + cg->float_depth;
+        /* Right must be call-free (a call would clobber xmm_stash during
+         * right evaluation).  Left may have calls — emit_expression(left)
+         * finishes with the value in xmm0 (builtins are required to sync
+         * xmm0 with rax before returning), so stashing into xmm_stash
+         * right after left is safe. */
+        int use_xmm_stash = (cg->float_depth < 6) && !subtree_has_call(right);
+
+        if (use_xmm_stash) {
+            n = emit_movapd_xmm_xmm(BUF(cg), stash_xmm, 0); EMIT(cg, n);
+            cg->float_depth++;
+            emit_expression(cg, right);
+            cg->float_depth--;
+            /* If right ended with a wasted `movq rax, xmm0` (e.g. from
+             * another float binop), drop it and use an xmm-domain move. */
+            peephole_drop_movq_rax_xmm0(cg);
+            n = emit_movapd_xmm_xmm(BUF(cg), 1, 0); EMIT(cg, n);
+            n = emit_movapd_xmm_xmm(BUF(cg), 0, stash_xmm); EMIT(cg, n);
+        } else {
+            n = emit_push(BUF(cg), REG_RAX); EMIT(cg, n);
+            emit_expression(cg, right);
+            if (peephole_drop_movq_rax_xmm0(cg)) {
+                n = emit_movapd_xmm_xmm(BUF(cg), 1, 0); EMIT(cg, n);
+            } else {
+                n = emit_movq_xmm_reg(BUF(cg), 1, REG_RAX); EMIT(cg, n);
+            }
+            n = emit_movsd_xmm_mem(BUF(cg), 0, REG_RSP, 0); EMIT(cg, n);
+            n = emit_add_reg_imm(BUF(cg), REG_RSP, 8); EMIT(cg, n);
         }
-        /* RAX has the f64 bits — push to stack */
-        n = emit_push(BUF(cg), REG_RAX); EMIT(cg, n);
-
-        /* Evaluate right → RAX (f64 bits) */
-        emit_expression(cg, right);
-        /* Move right result to xmm1: movq xmm1, rax */
-        n = emit_movq_xmm_reg(BUF(cg), 1, REG_RAX); EMIT(cg, n);
-
-        /* Pop left from stack into xmm0: movsd xmm0, [rsp]; add rsp,8 */
-        n = emit_movsd_xmm_mem(BUF(cg), 0, REG_RSP, 0); EMIT(cg, n);
-        n = emit_add_reg_imm(BUF(cg), REG_RSP, 8); EMIT(cg, n);
 
         /* xmm0 = left, xmm1 = right */
         if (strcmp(op, "+") == 0) {
@@ -1561,7 +1609,15 @@ static void emit_var_decl(CodegenState *cg, const ASTNode *node) {
         if (expr_type == 1 && !v->is_float && !has_type_annotation) {
             v->is_float = 1;
         }
-        int n = emit_mov_mem_reg(BUF(cg), REG_RBP, v->rbp_off, REG_RAX);
+        int n;
+        /* Same movq-elision peephole as emit_assignment: if the var
+         * is float and the initializer left RAX via a wasted
+         * `movq rax, xmm0`, drop that and write xmm0 directly. */
+        if (v->is_float && peephole_drop_movq_rax_xmm0(cg)) {
+            n = emit_movsd_mem_xmm(BUF(cg), REG_RBP, v->rbp_off, 0);
+        } else {
+            n = emit_mov_mem_reg(BUF(cg), REG_RBP, v->rbp_off, REG_RAX);
+        }
         EMIT(cg, n);
     }
 }
@@ -1760,11 +1816,18 @@ static void emit_assignment(CodegenState *cg, const ASTNode *node) {
         return;
     }
 
-    /* Evaluate rvalue -> RAX */
+    /* Evaluate rvalue -> RAX (and xmm0 if float). */
     emit_expression(cg, node->children[1]);
 
-    /* Store to stack: mov [rbp + offset], rax */
-    int n = emit_mov_mem_reg(BUF(cg), REG_RBP, v->rbp_off, REG_RAX);
+    int n;
+    /* If the variable is float and the rvalue just ended with
+     * `movq rax, xmm0`, skip the rax round-trip and store xmm0
+     * directly via movsd — 1 fewer instruction per f64 write. */
+    if (v->is_float && peephole_drop_movq_rax_xmm0(cg)) {
+        n = emit_movsd_mem_xmm(BUF(cg), REG_RBP, v->rbp_off, 0);
+    } else {
+        n = emit_mov_mem_reg(BUF(cg), REG_RBP, v->rbp_off, REG_RAX);
+    }
     EMIT(cg, n);
 }
 

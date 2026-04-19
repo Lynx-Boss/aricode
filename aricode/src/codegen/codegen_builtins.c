@@ -966,6 +966,8 @@ static void emit_log_coeff_stack_teardown(CodegenState *cg) {
  *   ymm10 = broadcast(1.0 bits 0x3FF0000000000000)
  *   ymm11 = broadcast(2^52 + 1023 = 0x43300000000003FF)
  *   ymm12 = broadcast(2^52       = 0x4330000000000000)
+ *   ymm13 = broadcast(√2 bits 0x3FF6A09E667F3BCD)   — for range reduction
+ *   ymm14 = broadcast(0.5 bits 0x3FE0000000000000)   — for range reduction
  *   [rsp + 0 .. +40] holds the 6 polynomial coefficients (see setup).
  *
  * Output: ymm0 = log(x).  Clobbers ymm1..ymm7.
@@ -993,6 +995,33 @@ static void emit_vec_log_body_avx2(CodegenState *cg) {
     /* vsubpd ymm1, ymm1, ymm11  — subtract 2^52 + 1023 → k as f64 */
     cg_vex3(cg, 1, 1, 11, 0, 1, 1, 1);
     b = BUF(cg); b[0]=0x5C; b[1]=0xC0 | ((1&7)<<3) | (11&7); EMIT(cg, 2);
+
+    /* ── √2 range reduction (branchless, per lane) ──
+     * For each lane where m ≥ √2:  m *= 0.5 ;  k += 1.
+     * Cuts the 7-term atanh truncation error from ~2e-9 to ~5e-13,
+     * matching scalar math_log after its own √2 reduction.
+     *
+     * ymm13 = broadcast(√2), ymm14 = broadcast(0.5).
+     * Scratch: ymm3 (mask), ymm4 (candidate reduced m / k_adj).
+     * Both are overwritten by the f/2+f/s steps below.
+     */
+    /* vcmppd ymm3, ymm2, ymm13, 0x05  —  mask = (m NLT √2) = (m ≥ √2) */
+    cg_vex3(cg, 3, 2, 13, 0, 1, 1, 1);
+    b = BUF(cg); b[0]=0xC2; b[1]=0xC0 | ((3&7)<<3) | (13&7); b[2]=0x05; EMIT(cg, 3);
+    /* vmulpd ymm4, ymm2, ymm14  —  ymm4 = m · 0.5 */
+    cg_vex3(cg, 4, 2, 14, 0, 1, 1, 1);
+    b = BUF(cg); b[0]=0x59; b[1]=0xC0 | ((4&7)<<3) | (14&7); EMIT(cg, 2);
+    /* vblendvpd ymm2, ymm2, ymm4, ymm3  —  m = mask ? m/2 : m
+     * Encoding: VEX.NDS.256.66.0F3A.W0 4B /r /is4
+     * is4 byte: bits 7:4 = mask reg (ymm3 → 0x30), bits 3:0 reserved. */
+    cg_vex3(cg, 2, 2, 4, 0, 1, 1, 3);
+    b = BUF(cg); b[0]=0x4B; b[1]=0xC0 | ((2&7)<<3) | (4&7); b[2]=0x30; EMIT(cg, 3);
+    /* vandpd ymm4, ymm3, ymm10  —  ymm4 = mask & 1.0_bits → 1.0 or 0.0 */
+    cg_vex3(cg, 4, 3, 10, 0, 1, 1, 1);
+    b = BUF(cg); b[0]=0x54; b[1]=0xC0 | ((4&7)<<3) | (10&7); EMIT(cg, 2);
+    /* vaddpd ymm1, ymm1, ymm4  —  k += adjustment */
+    cg_vex3(cg, 1, 1, 4, 0, 1, 1, 1);
+    b = BUF(cg); b[0]=0x58; b[1]=0xC0 | ((1&7)<<3) | (4&7); EMIT(cg, 2);
 
     /* ── f = m - 1, 2+f = m + 1, s = f/(2+f) ── */
     /* vsubpd ymm0, ymm2, ymm10  — ymm0 = f */
@@ -2727,6 +2756,29 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
                 /* movq xmm1, rax — xmm1 = m */
                 b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xC8; EMIT(cg, 5);
 
+                /* === √2 range reduction ===
+                 * If m ≥ √2, halve m and bump k.  Shrinks |f| from
+                 * [0, 1) to [−0.293, 0.414], |s| to ≤ 0.172, z ≤ 0.03.
+                 * Drops the 7-term atanh truncation error from ~2e-9
+                 * (at z≈0.09) to ~5e-13 (at z≤0.03) — gets lane-0
+                 * within ~ulp of glibc log (what the optimizer.c
+                 * compile-time fold uses for math_log literals).
+                 */
+                /* mov rdx, √2 bits ; movq xmm2, rdx */
+                pn = emit_mov_reg_imm64(BUF(cg), REG_RDX, 0x3FF6A09E667F3BCDULL); EMIT(cg, pn);
+                b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xD2; EMIT(cg, 5);
+                /* ucomisd xmm1, xmm2 */
+                b = BUF(cg); b[0]=0x66; b[1]=0x0F; b[2]=0x2E; b[3]=0xCA; EMIT(cg, 4);
+                /* jb +22 — skip adjustment if m < √2 */
+                b = BUF(cg); b[0]=0x72; b[1]=22; EMIT(cg, 2);
+                /* mov rdx, 0.5 bits ; movq xmm2, rdx */
+                pn = emit_mov_reg_imm64(BUF(cg), REG_RDX, 0x3FE0000000000000ULL); EMIT(cg, pn);
+                b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xD2; EMIT(cg, 5);
+                /* mulsd xmm1, xmm2 — m *= 0.5 */
+                b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x59; b[3]=0xCA; EMIT(cg, 4);
+                /* inc rcx — k += 1 */
+                b = BUF(cg); b[0]=0x48; b[1]=0xFF; b[2]=0xC1; EMIT(cg, 3);
+
                 /* === Step 2: f = m - 1, s = f/(2+f) === */
                 pn = emit_mov_reg_imm64(BUF(cg), REG_RDX, 0x3FF0000000000000ULL); EMIT(cg, pn); /* 1.0 */
                 b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xD2; EMIT(cg, 5); /* movq xmm2, rdx */
@@ -3815,6 +3867,8 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             cg_broadcast_f64(cg, 10, 0x3FF0000000000000ULL, 0);             /* 1.0 bits */
             cg_broadcast_f64(cg, 11, 0x43300000000003FFULL, 0);             /* 2^52 + 1023 */
             cg_broadcast_f64(cg, 12, 0x4330000000000000ULL, 0);             /* 2^52 */
+            cg_broadcast_f64(cg, 13, 0x3FF6A09E667F3BCDULL, 0);             /* √2 */
+            cg_broadcast_f64(cg, 14, 0x3FE0000000000000ULL, 0);             /* 0.5 */
 
             emit_log_coeff_stack_setup(cg);
 
@@ -3855,6 +3909,8 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             cg_broadcast_f64(cg, 10, 0x3FF0000000000000ULL, 0);
             cg_broadcast_f64(cg, 11, 0x43300000000003FFULL, 0);
             cg_broadcast_f64(cg, 12, 0x4330000000000000ULL, 0);
+            cg_broadcast_f64(cg, 13, 0x3FF6A09E667F3BCDULL, 0);
+            cg_broadcast_f64(cg, 14, 0x3FE0000000000000ULL, 0);
 
             emit_log_coeff_stack_setup(cg);
 

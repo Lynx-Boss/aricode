@@ -1,0 +1,397 @@
+#!/bin/bash
+# ============================================================================
+#  ARICODE - Numerical & Codegen Edge-Case Tests
+# ============================================================================
+#  Catalog of quick regression tests for bugs that the main run_all.sh
+#  didn't exercise.  Each case targets a specific bug we've hit (or
+#  could latently hit) in the codegen or the f64 builtin family.
+#
+#  Organised by category so you can eyeball which invariant broke
+#  from the section header alone.  All tests run in well under a
+#  second total.
+#
+#  Add a test here when you fix a subtle bug — the next regression
+#  should be caught inside a second of compilation.
+# ============================================================================
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+ARIC="$SCRIPT_DIR/../src/compiler/aric"
+PASS=0
+FAIL=0
+TOTAL=0
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+CYAN='\033[0;36m'
+YELLOW='\033[0;33m'
+BOLD='\033[1m'
+DIM='\033[2m'
+RESET='\033[0m'
+
+run_test() {
+    local name="$1" file="$2" expect="$3" notes="${4:-}"
+    TOTAL=$((TOTAL + 1))
+    printf "  [%2d] %-38s" "$TOTAL" "$name"
+
+    if ! "$ARIC" "$file" -o "/tmp/aritest_edge_$name" >/dev/null 2>&1; then
+        printf "${RED}COMPILE FAIL${RESET}\n"
+        FAIL=$((FAIL + 1))
+        return
+    fi
+
+    local output
+    output=$("/tmp/aritest_edge_$name" 2>/dev/null) || true
+
+    if echo "$output" | grep -qF "$expect"; then
+        printf "${GREEN}PASS${RESET}"
+        [ -n "$notes" ] && printf " ${DIM}%s${RESET}" "$notes"
+        printf "\n"
+        PASS=$((PASS + 1))
+    else
+        printf "${RED}FAIL${RESET} ${DIM}(expected '$expect')${RESET}\n"
+        printf "         ${DIM}got: $(echo "$output" | tr '\n' ' ' | cut -c 1-70)${RESET}\n"
+        FAIL=$((FAIL + 1))
+    fi
+
+    rm -f "/tmp/aritest_edge_$name"
+}
+
+echo ""
+echo -e "${BOLD}${CYAN}============================================================${RESET}"
+echo -e "${BOLD}${CYAN}  ARICODE - Numerical / Codegen Edge-Case Tests${RESET}"
+echo -e "${BOLD}${CYAN}============================================================${RESET}"
+
+# ────────────────────────────────────────────────────────────────────
+echo -e "\n${BOLD}--- Softmax numerical edge cases ---${RESET}"
+# Each of these repros a bug found in real training runs.
+
+# #1  n = 1: degenerate softmax must return 1.0.
+cat > /tmp/edge_softmax_n1.ari << 'EOF'
+fn main() -> i32 {
+    let a: i32 = arr_f64_new(1);
+    arr_f64_set(a, 0, 42.0);
+    arr_f64_softmax(a);
+    print_f64(arr_f64_get(a, 0), 6);
+    return 0;
+}
+EOF
+run_test "softmax_n1" /tmp/edge_softmax_n1.ari "1.000000" \
+  "scalar tail when n < vec width"
+
+# #2  n = 3 (< 4): pure scalar tail path, no vec iterations.
+# Softmax sums to 1 ± f64 epsilon — print 3 digits, both 0.999 and
+# 1.000 round-trips to "1.00" after a rounding margin.
+cat > /tmp/edge_softmax_n3.ari << 'EOF'
+fn main() -> i32 {
+    let a: i32 = arr_f64_new(3);
+    arr_f64_set(a, 0, 1.0); arr_f64_set(a, 1, 2.0); arr_f64_set(a, 2, 3.0);
+    arr_f64_softmax(a);
+    let sum: f64 = arr_f64_get(a,0) + arr_f64_get(a,1) + arr_f64_get(a,2);
+    // Normalise the last-digit rounding: accept 0.999999 or 1.000000.
+    if (sum > 0.99999) { print_int(1); } else { print_int(0); }
+    return 0;
+}
+EOF
+run_test "softmax_n3" /tmp/edge_softmax_n3.ari "1" \
+  "sums to 1 ± ε even when n < 4"
+
+# #3  n = 10 (not mul-of-4): vec loop + scalar tail stitched correctly.
+cat > /tmp/edge_softmax_n10.ari << 'EOF'
+fn main() -> i32 {
+    let a: i32 = arr_f64_new(10);
+    let i: i32 = 0;
+    while (i < 10) { arr_f64_set(a, i, int_to_float(i) * 0.1); i += 1; }
+    arr_f64_softmax(a);
+    let sum: f64 = 0.0; i = 0;
+    while (i < 10) { sum = sum + arr_f64_get(a, i); i += 1; }
+    if (sum > 0.99999) { print_int(1); } else { print_int(0); }
+    return 0;
+}
+EOF
+run_test "softmax_n10" /tmp/edge_softmax_n10.ari "1" \
+  "n%4 != 0 — last 0-3 lanes must count"
+
+# #4  Extreme logit spread > 700 nats.  Without the −700 clamp in
+# softmax, vec_exp's 2^k reconstruction overflows and the largest
+# probability lands in the wrong slot.  This is the bug that broke
+# MNIST + Adam on its first batch.
+cat > /tmp/edge_softmax_extreme.ari << 'EOF'
+fn argmax(buf: i32, n: i32) -> i32 {
+    let bi: i32 = 0; let bv: f64 = arr_f64_get(buf, 0);
+    let i: i32 = 1;
+    while (i < n) {
+        let v: f64 = arr_f64_get(buf, i);
+        if (v > bv) { bv = v; bi = i; }
+        i += 1;
+    }
+    return bi;
+}
+fn main() -> i32 {
+    let a: i32 = arr_f64_new(10);
+    let i: i32 = 0;
+    while (i < 8) { arr_f64_set(a, i, 0.0); i += 1; }
+    arr_f64_set(a, 8, 0.0 - 5000.0);     // must underflow to ~0
+    arr_f64_set(a, 9, 2000.0);           // unique max
+    arr_f64_softmax(a);
+    print_int(argmax(a, 10));            // expect 9
+    return 0;
+}
+EOF
+run_test "softmax_extreme_spread" /tmp/edge_softmax_extreme.ari "9" \
+  "largest logit lands in the right slot"
+
+# #5  All equal: softmax → uniform.
+cat > /tmp/edge_softmax_uniform.ari << 'EOF'
+fn main() -> i32 {
+    let a: i32 = arr_f64_new(4);
+    let i: i32 = 0;
+    while (i < 4) { arr_f64_set(a, i, 1.5); i += 1; }
+    arr_f64_softmax(a);
+    // Each element should be 0.25.  Print the first.
+    print_f64(arr_f64_get(a, 0), 6);
+    return 0;
+}
+EOF
+run_test "softmax_uniform" /tmp/edge_softmax_uniform.ari "0.250000"
+
+# ────────────────────────────────────────────────────────────────────
+echo -e "\n${BOLD}--- Vec exp numerical range ---${RESET}"
+
+# #6  exp(0..3) — basic spot-check.
+cat > /tmp/edge_vec_exp.ari << 'EOF'
+fn main() -> i32 {
+    let a: i32 = arr_f64_new(4);
+    arr_f64_set(a, 0, 0.0); arr_f64_set(a, 1, 1.0);
+    arr_f64_set(a, 2, 2.0); arr_f64_set(a, 3, 3.0);
+    arr_f64_exp(a);
+    // exp(1) ≈ 2.71828, exp(2) ≈ 7.389, exp(3) ≈ 20.085
+    print_f64(arr_f64_get(a, 1), 4);    // 2.7182
+    return 0;
+}
+EOF
+run_test "vec_exp_moderate" /tmp/edge_vec_exp.ari "2.7182"
+
+# #7  expm1 vectorised — matches scalar math_expm1 for moderate inputs.
+cat > /tmp/edge_vec_expm1.ari << 'EOF'
+fn main() -> i32 {
+    let a: i32 = arr_f64_new(4);
+    arr_f64_set(a, 0, 0.5); arr_f64_set(a, 1, 1.0);
+    arr_f64_set(a, 2, 2.0); arr_f64_set(a, 3, 3.0);
+    arr_f64_expm1(a);
+    // expm1(1) = e - 1 ≈ 1.71828
+    print_f64(arr_f64_get(a, 1), 4);
+    return 0;
+}
+EOF
+run_test "vec_expm1_moderate" /tmp/edge_vec_expm1.ari "1.7182"
+
+# ────────────────────────────────────────────────────────────────────
+echo -e "\n${BOLD}--- f64 return contract (xmm0 AND rax) ---${RESET}"
+# Every builtin that returns f64 MUST leave the result in both xmm0 and
+# rax.  When this is broken, the xmm-stash path of a float binop picks
+# up garbage from xmm0.  We caught this with arr_f64_get / math_exp /
+# math_sin x87 path.  Tests below use arr_f64_get on the left of a
+# float binop — without the contract, left gets stashed as garbage.
+
+# #8  arr_f64_get then + literal.
+cat > /tmp/edge_f64_get_binop.ari << 'EOF'
+fn main() -> i32 {
+    let a: i32 = arr_f64_new(4);
+    arr_f64_set(a, 0, 1.5); arr_f64_set(a, 1, 2.5);
+    let r: f64 = arr_f64_get(a, 0) + 0.5;     // expect 2.0
+    print_f64(r, 6);
+    return 0;
+}
+EOF
+run_test "f64_get_in_binop" /tmp/edge_f64_get_binop.ari "2.000000" \
+  "would regress if arr_f64_get skips xmm0 sync"
+
+# #9  math_exp then + literal (was missing xmm0 sync).
+cat > /tmp/edge_math_exp_binop.ari << 'EOF'
+fn main() -> i32 {
+    let r: f64 = math_exp(0.0) + 1.0;      // exp(0) + 1 = 2.0
+    print_f64(r, 6);
+    return 0;
+}
+EOF
+run_test "math_exp_in_binop" /tmp/edge_math_exp_binop.ari "2.000000" \
+  "math_exp's final movq rax, xmm2 must sync xmm0"
+
+# #10  Nested call in the left position of a float binop — exercises
+# the stash fallback that depends on right-side peephole.
+cat > /tmp/edge_nested_call_binop.ari << 'EOF'
+fn main() -> i32 {
+    let a: i32 = arr_f64_new(4);
+    arr_f64_set(a, 0, 3.0); arr_f64_set(a, 1, 4.0);
+    arr_f64_set(a, 2, 0.0); arr_f64_set(a, 3, 0.0);
+    let r: f64 = arr_f64_get(a, 0) * arr_f64_get(a, 1);  // 12.0
+    print_f64(r, 4);
+    return 0;
+}
+EOF
+run_test "call_on_both_sides" /tmp/edge_nested_call_binop.ari "12.0000" \
+  "stash fallback on right, contract on left"
+
+# ────────────────────────────────────────────────────────────────────
+echo -e "\n${BOLD}--- Hot-var register allocation ---${RESET}"
+
+# #11  f64 local read in a binop.  Validates that the hot-var cache
+# load (movapd xmm0, xmm_hot) feeds the right xmm register for the
+# subsequent subsd without going through a stale stack slot.
+cat > /tmp/edge_hotvar_binop.ari << 'EOF'
+fn main() -> i32 {
+    let a: f64 = 10.0;
+    let b: f64 = 3.5;
+    let c: f64 = a - b;       // expect 6.5
+    print_f64(c, 4);
+    return 0;
+}
+EOF
+run_test "hotvar_binop_read" /tmp/edge_hotvar_binop.ari "6.5000" \
+  "hot f64 var reads feed binop correctly"
+
+# #12  More f64 locals than the xmm8..xmm15 pool can hold (9).  The
+# 9th one must fall back to stack cleanly, not crash or corrupt.
+cat > /tmp/edge_hotvar_overflow.ari << 'EOF'
+fn main() -> i32 {
+    let v0: f64 = 1.0; let v1: f64 = 2.0; let v2: f64 = 3.0;
+    let v3: f64 = 4.0; let v4: f64 = 5.0; let v5: f64 = 6.0;
+    let v6: f64 = 7.0; let v7: f64 = 8.0; let v8: f64 = 9.0;
+    print_f64(v0 + v1 + v2 + v3 + v4 + v5 + v6 + v7 + v8, 6);
+    return 0;
+}
+EOF
+run_test "hotvar_pool_overflow" /tmp/edge_hotvar_overflow.ari "45.000000" \
+  "9th f64 var falls back to stack"
+
+# #13  i32 read right after a write to the same hot_gp slot.  The
+# peephole strips the redundant reload; must not miscompute the sum.
+cat > /tmp/edge_hotvar_gp_reload.ari << 'EOF'
+fn main() -> i32 {
+    let i: i32 = 0;
+    let sum: i32 = 0;
+    while (i < 1000) {
+        i = i + 1;        // writes r12
+        sum = sum + i;    // reads r12 immediately
+    }
+    print_int(sum);        // 1+2+...+1000 = 500500
+    return 0;
+}
+EOF
+run_test "hotvar_gp_reload" /tmp/edge_hotvar_gp_reload.ari "500500" \
+  "redundant-mov peephole preserves value"
+
+# #14  Mixed f64 + i32 locals with params — both caches live.
+cat > /tmp/edge_hotvar_mixed.ari << 'EOF'
+fn compute(k: i32, scale: f64) -> f64 {
+    let acc: f64 = 0.0;
+    let i: i32 = 0;
+    while (i < k) {
+        acc = acc + int_to_float(i) * scale;
+        i = i + 1;
+    }
+    return acc;
+}
+fn main() -> i32 {
+    let r: f64 = compute(100, 0.01);   // sum(0..99)/100 = 49.5
+    print_f64(r, 4);
+    return 0;
+}
+EOF
+run_test "hotvar_mixed_types" /tmp/edge_hotvar_mixed.ari "49.5000" \
+  "f64 + i32 caches coexist in same function"
+
+# ────────────────────────────────────────────────────────────────────
+echo -e "\n${BOLD}--- Branch peephole correctness ---${RESET}"
+
+# #15  setCC+movzx+cmp-0+je rewritten to inverse JCC must match sense.
+cat > /tmp/edge_branch_lt.ari << 'EOF'
+fn main() -> i32 {
+    let i: i32 = 0; let taken: i32 = 0;
+    while (i < 10) {
+        if (i < 5) { taken = taken + 1; }
+        i = i + 1;
+    }
+    print_int(taken);   // 5
+    return 0;
+}
+EOF
+run_test "branch_lt" /tmp/edge_branch_lt.ari "5"
+
+# #16  Inverse: !=, <=, >= — each flips the low condition bit.
+cat > /tmp/edge_branch_ne.ari << 'EOF'
+fn main() -> i32 {
+    let i: i32 = 0; let t: i32 = 0;
+    while (i < 10) {
+        if (i != 3) { t = t + 1; }
+        i = i + 1;
+    }
+    print_int(t);      // 9
+    return 0;
+}
+EOF
+run_test "branch_ne" /tmp/edge_branch_ne.ari "9"
+
+# #17  Float comparison (uses setb/seta from ucomisd, low bit same).
+cat > /tmp/edge_branch_float.ari << 'EOF'
+fn main() -> i32 {
+    let v: f64 = 3.14;
+    if (v > 3.0) {
+        print_int(1);
+    } else {
+        print_int(0);
+    }
+    return 0;
+}
+EOF
+run_test "branch_float" /tmp/edge_branch_float.ari "1"
+
+# ────────────────────────────────────────────────────────────────────
+echo -e "\n${BOLD}--- State isolation between calls ---${RESET}"
+
+# #18  Repeated softmax + forward pass — the xmm-safe fn should not
+# leak cached state from one call to the next.  Run a small training
+# loop and check final output.
+cat > /tmp/edge_repeated_softmax.ari << 'EOF'
+fn main() -> i32 {
+    let y: i32 = arr_f64_new(10);
+    let i: i32 = 0;
+    while (i < 100) {
+        let j: i32 = 0;
+        while (j < 10) {
+            arr_f64_set(y, j, int_to_float(j) * 0.1 + int_to_float(i) * 0.001);
+            j = j + 1;
+        }
+        arr_f64_softmax(y);
+        i = i + 1;
+    }
+    // After 100 softmax calls, sum of last one should still be 1 ± ε.
+    let sum: f64 = 0.0;
+    let k: i32 = 0;
+    while (k < 10) { sum = sum + arr_f64_get(y, k); k = k + 1; }
+    if (sum > 0.99999) { print_int(1); } else { print_int(0); }
+    return 0;
+}
+EOF
+run_test "softmax_repeated" /tmp/edge_repeated_softmax.ari "1" \
+  "no state bleed across 100 calls"
+
+# ────────────────────────────────────────────────────────────────────
+
+echo ""
+echo -e "${BOLD}${CYAN}============================================================${RESET}"
+printf "  Total:  ${BOLD}%d${RESET}\n" "$TOTAL"
+printf "  Passed: ${GREEN}${BOLD}%d${RESET}\n" "$PASS"
+if [ "$FAIL" -gt 0 ]; then
+    printf "  Failed: ${RED}${BOLD}%d${RESET}\n" "$FAIL"
+else
+    printf "  Failed: ${BOLD}%d${RESET}\n" "$FAIL"
+fi
+echo -e "${BOLD}${CYAN}============================================================${RESET}"
+
+# Cleanup temp sources
+rm -f /tmp/edge_*.ari
+
+exit $FAIL

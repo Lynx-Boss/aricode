@@ -218,6 +218,7 @@ LocalVar *add_local(CodegenState *cg, const char *name) {
     v->rbp_off     = cg->stack_offset;
     v->is_float    = 0;  /* default to integer — set to 1 by caller if f64 */
     v->hot_xmm     = -1; /* no xmm cache by default (assigned in emit_var_decl) */
+    v->hot_gp      = -1; /* no GP cache by default                          */
     v->struct_type = NULL;
     return v;
 }
@@ -458,6 +459,19 @@ static void emit_float_literal(CodegenState *cg, const ASTNode *node) {
     memcpy(&bits, &val, 8);
     int n;
 
+    /* +0.0 (and only +0.0) is all-zero bits, so we can use xor-zero
+     * idioms — much smaller than the general imm64 path and equally
+     * recognised by Zen 3's renamer.  Skip this for -0.0 (0x80..) and
+     * any other value. */
+    if (bits == 0) {
+        n = emit_xor_reg_reg(BUF(cg), REG_RAX, REG_RAX); EMIT(cg, n);
+        /* xorpd xmm0, xmm0 = 66 0F 57 C0 — 4 bytes, zero latency. */
+        uint8_t *b = BUF(cg);
+        b[0] = 0x66; b[1] = 0x0F; b[2] = 0x57; b[3] = 0xC0;
+        EMIT(cg, 4);
+        return;
+    }
+
     /* mov rax, imm64 (the IEEE 754 bits) - for stack storage */
     n = emit_mov_reg_imm64(BUF(cg), REG_RAX, bits);
     EMIT(cg, n);
@@ -506,6 +520,9 @@ static int emit_identifier(CodegenState *cg, const ASTNode *node) {
             n = emit_movsd_xmm_mem(BUF(cg), 0, REG_RBP, v->rbp_off); EMIT(cg, n);
             n = emit_mov_reg_mem  (BUF(cg), REG_RAX, REG_RBP, v->rbp_off); EMIT(cg, n);
         }
+    } else if (v->hot_gp >= 0) {
+        /* i32 cached in r12..r15 — register-to-register move. */
+        n = emit_mov_reg_reg(BUF(cg), REG_RAX, v->hot_gp); EMIT(cg, n);
     } else {
         n = emit_mov_reg_mem(BUF(cg), REG_RAX, REG_RBP, v->rbp_off); EMIT(cg, n);
     }
@@ -613,9 +630,10 @@ static int call_is_xmm_safe(const char *fn) {
 /*
  * Does any call in this subtree go to something other than our
  * xmm-safe whitelist?  Used to enable hot-var mode: if the whole
- * function body is call-free (apart from whitelisted builtins), we
- * can pin f64 locals to xmm8..xmm15 for the entire body without
- * worrying about a call trashing them.
+ * function body is call-free (apart from whitelisted builtins) AND
+ * doesn't use try/catch (which commandeers r12..r15 for error-unwind
+ * state), we can pin f64 locals to xmm8..xmm15 and i32 locals to
+ * r12..r15 for the entire body without worrying about clobbers.
  */
 static int subtree_has_xmm_clobbering_call(const ASTNode *n) {
     if (!n) return 0;
@@ -628,6 +646,10 @@ static int subtree_has_xmm_clobbering_call(const ASTNode *n) {
             if (subtree_has_xmm_clobbering_call(n->children[i])) return 1;
         return 0;
     }
+    /* try/catch uses r12..r15 as the error-unwind register quartet,
+     * which collides with our i32 cache.  Treat as clobbering so the
+     * enclosing function opts out of hot-var mode. */
+    if (n->type == NODE_TRY_CATCH || n->type == NODE_ERROR_RAISE) return 1;
     for (size_t i = 0; i < n->child_count; i++)
         if (subtree_has_xmm_clobbering_call(n->children[i])) return 1;
     return 0;
@@ -1599,6 +1621,14 @@ static void emit_return(CodegenState *cg, const ASTNode *node) {
     EMIT(cg, n);
     n = emit_pop(BUF(cg), REG_RBP);
     EMIT(cg, n);
+    /* In xmm-safe mode, restore r12..r15 (pushed in reverse order at
+     * prologue).  Must come after pop rbp and before ret. */
+    if (cg->in_xmm_safe_fn) {
+        n = emit_pop(BUF(cg), REG_R15); EMIT(cg, n);
+        n = emit_pop(BUF(cg), REG_R14); EMIT(cg, n);
+        n = emit_pop(BUF(cg), REG_R13); EMIT(cg, n);
+        n = emit_pop(BUF(cg), REG_R12); EMIT(cg, n);
+    }
     n = emit_ret(BUF(cg));
     EMIT(cg, n);
 }
@@ -1651,11 +1681,13 @@ static void emit_var_decl(CodegenState *cg, const ASTNode *node) {
             v->is_float = 1;
         }
 
-        /* Will this local be hot-var cached? */
-        int going_hot = (v->is_float && cg->next_hot_xmm < 16);
+        /* Will this local be hot-var cached?                       */
+        int going_hot_xmm = (v->is_float  && cg->next_hot_xmm < 16);
+        int going_hot_gp  = (!v->is_float && !v->struct_type
+                             && cg->next_hot_gp  < 16);
 
         int n;
-        if (going_hot) {
+        if (going_hot_xmm) {
             /* Skip the dead stack write; cache holds source of truth. */
             v->hot_xmm = cg->next_hot_xmm++;
             peephole_drop_movq_rax_xmm0(cg);    /* eliminate wasted movq */
@@ -1663,6 +1695,10 @@ static void emit_var_decl(CodegenState *cg, const ASTNode *node) {
                 n = emit_movq_xmm_reg(BUF(cg), 0, REG_RAX); EMIT(cg, n);
             }
             n = emit_movapd_xmm_xmm(BUF(cg), v->hot_xmm, 0); EMIT(cg, n);
+        } else if (going_hot_gp) {
+            /* i32 cached in r12..r15 — move rax into the slot. */
+            v->hot_gp = cg->next_hot_gp++;
+            n = emit_mov_reg_reg(BUF(cg), v->hot_gp, REG_RAX); EMIT(cg, n);
         } else {
             /* Cold path: store to the stack slot. */
             if (v->is_float && peephole_drop_movq_rax_xmm0(cg)) {
@@ -1875,15 +1911,20 @@ static void emit_assignment(CodegenState *cg, const ASTNode *node) {
     int n;
     /* In hot-var mode the backing stack slot is write-only dead code:
      * nothing in the function ever reads it (all reads go through the
-     * xmm cache).  Skip the memory write entirely and just refresh the
-     * cache.  The function body is known to be xmm-safe, so no call can
-     * make us reload the slot before the function returns. */
+     * xmm/GP cache).  Skip the memory write entirely and just refresh
+     * the cache.  The function body is known to be xmm-safe, so no
+     * call can make us reload the slot before the function returns. */
     if (v->hot_xmm >= 0) {
         peephole_drop_movq_rax_xmm0(cg);      /* eliminate wasted movq */
         if (!rhs_is_float) {
             n = emit_movq_xmm_reg(BUF(cg), 0, REG_RAX); EMIT(cg, n);
         }
         n = emit_movapd_xmm_xmm(BUF(cg), v->hot_xmm, 0); EMIT(cg, n);
+        return;
+    }
+    if (v->hot_gp >= 0) {
+        /* i32 cache: rax holds the new value → copy into the slot. */
+        n = emit_mov_reg_reg(BUF(cg), v->hot_gp, REG_RAX); EMIT(cg, n);
         return;
     }
 
@@ -2257,23 +2298,38 @@ static void emit_function(CodegenState *cg, const ASTNode *node) {
     cg->stack_offset = 0;
 
     /* Enable hot-var mode for this function if the body is xmm-safe.
-     * When enabled, f64 locals get pinned to xmm8..xmm15 across the
-     * whole function body, avoiding per-read memory loads in tight
-     * loops.  Disabled (-1) means "no xmm cache — every read/write
-     * round-trips through the stack slot". */
+     * When enabled, f64 locals pin to xmm8..xmm15 and i32 locals pin
+     * to r12..r15 across the whole body — no stack traffic for reads
+     * or writes.  Disabled means "every access round-trips the
+     * stack slot". */
     const ASTNode *body_for_scan = node->children[node->child_count - 1];
-    if (!subtree_has_xmm_clobbering_call(body_for_scan)) {
+    cg->in_xmm_safe_fn = !subtree_has_xmm_clobbering_call(body_for_scan);
+    if (cg->in_xmm_safe_fn) {
         cg->next_hot_xmm = 8;              /* xmm8..xmm15, 8 slots */
+        cg->next_hot_gp  = 12;             /* r12..r15,    4 slots */
     } else {
         cg->next_hot_xmm = 16;             /* pool empty → no caching */
+        cg->next_hot_gp  = 16;
     }
 
     /* Parse parameters */
     const ASTNode *params = node->children[0]; /* child 0 = param block */
     fe->param_cnt = (int)params->child_count;
 
+    /* In xmm-safe mode we use r12..r15 as a cache for i32 locals.
+     * They're callee-saved in System V, so we push them before the
+     * frame pointer (so the frame layout above rbp isn't disturbed)
+     * and pop them in emit_return after restoring rbp. */
+    int n;
+    if (cg->in_xmm_safe_fn) {
+        n = emit_push(BUF(cg), REG_R12); EMIT(cg, n);
+        n = emit_push(BUF(cg), REG_R13); EMIT(cg, n);
+        n = emit_push(BUF(cg), REG_R14); EMIT(cg, n);
+        n = emit_push(BUF(cg), REG_R15); EMIT(cg, n);
+    }
+
     /* Function prologue: push rbp; mov rbp, rsp */
-    int n = emit_push(BUF(cg), REG_RBP);
+    n = emit_push(BUF(cg), REG_RBP);
     EMIT(cg, n);
     n = emit_mov_reg_reg(BUF(cg), REG_RBP, REG_RSP);
     EMIT(cg, n);
@@ -2313,16 +2369,21 @@ static void emit_function(CodegenState *cg, const ASTNode *node) {
             }
         }
 
-        /* Hot-var mode: pin this f64 parameter into an xmm cache
-         * slot.  The f64 bits arrived via an integer arg register;
-         * movq moves them into the target xmm in one op.  In this
-         * mode the stack slot is dead (all reads go through the
-         * cache), so skip the GPR→stack spill entirely. */
-        int goes_hot = (v->is_float && cg->next_hot_xmm < 16);
+        /* Hot-var mode pins params into register caches: f64 → xmm
+         * (via movq from the integer arg reg), i32 → r12..r15 (via
+         * mov).  In this mode the stack slot is dead, so we skip
+         * the GPR→stack spill entirely. */
+        int goes_hot_xmm = ( v->is_float && cg->next_hot_xmm < 16);
+        int goes_hot_gp  = (!v->is_float && !v->struct_type
+                            && cg->next_hot_gp < 16);
 
-        if (goes_hot) {
+        if (goes_hot_xmm) {
             v->hot_xmm = cg->next_hot_xmm++;
             n = emit_movq_xmm_reg(BUF(cg), v->hot_xmm, SYS_V_ARG_REGS[i]);
+            EMIT(cg, n);
+        } else if (goes_hot_gp) {
+            v->hot_gp = cg->next_hot_gp++;
+            n = emit_mov_reg_reg(BUF(cg), v->hot_gp, SYS_V_ARG_REGS[i]);
             EMIT(cg, n);
         } else {
             /* Cold path: store the GPR (f64 bits or int) to the stack. */

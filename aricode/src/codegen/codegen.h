@@ -46,6 +46,11 @@ typedef struct {
                             * function body — set when the whole
                             * function is xmm-safe (no calls that
                             * clobber xmm8+).  -1 = stack-only.    */
+    int         hot_gp;    /* if >=0, this i32 var is cached in the
+                            * GP register with that index (range
+                            * r12..r15, which are callee-saved so
+                            * they survive anywhere our xmm-safe
+                            * whitelist may branch).  -1 = stack. */
     const char *struct_type; /* if not NULL, this variable is a struct
                               * (borrowed name of the struct type) */
 } LocalVar;
@@ -112,6 +117,17 @@ typedef struct {
      * is the next free slot while emitting the current function body; it
      * resets to 8 at function entry, and gets to 16 if we run out. */
     int         next_hot_xmm;
+
+    /* Register-allocated i32 locals live in r12..r15 (callee-saved so
+     * they survive the whitelist of xmm-safe builtins — none of
+     * which touch the upper integer regs).  Reset to 12 at function
+     * entry in xmm-safe mode, else 16 (disabled). */
+    int         next_hot_gp;
+
+    /* Non-zero iff the current function is in xmm-safe mode.  Used by
+     * emit_function / emit_return to decide whether to save r12..r15
+     * (four pushes/pops around the body). */
+    int         in_xmm_safe_fn;
 
     /* Error tracking */
     int         had_error;

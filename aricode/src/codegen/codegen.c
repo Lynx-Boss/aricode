@@ -521,7 +521,19 @@ static int emit_identifier(CodegenState *cg, const ASTNode *node) {
             n = emit_mov_reg_mem  (BUF(cg), REG_RAX, REG_RBP, v->rbp_off); EMIT(cg, n);
         }
     } else if (v->hot_gp >= 0) {
-        /* i32 cached in r12..r15 — register-to-register move. */
+        /* i32 cached in r12..r15 — register-to-register move.        */
+        /* Peephole: if we just wrote rax into this same slot (3-byte
+         * `49 89 C(hot_gp&7)`), rax still holds the value — skip the
+         * redundant reload.  Fires when an `i = i + 1` statement is
+         * immediately followed by a read of `i` (typical of the
+         * while-unrolled condition re-check). */
+        if (cg->code_size >= 3) {
+            const uint8_t *p = cg->code + cg->code_size - 3;
+            if (p[0] == 0x49 && p[1] == 0x89 &&
+                p[2] == (uint8_t)(0xC0 | (v->hot_gp & 7))) {
+                return 0;                  /* rax already has the value */
+            }
+        }
         n = emit_mov_reg_reg(BUF(cg), REG_RAX, v->hot_gp); EMIT(cg, n);
     } else {
         n = emit_mov_reg_mem(BUF(cg), REG_RAX, REG_RBP, v->rbp_off); EMIT(cg, n);

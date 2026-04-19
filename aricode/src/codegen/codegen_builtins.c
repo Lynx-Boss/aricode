@@ -3514,6 +3514,54 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             pn = emit_xor_reg_reg(BUF(cg), REG_RAX, REG_RAX); EMIT(cg, pn);
             return 1;
         }
+        if (strcmp(name, "arr_f64_expm1") == 0 && argc == 1) {
+            /* In-place expm1(buf) = exp(x) - 1, AVX2 packed.  Reuses the
+             * vec-exp body and subtracts broadcast 1.0 at the end.
+             *
+             * NOTE: loses precision for |x| < 2^-53 where exp(x) rounds
+             * to exactly 1.0 and the subtraction gives 0.  Callers that
+             * need full precision near zero should stick with the
+             * scalar math_expm1 (Horner-evaluated Taylor). */
+            emit_expression(cg, node->children[1]); /* buf */
+            int pn; uint8_t *b;
+            pn = emit_mov_reg_reg(BUF(cg), REG_RDI, REG_RAX); EMIT(cg, pn);
+            pn = emit_mov_reg_mem(BUF(cg), REG_RCX, REG_RAX, -8); EMIT(cg, pn);
+
+            /* RDX = n & ~3 */
+            pn = emit_mov_reg_reg(BUF(cg), REG_RDX, REG_RCX); EMIT(cg, pn);
+            b = BUF(cg); b[0]=0x48; b[1]=0x83; b[2]=0xE2; b[3]=0xFC; EMIT(cg, 4);
+
+            cg_broadcast_f64(cg, 8,  0x3FF71547652B82FEULL, /*scratch=*/0);
+            cg_broadcast_f64(cg, 9,  0x3FE62E42FEFA39EFULL, 0);
+            cg_broadcast_f64(cg, 10, 0x3FF0000000000000ULL, 0);
+            emit_exp_coeff_stack_setup(cg);
+
+            pn = emit_xor_reg_reg(BUF(cg), REG_RSI, REG_RSI); EMIT(cg, pn);
+
+            CgCountedLoop vec = cg_loop_begin(cg, REG_RSI, REG_RDX);
+
+            /* ymm0 = x = load */
+            cg_vmovupd_ymm_base_idx(cg, 0, REG_RDI, REG_RSI, 0x10);
+
+            emit_vec_exp_body_avx2(cg);            /* ymm0 = exp(x) */
+
+            /* ymm0 -= 1.0  — vsubpd ymm0, ymm0, ymm10 (broadcast 1.0). */
+            cg_vex3(cg, 0, 0, 10, 0, 1, 1, 1);
+            b = BUF(cg); b[0]=0x5C; b[1]=0xC0 | (0<<3) | (10&7); EMIT(cg, 2);
+
+            /* Store */
+            cg_vmovupd_ymm_base_idx(cg, 0, REG_RDI, REG_RSI, 0x11);
+
+            cg_loop_end(cg, vec, 4);
+
+            /* Scalar tail skipped — callers pad to mul 4, as with arr_f64_exp. */
+
+            emit_exp_coeff_stack_teardown(cg);
+
+            b = BUF(cg); b[0]=0xC5; b[1]=0xF8; b[2]=0x77; EMIT(cg, 3);  /* vzeroupper */
+            pn = emit_xor_reg_reg(BUF(cg), REG_RAX, REG_RAX); EMIT(cg, pn);
+            return 1;
+        }
         if (strcmp(name, "arr_f64_relu") == 0 && argc == 1) {
             /* In-place ReLU: buf[i] = max(0, buf[i]).
              *

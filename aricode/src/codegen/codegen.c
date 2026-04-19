@@ -674,6 +674,50 @@ static int peephole_drop_movq_rax_xmm0(CodegenState *cg) {
     return 0;
 }
 
+/*
+ * Emit the "skip if false" conditional jump for an `if`/`while`/`for`.
+ * Returns the offset of the 6-byte conditional jump in the code buffer,
+ * so the caller can patch its rel32 target once the skip destination
+ * is known.
+ *
+ * Peephole: when the condition expression just materialised a boolean
+ * via `setCC al; movzx rax, al` (7 bytes), the flags from the
+ * originating cmp / ucomisd are still live — setCC reads flags and
+ * movzx doesn't touch them.  We rewind those two instructions and
+ * emit `jcc_inverse rel32` directly instead of the 11-byte
+ * setCC + movzx + cmp rax, 0 + je sequence.  Saves 5 bytes and 3
+ * pipeline slots per branching comparison.
+ *
+ * Fallback: the old `cmp rax, 0; je rel32` pattern for non-comparison
+ * conditions (raw booleans, call results, arithmetic).
+ */
+static size_t cg_emit_cond_jump_skip(CodegenState *cg) {
+    if (cg->code_size >= 7) {
+        const uint8_t *p = cg->code + cg->code_size - 7;
+        /* setCC al: 0F 9X C0    (X = condition code) */
+        /* movzx rax, al: 48 0F B6 C0 */
+        if (p[0] == 0x0F && (p[1] & 0xF0) == 0x90 && p[2] == 0xC0 &&
+            p[3] == 0x48 && p[4] == 0x0F && p[5] == 0xB6 && p[6] == 0xC0) {
+            uint8_t cc_true = p[1] & 0x0F;            /* the condition tested */
+            cg->code_size -= 7;                        /* rewind setCC + movzx */
+            /* JCC near with the INVERTED condition (skip when false).
+             * Low bit of the condition code is the negation, so XOR 1. */
+            uint8_t *b = BUF(cg);
+            b[0] = 0x0F;
+            b[1] = (uint8_t)(0x80 | (cc_true ^ 0x01));
+            memset(b + 2, 0, 4);                       /* rel32 placeholder */
+            size_t pos = cg->code_size;
+            EMIT(cg, 6);
+            return pos;
+        }
+    }
+    /* Cold path: plain `cmp rax, 0; je rel32`. */
+    int n = emit_cmp_reg_imm(BUF(cg), REG_RAX, 0); EMIT(cg, n);
+    size_t pos = cg->code_size;
+    n = emit_je(BUF(cg), 0); EMIT(cg, n);
+    return pos;
+}
+
 static void emit_binary_op(CodegenState *cg, const ASTNode *node) {
     const char *op = node->op;
     if (!op || node->child_count < 2) {
@@ -1736,17 +1780,12 @@ static void emit_if(CodegenState *cg, const ASTNode *node) {
         return;
     }
 
-    /* Evaluate condition -> RAX */
+    /* Evaluate condition → rax (0 / 1). */
     emit_expression(cg, node->children[0]);
 
-    /* Test RAX: cmp rax, 0 */
-    int n = emit_cmp_reg_imm(BUF(cg), REG_RAX, 0);
-    EMIT(cg, n);
-
-    /* JE over then-block (placeholder offset) */
-    size_t je_pos = cg->code_size;
-    n = emit_je(BUF(cg), 0); /* placeholder */
-    EMIT(cg, n);
+    /* Peephole-or-cmp skip branch (see cg_emit_cond_jump_skip). */
+    size_t je_pos = cg_emit_cond_jump_skip(cg);
+    int n;
 
     /* Then block */
     emit_block(cg, node->children[1]);
@@ -1835,14 +1874,9 @@ static void emit_while(CodegenState *cg, const ASTNode *node) {
     /* Evaluate condition -> RAX */
     emit_expression(cg, node->children[0]);
 
-    /* Test: cmp rax, 0 */
-    int n = emit_cmp_reg_imm(BUF(cg), REG_RAX, 0);
-    EMIT(cg, n);
-
-    /* JE to loop_end (placeholder) */
-    size_t je_pos = cg->code_size;
-    n = emit_je(BUF(cg), 0);
-    EMIT(cg, n);
+    /* Peephole-or-cmp skip branch. */
+    size_t je_pos = cg_emit_cond_jump_skip(cg);
+    int n;
 
     /* Body (first copy) */
     emit_block(cg, node->children[1]);
@@ -1851,12 +1885,7 @@ static void emit_while(CodegenState *cg, const ASTNode *node) {
     if (can_unroll) {
         /* Re-check condition before second body copy */
         emit_expression(cg, node->children[0]);
-        n = emit_cmp_reg_imm(BUF(cg), REG_RAX, 0);
-        EMIT(cg, n);
-        /* JE to loop_end (placeholder) */
-        je_pos2 = cg->code_size;
-        n = emit_je(BUF(cg), 0);
-        EMIT(cg, n);
+        je_pos2 = cg_emit_cond_jump_skip(cg);
 
         /* Body (second copy — unrolled) */
         emit_block(cg, node->children[1]);
@@ -1984,13 +2013,8 @@ static void emit_for(CodegenState *cg, const ASTNode *node) {
 
     /* Condition */
     emit_expression(cg, node->children[1]);
-    int n = emit_cmp_reg_imm(BUF(cg), REG_RAX, 0);
-    EMIT(cg, n);
-
-    /* JE to loop_end */
-    size_t je_pos = cg->code_size;
-    n = emit_je(BUF(cg), 0);
-    EMIT(cg, n);
+    size_t je_pos = cg_emit_cond_jump_skip(cg);
+    int n;
 
     /* Body */
     emit_block(cg, node->children[3]);

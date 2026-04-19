@@ -494,14 +494,13 @@ static int emit_identifier(CodegenState *cg, const ASTNode *node) {
     int n;
     if (v->is_float) {
         if (v->hot_xmm >= 0) {
-            /* Hot-var cache hit: value lives in xmm[hot_xmm] — avoid
-             * the memory load entirely.  movapd is a rename on Zen 3.
-             * Still populate RAX in parallel (cheap, and some callers
-             * — push rax in the binop fallback, return value — still
-             * need it).  The memory access frees a load port vs the
-             * cold path's `movsd xmm0, [rbp+off]`. */
+            /* Hot-var cache: value lives in xmm[hot_xmm].  The backing
+             * stack slot is never written in this mode, so populating
+             * RAX must come via a cross-domain move rather than a
+             * stack reload (which would read garbage).  movq is ~2c
+             * — still cheaper than the old ~5c stack load + GP→FP. */
             n = emit_movapd_xmm_xmm(BUF(cg), 0, v->hot_xmm); EMIT(cg, n);
-            n = emit_mov_reg_mem  (BUF(cg), REG_RAX, REG_RBP, v->rbp_off); EMIT(cg, n);
+            n = emit_movq_reg_xmm  (BUF(cg), REG_RAX, 0); EMIT(cg, n);
         } else {
             /* Cold path: two parallel loads (one per port on Zen 3). */
             n = emit_movsd_xmm_mem(BUF(cg), 0, REG_RBP, v->rbp_off); EMIT(cg, n);
@@ -1651,30 +1650,27 @@ static void emit_var_decl(CodegenState *cg, const ASTNode *node) {
         if (expr_type == 1 && !v->is_float && !has_type_annotation) {
             v->is_float = 1;
         }
-        int n;
-        /* Same movq-elision peephole as emit_assignment: if the var
-         * is float and the initializer left RAX via a wasted
-         * `movq rax, xmm0`, drop that and write xmm0 directly. */
-        if (v->is_float && peephole_drop_movq_rax_xmm0(cg)) {
-            n = emit_movsd_mem_xmm(BUF(cg), REG_RBP, v->rbp_off, 0);
-        } else {
-            n = emit_mov_mem_reg(BUF(cg), REG_RBP, v->rbp_off, REG_RAX);
-        }
-        EMIT(cg, n);
 
-        /* Hot-var mode: pin this f64 to a free xmm8..xmm15 slot.  The
-         * initialiser left its value in xmm0 — copy it to the hot
-         * slot so subsequent reads can go direct.  Stack remains the
-         * source of truth (we keep writing to it) so reloads are
-         * still correct if we ever re-enter from a clobbering path. */
-        if (v->is_float && cg->next_hot_xmm < 16) {
+        /* Will this local be hot-var cached? */
+        int going_hot = (v->is_float && cg->next_hot_xmm < 16);
+
+        int n;
+        if (going_hot) {
+            /* Skip the dead stack write; cache holds source of truth. */
             v->hot_xmm = cg->next_hot_xmm++;
-            /* If the rvalue was int (e.g. `let x: f64 = 5;`), xmm0
-             * holds garbage — sync it from rax first. */
+            peephole_drop_movq_rax_xmm0(cg);    /* eliminate wasted movq */
             if (expr_type != 1) {
                 n = emit_movq_xmm_reg(BUF(cg), 0, REG_RAX); EMIT(cg, n);
             }
             n = emit_movapd_xmm_xmm(BUF(cg), v->hot_xmm, 0); EMIT(cg, n);
+        } else {
+            /* Cold path: store to the stack slot. */
+            if (v->is_float && peephole_drop_movq_rax_xmm0(cg)) {
+                n = emit_movsd_mem_xmm(BUF(cg), REG_RBP, v->rbp_off, 0);
+            } else {
+                n = emit_mov_mem_reg(BUF(cg), REG_RBP, v->rbp_off, REG_RAX);
+            }
+            EMIT(cg, n);
         }
     }
 }
@@ -1877,24 +1873,29 @@ static void emit_assignment(CodegenState *cg, const ASTNode *node) {
     int rhs_is_float = emit_expression(cg, node->children[1]);
 
     int n;
-    /* If the variable is float and the rvalue just ended with
-     * `movq rax, xmm0`, skip the rax round-trip and store xmm0
-     * directly via movsd — 1 fewer instruction per f64 write. */
+    /* In hot-var mode the backing stack slot is write-only dead code:
+     * nothing in the function ever reads it (all reads go through the
+     * xmm cache).  Skip the memory write entirely and just refresh the
+     * cache.  The function body is known to be xmm-safe, so no call can
+     * make us reload the slot before the function returns. */
+    if (v->hot_xmm >= 0) {
+        peephole_drop_movq_rax_xmm0(cg);      /* eliminate wasted movq */
+        if (!rhs_is_float) {
+            n = emit_movq_xmm_reg(BUF(cg), 0, REG_RAX); EMIT(cg, n);
+        }
+        n = emit_movapd_xmm_xmm(BUF(cg), v->hot_xmm, 0); EMIT(cg, n);
+        return;
+    }
+
+    /* Cold path: write through to the stack slot.  The same movq-drop
+     * peephole as before — if the rvalue ended with `movq rax, xmm0`,
+     * skip that and store xmm0 directly. */
     if (v->is_float && peephole_drop_movq_rax_xmm0(cg)) {
         n = emit_movsd_mem_xmm(BUF(cg), REG_RBP, v->rbp_off, 0);
     } else {
         n = emit_mov_mem_reg(BUF(cg), REG_RBP, v->rbp_off, REG_RAX);
     }
     EMIT(cg, n);
-
-    /* Keep the hot-var xmm cache in sync with the stack store. */
-    if (v->hot_xmm >= 0) {
-        /* If the rvalue was int, xmm0 has garbage — refresh from rax. */
-        if (!rhs_is_float) {
-            n = emit_movq_xmm_reg(BUF(cg), 0, REG_RAX); EMIT(cg, n);
-        }
-        n = emit_movapd_xmm_xmm(BUF(cg), v->hot_xmm, 0); EMIT(cg, n);
-    }
 }
 
 /*
@@ -2312,17 +2313,21 @@ static void emit_function(CodegenState *cg, const ASTNode *node) {
             }
         }
 
-        /* Store from GPR — f64 bits are carried in the integer register */
-        n = emit_mov_mem_reg(BUF(cg), REG_RBP, v->rbp_off,
-                             SYS_V_ARG_REGS[i]);
-        EMIT(cg, n);
-
         /* Hot-var mode: pin this f64 parameter into an xmm cache
          * slot.  The f64 bits arrived via an integer arg register;
-         * movq moves them into the target xmm in one op. */
-        if (v->is_float && cg->next_hot_xmm < 16) {
+         * movq moves them into the target xmm in one op.  In this
+         * mode the stack slot is dead (all reads go through the
+         * cache), so skip the GPR→stack spill entirely. */
+        int goes_hot = (v->is_float && cg->next_hot_xmm < 16);
+
+        if (goes_hot) {
             v->hot_xmm = cg->next_hot_xmm++;
             n = emit_movq_xmm_reg(BUF(cg), v->hot_xmm, SYS_V_ARG_REGS[i]);
+            EMIT(cg, n);
+        } else {
+            /* Cold path: store the GPR (f64 bits or int) to the stack. */
+            n = emit_mov_mem_reg(BUF(cg), REG_RBP, v->rbp_off,
+                                 SYS_V_ARG_REGS[i]);
             EMIT(cg, n);
         }
     }

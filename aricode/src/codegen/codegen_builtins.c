@@ -3178,6 +3178,12 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             cg_broadcast_f64(cg, 8,  0x3FF71547652B82FEULL, 0);
             cg_broadcast_f64(cg, 9,  0x3FE62E42FEFA39EFULL, 0);
             cg_broadcast_f64(cg, 10, 0x3FF0000000000000ULL, 0);
+            /* Clamp target for shifted values: vec_exp's 2^k reconstruction
+             * overflows for k ≲ −1023, which corresponds to x ≲ −710.  Clamp
+             * the shifted (buf − max) values to −700 before exp to keep the
+             * polynomial in its valid range.  exp(−700) ≈ 1e−304 which is
+             * effectively zero for softmax normalisation purposes. */
+            cg_broadcast_f64(cg, 13, 0xC085E00000000000ULL, 0); /* −700.0 */
             emit_exp_coeff_stack_setup(cg);
 
             /* ── PASS 1: horizontal max ──────────────────────────────
@@ -3241,6 +3247,10 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             /* ymm0 -= ymm11  (shift by max)  —  vsubpd ymm0, ymm0, ymm11 */
             cg_vex3(cg, 0, 0, 11, 0, 1, 1, 1);
             b = BUF(cg); b[0]=0x5C; b[1]=0xC0 | (0<<3) | (11&7); EMIT(cg, 2);
+            /* Clamp shifted value to ≥ ymm13 (−700) so vec_exp stays in range.
+             *   vmaxpd ymm0, ymm0, ymm13 */
+            cg_vex3(cg, 0, 0, 13, 0, 1, 1, 1);
+            b = BUF(cg); b[0]=0x5F; b[1]=0xC0 | (0<<3) | (13&7); EMIT(cg, 2);
 
             emit_vec_exp_body_avx2(cg);                   /* ymm0 = exp(shifted) */
 
@@ -3281,6 +3291,10 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
                  *   VEX.LIG.F2.0F 5C /r */
                 cg_vex3(cg, 0, 0, 11, 0, 0, 3, 1);
                 b = BUF(cg); b[0] = 0x5C; b[1] = 0xC0 | (0<<3) | (11&7); EMIT(cg, 2);
+                /* Clamp shifted value to ≥ xmm13 low (−700).
+                 *   vmaxsd xmm0, xmm0, xmm13 */
+                cg_vex3(cg, 0, 0, 13, 0, 0, 3, 1);
+                b = BUF(cg); b[0] = 0x5F; b[1] = 0xC0 | (0<<3) | (13&7); EMIT(cg, 2);
                 /* vbroadcastsd ymm0, xmm0 — splat scalar to all 4 lanes. */
                 cg_vex3(cg, 0, 0, 0, 0, 1, 1, 2);
                 b = BUF(cg); b[0] = 0x19; b[1] = 0xC0; EMIT(cg, 2);

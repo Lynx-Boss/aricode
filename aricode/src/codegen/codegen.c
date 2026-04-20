@@ -831,6 +831,30 @@ static void emit_binary_op(CodegenState *cg, const ASTNode *node) {
     int right_is_float = expr_is_float(cg, right);
 
     if (left_is_float || right_is_float) {
+        /* Peephole — `0.0 - x`  ⇒  toggle x's IEEE-754 sign bit.
+         * gcc precomputes a rodata sign mask and xorpd's against it;
+         * aricode has no rodata so we achieve the same effect with
+         * `btc rax, 63` in the integer domain, then resync xmm0 —
+         * 10 bytes + 2 µops instead of the full load-zero / stash /
+         * subsd sequence.  Matches the f64 literal `0.0` on the left;
+         * the int literal 0 would need an explicit i→f64 cast first
+         * and isn't seen in practice from the current parser. */
+        if (strcmp(op, "-") == 0 && left &&
+            left->type == NODE_FLOAT_LITERAL && left->float_val == 0.0) {
+            emit_expression(cg, right);     /* xmm0 = x, rax = x_bits */
+            /* btc rax, 63  —  REX.W 0F BA /7 ib  =  48 0F BA F8 3F */
+            uint8_t *b = BUF(cg);
+            b[0] = 0x48; b[1] = 0x0F; b[2] = 0xBA;
+            b[3] = 0xF8; b[4] = 0x3F;
+            EMIT(cg, 5);
+            /* movq xmm0, rax  —  66 48 0F 6E C0 */
+            b = BUF(cg);
+            b[0] = 0x66; b[1] = 0x48; b[2] = 0x0F;
+            b[3] = 0x6E; b[4] = 0xC0;
+            EMIT(cg, 5);
+            return;
+        }
+
         /* Evaluate left → xmm0 (also rax). */
         emit_expression(cg, left);
 

@@ -4,7 +4,7 @@ Honest, number-backed picture of what the compiler can do, what's
 fast, what's slow, and what's still on the backlog.  Updated after
 each performance or feature push.
 
-Last updated: 2026-04-19 (MNIST AdamW variant at 98.61 %)
+Last updated: 2026-04-20 (CNN variant on MNIST at 98.66 %)
 
 ---
 
@@ -95,7 +95,13 @@ Compiler-side AVX2 tensor builtins (`arr_f64_*`):
 | `arr_f64_softmax`                    |                      |
 | `arr_f64_adam_apply`                 |                      |
 
-### MNIST demo — up to 98.61 % test accuracy
+Conv/pool ship as pure-`.ari` helpers in `aricode-ml/conv2d.ari` —
+`conv2d_im2col`, `conv2d_forward`, `conv2d_backward_weights`,
+`maxpool_2x2_forward` / `_backward`.  They lean on existing AVX2
+array builtins in the hot paths; turning conv2d into a single
+compiler builtin is the next iteration.
+
+### MNIST demo — up to 98.66 % test accuracy
 
 End-to-end digit classifier in `aricode-ml/examples/mnist/`,
 784 → 128 → 10 MLP, He init, full 60 K / 10 K MNIST.  Two variants:
@@ -126,6 +132,22 @@ from 1e-3 down to 1e-5 over 20 epochs.  Uses the fused AVX2
 |  20   | 0.0619    | **98.61 %** |
 
 137 s wall-clock, ~50 KB binary.
+
+**`mnist_cnn.ari`** — one-conv CNN with the same AdamW + smoothing +
+cosine recipe on top.  Architecture: Conv 1→8ch (3×3, pad 1) + ReLU +
+MaxPool 2×2 + FC 1568→64 + ReLU + FC 64→10.  Conv / pool primitives
+live in `aricode-ml/conv2d.ari` as pure-`.ari` helpers calling AVX2
+`arr_f64_add_scaled` / `dot` / `sum`; im2col construction is still
+scalar.
+
+| Epoch | train NLL | test acc |
+|-------|-----------|----------|
+|   1   | 0.2998    | 96.73 %  |
+|   5   | 0.1122    | 98.18 %  |
+|  10   | 0.0925    | **98.66 %** |
+
+124 s wall-clock, ~65 KB binary.  Beats the MLP at half the epoch
+budget with ~2× fewer parameters (101 K vs 203 K).
 
 ---
 

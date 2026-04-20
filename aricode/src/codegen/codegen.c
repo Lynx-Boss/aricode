@@ -43,6 +43,19 @@ void cg_error(CodegenState *cg, const char *fmt, ...) {
     va_end(ap);
 }
 
+/* Fatal bail-out when the emitted program exceeds CODEGEN_MAX_CODE.
+ * By the time we get here we've already overflowed the buffer by a
+ * bounded amount (at most the size of one emitter chunk), but the
+ * stack-allocated CodegenState still has room for a few neighbouring
+ * fields — we stop immediately before deeper corruption spreads. */
+void cg_error_oom(CodegenState *cg) {
+    fprintf(stderr,
+        "aricode: code buffer exhausted (%zu > %d bytes).  "
+        "Raise CODEGEN_MAX_CODE in src/codegen/codegen.h and rebuild.\n",
+        cg->code_size, CODEGEN_MAX_CODE);
+    exit(1);
+}
+
 /* ------------------------------------------------------------------ */
 /*  Forward declarations                                              */
 /* ------------------------------------------------------------------ */

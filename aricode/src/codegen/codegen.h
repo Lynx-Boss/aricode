@@ -22,7 +22,7 @@
 /*  Code buffer                                                       */
 /* ------------------------------------------------------------------ */
 
-#define CODEGEN_MAX_CODE   (64 * 1024)   /* 64 KiB max code size     */
+#define CODEGEN_MAX_CODE   (512 * 1024)  /* 512 KiB max code size    */
 #define CODEGEN_MAX_FUNCS  256           /* max function definitions  */
 #define CODEGEN_MAX_VARS   256           /* max locals per function   */
 
@@ -150,7 +150,18 @@ typedef struct {
 /*  Macros shared with codegen modules                                */
 /* ------------------------------------------------------------------ */
 
-#define EMIT(cg, count) do { (cg)->code_size += (count); } while (0)
+/* Declared in codegen.c; prints a clear message and exits.  Used by
+ * the EMIT macro below as the bail-out path when the program would
+ * overflow the compile-time code buffer. */
+void cg_error_oom(CodegenState *cg);
+
+/* Advance the code cursor.  Bails out fatally (via cg_error_oom) if
+ * the program exceeds the compile-time code buffer — clean error
+ * beats segfault for users hitting the ceiling on large programs. */
+#define EMIT(cg, count) do {                                          \
+    (cg)->code_size += (count);                                       \
+    if ((cg)->code_size > CODEGEN_MAX_CODE) cg_error_oom(cg);         \
+} while (0)
 #define BUF(cg) ((cg)->code + (cg)->code_size)
 
 /* ------------------------------------------------------------------ */

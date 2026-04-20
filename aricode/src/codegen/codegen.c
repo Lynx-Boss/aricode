@@ -2045,6 +2045,54 @@ static void emit_assignment(CodegenState *cg, const ASTNode *node) {
         return;
     }
 
+    /* Cold-int compound-op peephole:
+     *   v = v + imm32    → add [rbp+off], imm32
+     *   v = v - imm32    → sub [rbp+off], imm32
+     *   v = v + other    → mov rcx, [other]; add [rbp+off], rcx
+     *   v = v - other    → mov rcx, [other]; sub [rbp+off], rcx
+     *
+     * Benefits `i += 1`, `sum = sum + x`, `s = batch_end` style loops
+     * on the cold path (any function with a non-xmm-safe call — which
+     * is most loops in practice, e.g. anything calling arr_f64_get).
+     * Hot-var mode already handles these cleanly via register caches,
+     * so we restrict to v->hot_xmm < 0 && v->hot_gp < 0. */
+    if (!v->is_float && v->hot_xmm < 0 && v->hot_gp < 0) {
+        const ASTNode *rhs = node->children[1];
+        if (rhs && rhs->type == NODE_BINARY_OP && rhs->op &&
+            (strcmp(rhs->op, "+") == 0 || strcmp(rhs->op, "-") == 0) &&
+            rhs->child_count >= 2) {
+            const ASTNode *left = rhs->children[0];
+            const ASTNode *right = rhs->children[1];
+            int is_sub = (strcmp(rhs->op, "-") == 0);
+            if (left && left->type == NODE_IDENTIFIER && left->string_val &&
+                strcmp(left->string_val, v->name) == 0) {
+                /* v = v <op> rhs_tail */
+                int n;
+                if (right && right->type == NODE_INT_LITERAL &&
+                    right->int_val >= INT32_MIN && right->int_val <= INT32_MAX) {
+                    int32_t imm = (int32_t)right->int_val;
+                    n = is_sub
+                        ? emit_sub_mem_imm(BUF(cg), REG_RBP, v->rbp_off, imm)
+                        : emit_add_mem_imm(BUF(cg), REG_RBP, v->rbp_off, imm);
+                    EMIT(cg, n);
+                    return;
+                }
+                if (right && right->type == NODE_IDENTIFIER && right->string_val) {
+                    LocalVar *rv = find_local(cg, right->string_val);
+                    if (rv && !rv->is_float && rv->hot_gp < 0 && rv->hot_xmm < 0) {
+                        /* mov rcx, [rbp + rv->rbp_off] ; add/sub [rbp + v->rbp_off], rcx */
+                        n = emit_mov_reg_mem(BUF(cg), REG_RCX, REG_RBP, rv->rbp_off); EMIT(cg, n);
+                        n = is_sub
+                            ? emit_sub_mem_reg(BUF(cg), REG_RBP, v->rbp_off, REG_RCX)
+                            : emit_add_mem_reg(BUF(cg), REG_RBP, v->rbp_off, REG_RCX);
+                        EMIT(cg, n);
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
     /* Evaluate rvalue -> RAX (and xmm0 if float). */
     int rhs_is_float = emit_expression(cg, node->children[1]);
 

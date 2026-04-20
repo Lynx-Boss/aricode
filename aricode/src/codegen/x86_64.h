@@ -218,6 +218,113 @@ static inline int emit_add_reg_imm(uint8_t *buf, int dst, int32_t value) {
 }
 
 /*
+ * ADD [base+disp], imm32  (64-bit memory target)
+ * Short form 83 /0 ib for imm8; full form 81 /0 id otherwise.
+ */
+static inline int emit_add_mem_imm(uint8_t *buf, int base, int32_t disp,
+                                   int32_t value) {
+    int off = 0;
+    buf[off++] = rex(1, 0, 0, reg_ext(base));
+    if (value >= -128 && value <= 127) {
+        buf[off++] = 0x83;
+    } else {
+        buf[off++] = 0x81;
+    }
+    /* Pick modrm disp size (0/8/32).  /0 extension for ADD. */
+    if (disp == 0 && (base & 7) != 5 /* rbp/r13 need explicit disp */) {
+        buf[off++] = modrm(0, 0, base);
+    } else if (disp >= -128 && disp <= 127) {
+        buf[off++] = modrm(1, 0, base);
+        buf[off++] = (uint8_t)(int8_t)disp;
+    } else {
+        buf[off++] = modrm(2, 0, base);
+        memcpy(buf + off, &disp, 4);
+        off += 4;
+    }
+    if (value >= -128 && value <= 127) {
+        buf[off++] = (uint8_t)(int8_t)value;
+    } else {
+        memcpy(buf + off, &value, 4);
+        off += 4;
+    }
+    return off;
+}
+
+/*
+ * ADD [base+disp], src  (64-bit, reg→mem via opcode 01 /r)
+ */
+static inline int emit_add_mem_reg(uint8_t *buf, int base, int32_t disp,
+                                   int src) {
+    int off = 0;
+    buf[off++] = rex(1, reg_ext(src), 0, reg_ext(base));
+    buf[off++] = 0x01;
+    if (disp == 0 && (base & 7) != 5) {
+        buf[off++] = modrm(0, src, base);
+    } else if (disp >= -128 && disp <= 127) {
+        buf[off++] = modrm(1, src, base);
+        buf[off++] = (uint8_t)(int8_t)disp;
+    } else {
+        buf[off++] = modrm(2, src, base);
+        memcpy(buf + off, &disp, 4);
+        off += 4;
+    }
+    return off;
+}
+
+/*
+ * SUB [base+disp], imm32  (64-bit memory target)
+ * 83 /5 ib for imm8; 81 /5 id otherwise.
+ */
+static inline int emit_sub_mem_imm(uint8_t *buf, int base, int32_t disp,
+                                   int32_t value) {
+    int off = 0;
+    buf[off++] = rex(1, 0, 0, reg_ext(base));
+    if (value >= -128 && value <= 127) {
+        buf[off++] = 0x83;
+    } else {
+        buf[off++] = 0x81;
+    }
+    if (disp == 0 && (base & 7) != 5) {
+        buf[off++] = modrm(0, 5, base);
+    } else if (disp >= -128 && disp <= 127) {
+        buf[off++] = modrm(1, 5, base);
+        buf[off++] = (uint8_t)(int8_t)disp;
+    } else {
+        buf[off++] = modrm(2, 5, base);
+        memcpy(buf + off, &disp, 4);
+        off += 4;
+    }
+    if (value >= -128 && value <= 127) {
+        buf[off++] = (uint8_t)(int8_t)value;
+    } else {
+        memcpy(buf + off, &value, 4);
+        off += 4;
+    }
+    return off;
+}
+
+/*
+ * SUB [base+disp], src  (64-bit, reg→mem via opcode 29 /r)
+ */
+static inline int emit_sub_mem_reg(uint8_t *buf, int base, int32_t disp,
+                                   int src) {
+    int off = 0;
+    buf[off++] = rex(1, reg_ext(src), 0, reg_ext(base));
+    buf[off++] = 0x29;
+    if (disp == 0 && (base & 7) != 5) {
+        buf[off++] = modrm(0, src, base);
+    } else if (disp >= -128 && disp <= 127) {
+        buf[off++] = modrm(1, src, base);
+        buf[off++] = (uint8_t)(int8_t)disp;
+    } else {
+        buf[off++] = modrm(2, src, base);
+        memcpy(buf + off, &disp, 4);
+        off += 4;
+    }
+    return off;
+}
+
+/*
  * SUB dst, src  (64-bit)
  * Opcode: REX.W 29 /r
  */

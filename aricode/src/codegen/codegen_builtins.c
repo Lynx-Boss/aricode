@@ -14,6 +14,39 @@
 #include <stdio.h>
 #include <string.h>
 
+/* Emit `movq xmm0, rax` (5 bytes) with the wasted-pair peephole: if
+ * the previous instruction was `movq rax, xmm0` (as produced by any
+ * f64 hot-var identifier read or a float-returning builtin's trailing
+ * sync), rax and xmm0 already hold the same bits — rewind that movq
+ * and skip this one entirely.  Net savings per fired peephole: 10
+ * bytes and 2 µops.
+ *
+ * Correctness: `movq rax, xmm0` does not modify xmm0, so after
+ * rewinding xmm0 still holds the value it had before the movq — which
+ * is exactly what the caller needs.  And the movq we were about to
+ * emit (rax → xmm0) would have been a no-op given xmm0 already has
+ * rax's bits.
+ *
+ * The cold-identifier path ends with `mov rax, [rbp+…]` (7 bytes, not
+ * movq) and doesn't match.  That's fine: the cold path populates both
+ * xmm0 and rax in parallel from memory, so the trailing movq here is
+ * harmless and only modestly redundant (one extra µop, no savings
+ * from attempting to elide it without also tracking the preceding
+ * movsd xmm0 pair — left for a future peephole). */
+static void emit_sync_xmm0_from_rax_smart(CodegenState *cg) {
+    if (cg->code_size >= 5) {
+        const uint8_t *p = cg->code + cg->code_size - 5;
+        if (p[0] == 0x66 && p[1] == 0x48 && p[2] == 0x0F &&
+            p[3] == 0x7E && p[4] == 0xC0) {
+            cg->code_size -= 5;
+            return;
+        }
+    }
+    uint8_t *b = BUF(cg);
+    b[0] = 0x66; b[1] = 0x48; b[2] = 0x0F; b[3] = 0x6E; b[4] = 0xC0;
+    EMIT(cg, 5);
+}
+
 /* =====================================================================
  *  SSE2 minimax polynomial helpers for sin / cos
  * =====================================================================
@@ -669,8 +702,10 @@ static void emit_sincos_octant_reduce(CodegenState *cg) {
 static void emit_sincos_body(CodegenState *cg, int is_cos) {
     int pn; uint8_t *b;
 
-    /* movq xmm0, rax — load x into xmm0 */
-    b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xC0; EMIT(cg, 5);
+    /* movq xmm0, rax — load x into xmm0.
+     * Elide the pair if the preceding insn was `movq rax, xmm0`
+     * (xmm0 already holds x bits from a hot-var read). */
+    emit_sync_xmm0_from_rax_smart(cg);
 
     /* --- Quick-path: if |x| <= π/4, skip octant reduction entirely. ---
      * Common in ML/graphics where angles are already pre-normalised.
@@ -2576,8 +2611,9 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
         if (strcmp(name, "math_sqrt") == 0 && argc == 1) {
             emit_expression(cg, node->children[1]); /* x → xmm0 via RAX bits */
             int pn; uint8_t *b;
-            /* movq xmm0, rax */
-            b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xC0; EMIT(cg, 5);
+            /* movq xmm0, rax — or elide the pair if preceded by
+             * the inverse (hot-var f64 reads, builtin f64 returns). */
+            emit_sync_xmm0_from_rax_smart(cg);
             /* sqrtsd xmm0, xmm0 */
             pn = emit_sqrtsd(BUF(cg), 0, 0); EMIT(cg, pn);
             /* movq rax, xmm0 */
@@ -2629,8 +2665,9 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
                  * 3. exp(r) = 1 + r + r^2 * (P1 + r*(P2 + r*(P3 + r*(P4 + r*P5))))
                  * 4. result = exp(r) * 2^k  via IEEE 754 bit construction */
 
-                /* movq xmm0, rax  — load x */
-                b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xC0; EMIT(cg, 5);
+                /* movq xmm0, rax  — load x  (or elide the pair if
+                 * preceded by `movq rax, xmm0` from a hot-var read). */
+                emit_sync_xmm0_from_rax_smart(cg);
 
                 /* === Step 1: k = round(x * log2e) === */
                 /* xmm1 = x * log2e */
@@ -2736,8 +2773,9 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
                  * 3. log(1+f) = 2*s + 2*s^3*(1/3 + s^2*(1/5 + s^2*(1/7 + ...)))
                  * 4. result = k * ln2 + log(1+f) */
 
-                /* movq xmm0, rax  — load x bits (also keep in rax) */
-                b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xC0; EMIT(cg, 5);
+                /* movq xmm0, rax  — load x bits (also keep in rax).
+                 * Elide the pair if the preceding insn was movq rax, xmm0. */
+                emit_sync_xmm0_from_rax_smart(cg);
 
                 /* === Step 1: Extract k and m from IEEE 754 bits === */
                 /* mov rcx, rax */
@@ -2916,8 +2954,8 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
              * Avoids catastrophic cancellation when exp(x) ≈ 1 for small x. */
             emit_expression(cg, node->children[1]);
             int pn; uint8_t *b;
-            /* movq xmm0, rax (x) */
-            b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xC0; EMIT(cg, 5);
+            /* movq xmm0, rax (x) — elide pair with preceding movq rax, xmm0. */
+            emit_sync_xmm0_from_rax_smart(cg);
             /* Horner from innermost: start with x/5040 */
             /* xmm1 = 1/5040 = 1.984126984126984e-04 */
             uint64_t c7 = 0x3F2A01A01A01A01AULL;

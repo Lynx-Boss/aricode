@@ -345,6 +345,66 @@ EOF
 run_test "call_on_both_sides" /tmp/edge_nested_call_binop.ari "12.0000" \
   "stash fallback on right, contract on left"
 
+# #10b  `movq xmm0, rax` elision after hot-var f64 read feeding a math
+# builtin.  emit_sync_xmm0_from_rax_smart rewinds the preceding
+# `movq rax, xmm0` (emitted by emit_identifier for hot-var f64) and
+# skips the inverse load, saving 10 bytes per call.  If the peephole
+# ever rewinds when it shouldn't, xmm0 holds the wrong value and the
+# sqrt/exp/log result drifts.  Use a function that has NO unsafe
+# calls in the body so the local `x` pins to xmm8-15 (hot-var mode).
+cat > /tmp/edge_hotvar_math_sqrt.ari << 'EOF'
+fn comp(x: f64) -> f64 {
+    // Hot-var candidate: f64 local, no unsafe calls.
+    let v: f64 = x + 0.0;   // forces `v` to be a live f64 local
+    return math_sqrt(v);
+}
+fn main() -> i32 {
+    let r: f64 = comp(9.0);
+    print_f64(r, 4);         // 3.0000
+    let r2: f64 = comp(16.0) + 1.0;
+    print_f64(r2, 4);        // 5.0000 (tests xmm0 sync after builtin)
+    return 0;
+}
+EOF
+run_test "hotvar_math_sqrt_peephole" /tmp/edge_hotvar_math_sqrt.ari "3.0000
+5.0000" "elide movq xmm0,rax pair for hot-var f64 → math_sqrt"
+
+# #10c  Same test for math_exp — exercises the SSE exp path's initial
+# xmm0 load, which also goes through emit_sync_xmm0_from_rax_smart.
+cat > /tmp/edge_hotvar_math_exp.ari << 'EOF'
+fn comp(x: f64) -> f64 {
+    let v: f64 = x + 0.0;
+    return math_exp(v);
+}
+fn main() -> i32 {
+    let r: f64 = comp(0.0);
+    print_f64(r, 4);          // exp(0) = 1.0000
+    let r2: f64 = comp(1.0) - 2.0;
+    print_f64(r2, 4);          // e - 2 ≈ 0.7183
+    return 0;
+}
+EOF
+run_test "hotvar_math_exp_peephole" /tmp/edge_hotvar_math_exp.ari "1.0000
+0.7182"
+
+# #10d  math_log over a hot-var — the SSE log path also consumes the
+# pre-loaded xmm0 via emit_sync_xmm0_from_rax_smart.
+cat > /tmp/edge_hotvar_math_log.ari << 'EOF'
+fn comp(x: f64) -> f64 {
+    let v: f64 = x + 0.0;
+    return math_log(v);
+}
+fn main() -> i32 {
+    let r: f64 = comp(1.0);
+    print_f64(r, 4);          // log(1) = 0.0000
+    let r2: f64 = comp(2.718281828459045) + 1.0;
+    print_f64(r2, 4);          // log(e) + 1 ≈ 2.0000
+    return 0;
+}
+EOF
+run_test "hotvar_math_log_peephole" /tmp/edge_hotvar_math_log.ari "0.0000
+2.0000"
+
 # ────────────────────────────────────────────────────────────────────
 echo -e "\n${BOLD}--- Hot-var register allocation ---${RESET}"
 

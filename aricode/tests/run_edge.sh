@@ -271,6 +271,27 @@ run_test "vec_log1p_moderate" /tmp/edge_vec_log1p.ari "0.000000
 2.3025
 0.9999"
 
+# #7f  arr_f64_copy_at — slice copy with vec + scalar tail.
+cat > /tmp/edge_copy_at.ari << 'EOF'
+fn main() -> i32 {
+    // src = 0, 1, 2, ..., 9
+    let src: i32 = arr_f64_new(10);
+    let i: i32 = 0;
+    while (i < 10) { arr_f64_set(src, i, int_to_float(i)); i += 1; }
+
+    // Copy src[3..8] (5 elements: one vec step + one scalar tail element)
+    let dst: i32 = arr_f64_new(5);
+    arr_f64_copy_at(src, 3, dst);
+    print_f64(arr_f64_get(dst, 0), 2);   // 3.00
+    print_f64(arr_f64_get(dst, 3), 2);   // 6.00 (last of vec)
+    print_f64(arr_f64_get(dst, 4), 2);   // 7.00 (scalar tail)
+    return 0;
+}
+EOF
+run_test "arr_f64_copy_at_slice" /tmp/edge_copy_at.ari "3.00
+6.00
+7.00" "vec + scalar tail copy from an offset within src"
+
 # #7e  arr_f64_fill — AVX2 broadcast-fill across vec + scalar tail.
 cat > /tmp/edge_fill.ari << 'EOF'
 fn main() -> i32 {

@@ -4847,6 +4847,59 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             pn = emit_xor_reg_reg(BUF(cg), REG_RAX, REG_RAX); EMIT(cg, pn);
             return 1;
         }
+        if (strcmp(name, "arr_f64_copy_at") == 0 && argc == 3) {
+            /* Copy `dst.length` f64 elements from src[src_offset..] into
+             * dst[0..dst.length].  Four elements per vmovupd, scalar
+             * tail for the n % 4 remainder.
+             *
+             * Typical use: pull a per-channel slice out of a flat
+             * [C, N] buffer to feed it into arr_f64_sum / arr_f64_dot,
+             * replacing a scalar for-loop.  conv2d_backward_weights is
+             * the first caller; any per-row reduction in matrix-shaped
+             * arrays benefits too. */
+            emit_expression(cg, node->children[3]); /* dst */
+            int pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
+            emit_expression(cg, node->children[2]); /* src_offset */
+            pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
+            emit_expression(cg, node->children[1]); /* src → RAX */
+            uint8_t *b;
+
+            /* Pop args into their final registers. */
+            pn = emit_pop(BUF(cg), REG_RSI); EMIT(cg, pn);   /* src_offset */
+            pn = emit_pop(BUF(cg), REG_RDI); EMIT(cg, pn);   /* dst */
+
+            /* Adjust src by src_offset * 8 so we can use a clean
+             * [src_ptr + idx*8] address mode.
+             *   shl rsi, 3 : 48 C1 E6 03
+             *   add rax, rsi : 48 01 F0
+             *   mov rsi, rax : 48 89 C6   (keep src_ptr in RSI) */
+            b = BUF(cg); b[0]=0x48; b[1]=0xC1; b[2]=0xE6; b[3]=0x03; EMIT(cg, 4);
+            b = BUF(cg); b[0]=0x48; b[1]=0x01; b[2]=0xF0; EMIT(cg, 3);
+            pn = emit_mov_reg_reg(BUF(cg), REG_RSI, REG_RAX); EMIT(cg, pn);
+
+            /* n = dst[-8], n_vec = n & ~3. */
+            pn = emit_mov_reg_mem(BUF(cg), REG_RCX, REG_RDI, -8); EMIT(cg, pn);
+            pn = emit_mov_reg_reg(BUF(cg), REG_RDX, REG_RCX); EMIT(cg, pn);
+            b = BUF(cg); b[0]=0x48; b[1]=0x83; b[2]=0xE2; b[3]=0xFC; EMIT(cg, 4);
+
+            /* Loop index in RAX (caller-saved, no preserve needed). */
+            pn = emit_xor_reg_reg(BUF(cg), REG_RAX, REG_RAX); EMIT(cg, pn);
+
+            CgCountedLoop vec = cg_loop_begin(cg, REG_RAX, REG_RDX);
+            cg_vmovupd_ymm_base_idx(cg, 0, REG_RSI, REG_RAX, 0x10);
+            cg_vmovupd_ymm_base_idx(cg, 0, REG_RDI, REG_RAX, 0x11);
+            cg_loop_end(cg, vec, 4);
+
+            CgCountedLoop tail = cg_loop_begin(cg, REG_RAX, REG_RCX);
+            cg_movsd_xmm_base_idx(cg, 0, REG_RSI, REG_RAX, 0x10);
+            cg_movsd_xmm_base_idx(cg, 0, REG_RDI, REG_RAX, 0x11);
+            cg_loop_end(cg, tail, 1);
+
+            /* vzeroupper + return 0 */
+            b = BUF(cg); b[0]=0xC5; b[1]=0xF8; b[2]=0x77; EMIT(cg, 3);
+            pn = emit_xor_reg_reg(BUF(cg), REG_RAX, REG_RAX); EMIT(cg, pn);
+            return 1;
+        }
         if (strcmp(name, "arr_f64_fill") == 0 && argc == 2) {
             /* Fill an f64 array with a scalar value.
              *   arr_f64_fill(buf, value) — buf[i] = value for i in [0, n).

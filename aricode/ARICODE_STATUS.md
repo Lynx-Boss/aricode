@@ -4,7 +4,7 @@ Honest, number-backed picture of what the compiler can do, what's
 fast, what's slow, and what's still on the backlog.  Updated after
 each performance or feature push.
 
-Last updated: 2026-04-20 (CNN variant on MNIST at 98.66 %)
+Last updated: 2026-04-20 (MNIST CNN at 98.66 %, 22 % faster than its own pure-`.ari` baseline)
 
 ---
 
@@ -83,18 +83,19 @@ Compiler-side AVX2 tensor builtins (`arr_f64_*`):
 
 | Shipped        | Not shipped yet |
 |----------------|------------------|
-| `arr_f64_new`, `get`, `set`          | `arr_f64_conv2d`     |
-| `arr_f64_matvec`, `matvec_T`         | `arr_f64_max_pool`   |
-| `arr_f64_outer_accum`                |                      |
-| `arr_f64_add_scaled`, `scale`        |                      |
-| `arr_f64_mul`, `sub`                 |                      |
-| `arr_f64_dot`, `sum`, `sum_kahan`    |                      |
-| `arr_f64_relu`, `sigmoid`, `tanh`    |                      |
-| `arr_f64_exp`, `arr_f64_expm1`       |                      |
-| `arr_f64_log`, `arr_f64_log1p`       |                      |
-| `arr_f64_softmax`                    |                      |
-| `arr_f64_adam_apply`                 |                      |
-| `arr_f64_conv2d_3x3_p1`              |                      |
+| `arr_f64_new`, `get`, `set`          | `arr_f64_max_pool`           |
+| `arr_f64_matvec`, `matvec_T`         | `arr_f64_conv2d` (C_in > 1)  |
+| `arr_f64_outer_accum`                |                              |
+| `arr_f64_add_scaled`, `scale`        |                              |
+| `arr_f64_mul`, `sub`                 |                              |
+| `arr_f64_dot`, `sum`, `sum_kahan`    |                              |
+| `arr_f64_relu`, `sigmoid`, `tanh`    |                              |
+| `arr_f64_exp`, `arr_f64_expm1`       |                              |
+| `arr_f64_log`, `arr_f64_log1p`       |                              |
+| `arr_f64_softmax`                    |                              |
+| `arr_f64_fill`, `copy_at`, `copy_slice` |                           |
+| `arr_f64_adam_apply`                 |                              |
+| `arr_f64_conv2d_3x3_p1`              |                              |
 
 `arr_f64_conv2d_3x3_p1(padded_input, weights, bias, output, C_out)`
 is a direct-convolution AVX2 kernel hardcoded for MNIST-size CNNs
@@ -104,11 +105,16 @@ weights once per output channel, then fuses 9 `vfmadd231pd` per
 4-wide output chunk — 28 rows × 7 chunks × 8 channels × 9 FMAs per
 sample.
 
+The three bulk memory primitives — `arr_f64_fill(buf, value)`,
+`arr_f64_copy_at(src, src_offset, dst)`, `arr_f64_copy_slice(src,
+src_offset, dst, dst_offset, n)` — replace the scalar bias-broadcast
+and im2col construction loops that used to dominate the CNN wall
+clock.  Each runs 4 f64 per vmovupd with a scalar tail.
+
 Pool and backward stay as pure-`.ari` helpers in
 `aricode-ml/conv2d.ari` (`conv2d_im2col`, `conv2d_backward_weights`,
-`maxpool_2x2_forward` / `_backward`).  A `conv2d_forward_fast`
-wrapper composes `conv2d_pad_28_to_30` + `arr_f64_conv2d_3x3_p1` for
-a 1-liner drop-in.
+`maxpool_2x2_forward` / `_backward`).  `conv2d_forward` internally
+composes `conv2d_pad_28_to_30` + `arr_f64_conv2d_3x3_p1`.
 
 ### MNIST demo — up to 98.66 % test accuracy
 
@@ -143,11 +149,11 @@ from 1e-3 down to 1e-5 over 20 epochs.  Uses the fused AVX2
 137 s wall-clock, ~50 KB binary.
 
 **`mnist_cnn.ari`** — one-conv CNN with the same AdamW + smoothing +
-cosine recipe on top.  Architecture: Conv 1→8ch (3×3, pad 1) + ReLU +
-MaxPool 2×2 + FC 1568→64 + ReLU + FC 64→10.  Conv / pool primitives
-live in `aricode-ml/conv2d.ari` as pure-`.ari` helpers calling AVX2
-`arr_f64_add_scaled` / `dot` / `sum`; im2col construction is still
-scalar.
+cosine recipe.  Architecture: Conv 1→8ch (3×3, pad 1) + ReLU +
+MaxPool 2×2 + FC 1568→64 + ReLU + FC 64→10.  Conv forward uses the
+AVX2 `arr_f64_conv2d_3x3_p1` builtin; im2col + backward_weights
+use the `arr_f64_fill` / `copy_slice` / `copy_at` bulk-memory
+builtins for what used to be scalar inner loops.
 
 | Epoch | train NLL | test acc |
 |-------|-----------|----------|
@@ -155,8 +161,20 @@ scalar.
 |   5   | 0.1122    | 98.18 %  |
 |  10   | 0.0925    | **98.66 %** |
 
-124 s wall-clock, ~65 KB binary.  Beats the MLP at half the epoch
+**97 s wall-clock**, ~65 KB binary.  Beats the MLP at half the epoch
 budget with ~2× fewer parameters (101 K vs 203 K).
+
+Wall-clock trajectory across the session's CNN AVX2 work
+(identical training trajectory / final accuracy in every row):
+
+| Stage                                                          | Time  | Δ        |
+|----------------------------------------------------------------|------:|---------:|
+| Pure-`.ari` conv forward + scalar im2col                       | 124 s | baseline |
+| + `arr_f64_conv2d_3x3_p1` AVX2 forward                         | 111 s | −10.5 %  |
+| + `arr_f64_copy_at` in `conv2d_backward_weights`               | 106 s | − 4.5 %  |
+| + `arr_f64_fill` + `copy_slice` in `conv2d_im2col`             | 101 s | − 4.7 %  |
+| + dropped wasted `conv2d_im2col` in inference loop             |  97 s | − 4.0 %  |
+| **Total**                                                      |       | **−22 %** |
 
 ---
 
@@ -245,7 +263,11 @@ cd aricode-stdlib/aricode-ml/examples/mnist
 aric mnist.ari -o mnist
 ./mnist                                 # 33 s, 97.15 % accuracy
 
-# Or AdamW variant (98.61 %)
+# Or AdamW MLP variant (98.61 %)
 aric mnist_adam.ari -o mnist_adam
 ./mnist_adam                            # 137 s, 98.61 % accuracy
+
+# Or CNN variant (98.66 %)
+aric mnist_cnn.ari -o mnist_cnn
+./mnist_cnn                             #  97 s, 98.66 % accuracy
 ```

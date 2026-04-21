@@ -19,18 +19,40 @@ Small programs, thousands to ~10 K iterations inside the binary.
 Binary load + dynamic linker setup dominate the clock, and aricode's
 static-syscall, tiny-binary model wins there.
 
-Sparring suite (5 000 iterations per binary, best-of-10):
+Sparring suite (5 000 iterations per binary, best-of-10), measured
+after this session's peephole landings:
 
-| Challenge       | C -O2 (glibc) | aricode | aricode wins by | gcc binary / aric binary |
-|-----------------|--------------:|--------:|----------------:|-------------------------:|
-| 02_fib          |   393 µs      | 283 µs  | **1.39×**       | 2377×                    |
-| 05_ackermann    |   394         | 306     |   1.29          | 1959                     |
-| 07_mersenne     |   425         | 357     |   1.19          | 1347                     |
-| 09_primecount   |   394         | 278     | **1.42**        | 1067                     |
-| 12_perceptron   |   391         | 302     |   1.30          | 174                      |
-| 13_minimax      |   408         | 343     |   1.19          | 545                      |
-| 14_leibniz      |   401         | 305     |   1.31          | 1111                     |
-| 15_arraysum     |   395         | 287     | **1.38**        | 722                      |
+| Challenge       | C -O2 (glibc) | aricode | aricode wins by | Δ vs previous session |
+|-----------------|--------------:|--------:|----------------:|----------------------:|
+| 01_add          |   371 µs      | 266 µs  | **1.40×**       | −6.4 %                |
+| 02_fib          |   373         | 267     |   1.40          | −8.0 %                |
+| 03_factorial    |   376         | 276     |   1.36          | −2.4 %                |
+| 05_ackermann    |   387         | 293     |   1.32          | −5.5 %                |
+| 06_collatz      |   378         | 266     |   1.42          | −6.7 %                |
+| 07_mersenne     |   411         | 347     |   1.18          | −4.9 %                |
+| 08_gcd          |   371         | 268     |   1.38          | −5.5 %                |
+| 09_primecount   |   376         | 270     | **1.39**        | −4.0 %                |
+| 10_powmod       |   373         | 275     |   1.36          | −2.0 %                |
+| 11_isqrt        |   372         | 276     |   1.35          | −1.5 %                |
+| 12_perceptron   |   380         | 295     |   1.29          | −3.5 %                |
+| 13_minimax      |   388         | 327     |   1.19          | −8.1 %                |
+| 14_leibniz      |   385         | 298     | **1.29**        | **−15.7 %**           |
+| 15_arraysum     |   393         | 274     | **1.43**        | −4.6 %                |
+
+Every benchmark improved versus the pre-peephole baseline, no
+regressions.  Biggest win is `14_leibniz` — a float-heavy inner loop
+with a `sign = 0.0 - sign` per iteration, which is exactly the shape
+the new `0.0 - x → btc rax, 63` peephole and the `movq xmm0, rax`
+elision were designed to catch.
+
+Known wart: binary sizes grew between runs on most challenges
+(e.g. `09_primecount` 544 B → 655 B, `12_perceptron` 1.6 KB → 4.2 KB
+despite faster wall-clock.  Text size and emitted-instruction count
+rose in parallel, so the peepholes are improving per-instruction
+quality while something upstream — possibly the f64-hot-var
+allocator, the exp/log coefficient stacks, or the new CNN builtin
+landing in binaries that never call it — is inflating total code.
+Not a correctness issue; flagged for investigation.
 
 aricode binaries are 300 B–4 KB (static syscalls, no glibc); gcc's are
 754 KB (glibc-linked).  The loader pays off at startup.

@@ -4847,6 +4847,55 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             pn = emit_xor_reg_reg(BUF(cg), REG_RAX, REG_RAX); EMIT(cg, pn);
             return 1;
         }
+        if (strcmp(name, "arr_f64_fill") == 0 && argc == 2) {
+            /* Fill an f64 array with a scalar value.
+             *   arr_f64_fill(buf, value) — buf[i] = value for i in [0, n).
+             *
+             * Hot path: 4 f64 per vmovupd using a broadcast ymm0.  Scalar
+             * tail handles the n % 4 remainder.
+             *
+             * Clobbers: RAX, RCX, RDX, RSI, RDI, ymm0.  No callee-saved
+             * registers touched.
+             */
+            emit_expression(cg, node->children[2]); /* value (f64 bits) → RAX */
+            int pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
+            emit_expression(cg, node->children[1]); /* buf → RAX */
+            uint8_t *b;
+
+            /* mov rdi, rax — buf base */
+            pn = emit_mov_reg_reg(BUF(cg), REG_RDI, REG_RAX); EMIT(cg, pn);
+            /* pop rdx — value bits */
+            pn = emit_pop(BUF(cg), REG_RDX); EMIT(cg, pn);
+            /* mov rcx, [rdi - 8] — n */
+            pn = emit_mov_reg_mem(BUF(cg), REG_RCX, REG_RDI, -8); EMIT(cg, pn);
+            /* Broadcast value into ymm0.
+             *   movq xmm0, rdx            ; 66 48 0F 6E C2
+             *   vbroadcastsd ymm0, xmm0   ; C4 E2 7D 19 C0 */
+            b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xC2; EMIT(cg, 5);
+            b = BUF(cg); b[0]=0xC4; b[1]=0xE2; b[2]=0x7D; b[3]=0x19; b[4]=0xC0; EMIT(cg, 5);
+
+            /* rdx = n & ~3 */
+            pn = emit_mov_reg_reg(BUF(cg), REG_RDX, REG_RCX); EMIT(cg, pn);
+            b = BUF(cg); b[0]=0x48; b[1]=0x83; b[2]=0xE2; b[3]=0xFC; EMIT(cg, 4);
+
+            /* xor esi, esi — i = 0 */
+            pn = emit_xor_reg_reg(BUF(cg), REG_RSI, REG_RSI); EMIT(cg, pn);
+
+            /* ── Vector loop ── */
+            CgCountedLoop vec = cg_loop_begin(cg, REG_RSI, REG_RDX);
+            cg_vmovupd_ymm_base_idx(cg, 0, REG_RDI, REG_RSI, 0x11);
+            cg_loop_end(cg, vec, 4);
+
+            /* ── Scalar tail ── */
+            CgCountedLoop tail = cg_loop_begin(cg, REG_RSI, REG_RCX);
+            cg_movsd_xmm_base_idx(cg, 0, REG_RDI, REG_RSI, 0x11);
+            cg_loop_end(cg, tail, 1);
+
+            /* vzeroupper + return 0 */
+            b = BUF(cg); b[0]=0xC5; b[1]=0xF8; b[2]=0x77; EMIT(cg, 3);
+            pn = emit_xor_reg_reg(BUF(cg), REG_RAX, REG_RAX); EMIT(cg, pn);
+            return 1;
+        }
         if (strcmp(name, "arr_f64_scale") == 0 && argc == 2) {
             /* Multiply all elements by f64 factor */
             emit_expression(cg, node->children[2]); /* factor f64 bits → RAX */

@@ -292,6 +292,7 @@ static AriType *builtin_return_type(const char *name) {
         {"arr_f64_sum_kahan", TYPE_F64},
         {"arr_f64_dot",     TYPE_F64},
         {"arr_f64_scale",   TYPE_I32},
+        {"arr_f64_fill",    TYPE_I32},
         {"arr_f64_matvec",  TYPE_I32},
         {"arr_f64_add_scaled", TYPE_I32},
         {"arr_f64_relu",    TYPE_I32},

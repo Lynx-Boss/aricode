@@ -271,6 +271,26 @@ run_test "vec_log1p_moderate" /tmp/edge_vec_log1p.ari "0.000000
 2.3025
 0.9999"
 
+# #7e  arr_f64_fill — AVX2 broadcast-fill across vec + scalar tail.
+cat > /tmp/edge_fill.ari << 'EOF'
+fn main() -> i32 {
+    // n = 10 exercises 2 vec iterations (8 f64) + 2 scalar tail.
+    let a: i32 = arr_f64_new(10);
+    arr_f64_fill(a, 3.14);
+    print_f64(arr_f64_get(a, 0), 4);   // 3.1400 (vec lane)
+    print_f64(arr_f64_get(a, 7), 4);   // 3.1400 (last of vec)
+    print_f64(arr_f64_get(a, 9), 4);   // 3.1400 (scalar tail)
+    // Fill with 0 — AVX2 vmovupd of a broadcasted zero.
+    arr_f64_fill(a, 0.0);
+    print_f64(arr_f64_get(a, 9), 4);   // 0.0000
+    return 0;
+}
+EOF
+run_test "arr_f64_fill_spot" /tmp/edge_fill.ari "3.1400
+3.1400
+3.1400
+0.0000" "broadcast-fill including the n % 4 scalar tail"
+
 # #7d  arr_f64_conv2d_3x3_p1 — spot-check two known-output cases.
 # Input is pre-padded (30×30).  Caller owns padding; this builtin is
 # the straight-line AVX2 convolution.

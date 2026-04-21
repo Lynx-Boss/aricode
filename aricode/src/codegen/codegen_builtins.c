@@ -14,31 +14,26 @@
 #include <stdio.h>
 #include <string.h>
 
-/* Emit `movq xmm0, rax` (5 bytes) with the wasted-pair peephole: if
- * the previous instruction was `movq rax, xmm0` (as produced by any
- * f64 hot-var identifier read or a float-returning builtin's trailing
- * sync), rax and xmm0 already hold the same bits — rewind that movq
- * and skip this one entirely.  Net savings per fired peephole: 10
- * bytes and 2 µops.
+/* Emit `movq xmm0, rax` (5 bytes) with a wasted-emit peephole: when
+ * the previous instruction was `movq rax, xmm0`, rax and xmm0 already
+ * hold the same bits, so the upcoming rax→xmm0 move is a no-op.  Skip
+ * it and save 5 bytes + 1 µop per fired peephole.
  *
- * Correctness: `movq rax, xmm0` does not modify xmm0, so after
- * rewinding xmm0 still holds the value it had before the movq — which
- * is exactly what the caller needs.  And the movq we were about to
- * emit (rax → xmm0) would have been a no-op given xmm0 already has
- * rax's bits.
+ * We do NOT rewind the preceding `movq rax, xmm0` here: callers that
+ * read rax after this point (math_log / math_sin / math_cos all do
+ * `mov rcx, rax` to unpack IEEE bits) would see stale contents if the
+ * sync were rolled back.  Keeping rax populated is cheap (5 bytes)
+ * and correctness-preserving.
  *
- * The cold-identifier path ends with `mov rax, [rbp+…]` (7 bytes, not
- * movq) and doesn't match.  That's fine: the cold path populates both
- * xmm0 and rax in parallel from memory, so the trailing movq here is
- * harmless and only modestly redundant (one extra µop, no savings
- * from attempting to elide it without also tracking the preceding
- * movsd xmm0 pair — left for a future peephole). */
+ * The cold-identifier path ends with `mov rax, [rbp+…]` and doesn't
+ * match either pattern — fine, the cold path populates both lanes in
+ * parallel from memory. */
 static void emit_sync_xmm0_from_rax_smart(CodegenState *cg) {
     if (cg->code_size >= 5) {
         const uint8_t *p = cg->code + cg->code_size - 5;
         if (p[0] == 0x66 && p[1] == 0x48 && p[2] == 0x0F &&
             p[3] == 0x7E && p[4] == 0xC0) {
-            cg->code_size -= 5;
+            /* xmm0 already equals rax bit-for-bit; skip the reload. */
             return;
         }
     }
@@ -3759,6 +3754,355 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             pn = emit_xor_reg_reg(BUF(cg), REG_RAX, REG_RAX); EMIT(cg, pn);
             return 1;
         }
+        if (strcmp(name, "arr_f64_conv2d_3x3_p1") == 0 && argc == 5) {
+            /* AVX2 direct convolution, hardcoded for MNIST-size CNNs:
+             *   Input    : C_in = 1, 28 × 28 spatial, caller pre-pads to
+             *              30 × 30 (zero borders).  Length 900.
+             *   Kernel   : 3 × 3, stride 1, pad 1.
+             *   Output   : [C_out, 28, 28] flat, length 784 · C_out.
+             *   Weights  : [C_out, 9] flat, length 9 · C_out.
+             *   Bias     : [C_out] .
+             *
+             * Algorithm:
+             *   for c in [0, C_out):
+             *     pre-broadcast weights[c*9 .. c*9+8]  →  ymm0..ymm8
+             *     pre-broadcast bias[c]                →  ymm9
+             *     out_base_c = output + c · 784
+             *     for y in [0, 28):
+             *       row0 = padded + (y+0)*30
+             *       row1 = padded + (y+1)*30
+             *       row2 = padded + (y+2)*30
+             *       out_row = out_base_c + y · 28
+             *       for x_start in {0, 4, ..., 24}:
+             *         acc = bias  (ymm9)
+             *         for each of 9 kernel positions:
+             *           load 4 inputs, FMA with broadcast weight
+             *         store 4 outputs
+             *
+             * Register plan (after prolog):
+             *   RDI = padded base                RCX = y counter
+             *   R8  = weights base               RDX = x_start_bytes
+             *   RBX = bias base (callee-saved)   RAX = c counter
+             *   R9  = output base                RSI = output_c_base
+             *   R10 = C_out count
+             *   R11 = transient (weights_c_base → output_row_base)
+             *   R12 = padded row 0 base (callee-saved)
+             *   R13 = padded row 1 base (callee-saved)
+             *   R14 = padded row 2 base (callee-saved)
+             *
+             *   ymm0..ymm8  = 9 broadcast weights
+             *   ymm9        = broadcast bias
+             *   ymm10       = 4-wide accumulator
+             *   ymm11       = 4-wide input chunk
+             *
+             * Stack after 4 arg pushes + 4 callee-saved pushes:
+             *   [rsp+0]   = r14   [rsp+8]   = r13   [rsp+16]  = r12
+             *   [rsp+24]  = rbx   [rsp+32]  = weights
+             *   [rsp+40]  = bias  [rsp+48]  = output  [rsp+56]  = C_out
+             */
+            emit_expression(cg, node->children[5]); /* C_out */
+            int pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
+            emit_expression(cg, node->children[4]); /* output */
+            pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
+            emit_expression(cg, node->children[3]); /* bias */
+            pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
+            emit_expression(cg, node->children[2]); /* weights */
+            pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
+            emit_expression(cg, node->children[1]); /* padded_input → RAX */
+            uint8_t *b;
+
+            /* Save callee-saved registers: rbx, r12, r13, r14 */
+            pn = emit_push(BUF(cg), REG_RBX); EMIT(cg, pn);
+            /* push r12: 41 54 */
+            b = BUF(cg); b[0]=0x41; b[1]=0x54; EMIT(cg, 2);
+            /* push r13: 41 55 */
+            b = BUF(cg); b[0]=0x41; b[1]=0x55; EMIT(cg, 2);
+            /* push r14: 41 56 */
+            b = BUF(cg); b[0]=0x41; b[1]=0x56; EMIT(cg, 2);
+
+            /* mov rdi, rax — padded input base */
+            pn = emit_mov_reg_reg(BUF(cg), REG_RDI, REG_RAX); EMIT(cg, pn);
+
+            /* Load remaining args from stack.
+             * mov r8,  [rsp+32]  — weights: 4C 8B 44 24 20 */
+            b = BUF(cg); b[0]=0x4C; b[1]=0x8B; b[2]=0x44; b[3]=0x24; b[4]=0x20; EMIT(cg, 5);
+            /* mov rbx, [rsp+40]  — bias:    48 8B 5C 24 28 */
+            b = BUF(cg); b[0]=0x48; b[1]=0x8B; b[2]=0x5C; b[3]=0x24; b[4]=0x28; EMIT(cg, 5);
+            /* mov r9,  [rsp+48]  — output:  4C 8B 4C 24 30 */
+            b = BUF(cg); b[0]=0x4C; b[1]=0x8B; b[2]=0x4C; b[3]=0x24; b[4]=0x30; EMIT(cg, 5);
+            /* mov r10, [rsp+56]  — C_out:   4C 8B 54 24 38 */
+            b = BUF(cg); b[0]=0x4C; b[1]=0x8B; b[2]=0x54; b[3]=0x24; b[4]=0x38; EMIT(cg, 5);
+
+            /* xor eax, eax  — c = 0 */
+            pn = emit_xor_reg_reg(BUF(cg), REG_RAX, REG_RAX); EMIT(cg, pn);
+
+            /* ═══ Channel loop ═══════════════════════════════════════ */
+            size_t channel_loop_start = cg->code_size;
+            /* cmp rax, r10 : 4C 39 D0 */
+            b = BUF(cg); b[0]=0x4C; b[1]=0x39; b[2]=0xD0; EMIT(cg, 3);
+            /* jge .done (rel32 placeholder) */
+            size_t jge_done_pos = cg->code_size;
+            b = BUF(cg); b[0]=0x0F; b[1]=0x8D; b[2]=0; b[3]=0; b[4]=0; b[5]=0; EMIT(cg, 6);
+
+            /* r11 = c * 72 + weights_base  (weights row for channel c) */
+            /* mov r11, rax : 49 89 C3 */
+            b = BUF(cg); b[0]=0x49; b[1]=0x89; b[2]=0xC3; EMIT(cg, 3);
+            /* imul r11, r11, 72 : 4D 6B DB 48 */
+            b = BUF(cg); b[0]=0x4D; b[1]=0x6B; b[2]=0xDB; b[3]=0x48; EMIT(cg, 4);
+            /* add r11, r8 : 4D 01 C3 */
+            b = BUF(cg); b[0]=0x4D; b[1]=0x01; b[2]=0xC3; EMIT(cg, 3);
+
+            /* Broadcast 9 weights from [r11], [r11+8], ..., [r11+64] into
+             * ymm0..ymm8.  vbroadcastsd ymm_dst, [r11+disp8]:
+             *   VEX.256.66.0F38.W0 19 /r
+             *   byte1 (after C4): R_bar<<7 | X_bar<<6 | B_bar<<5 | mmmmm
+             *     B_bar = 0 (r11 is high reg)
+             *     For ymm0..ymm7 (R_bar=1): 1<<7 | 1<<6 | 0<<5 | 2 = 0xC2
+             *     For ymm8+    (R_bar=0): 0<<7 | 1<<6 | 0<<5 | 2 = 0x42
+             *   byte2: 0x7D (W=0, vvvv=F, L=1, pp=01)
+             *   byte3: 0x19
+             *   modrm: mod=01 (disp8) | reg=dst_lo<<3 | r/m=011 (r11 low) = 0x43 | (dst_lo<<3)
+             *   disp8 */
+            for (int k = 0; k < 9; k++) {
+                int dst_ymm = k;
+                int R_bar = (dst_ymm < 8) ? 1 : 0;
+                uint8_t byte1 = (R_bar << 7) | (1 << 6) | (0 << 5) | 2;
+                b = BUF(cg);
+                b[0] = 0xC4;
+                b[1] = byte1;
+                b[2] = 0x7D;
+                b[3] = 0x19;
+                b[4] = 0x40 | ((dst_ymm & 7) << 3) | 3;   /* [r11+disp8] */
+                b[5] = (uint8_t)(k * 8);
+                EMIT(cg, 6);
+            }
+
+            /* Broadcast bias[c] → ymm9.  Encoding: vbroadcastsd ymm9, [rbx+rax*8]
+             *   SIB addressing: modrm.r/m = 100 (SIB indicator)
+             *   SIB: scale=3 (*8), index=rax (000), base=rbx (011)
+             *   → SIB byte = (3<<6) | (0<<3) | 3 = 0xC3
+             *   modrm = mod=00 | reg=9<<3 (but R bit set) | r/m=100
+             *
+             * For ymm9 (R_bar=0):
+             *   byte1 = 0<<7 | 1<<6 | 1<<5 | 2 = 0x62  (B̄=1 since rbx<8)
+             *   byte2 = 0x7D
+             *   byte3 = 0x19
+             *   modrm = 00 | ((9&7)<<3) | 4 = (1<<3) | 4 = 0x0C
+             *   SIB = 0xC3
+             */
+            b = BUF(cg);
+            b[0] = 0xC4; b[1] = 0x62; b[2] = 0x7D; b[3] = 0x19;
+            b[4] = 0x0C;   /* mod=00, reg=1 (ymm9 low 3), r/m=100 (SIB) */
+            b[5] = 0xC3;   /* SIB: *8, rax, rbx */
+            EMIT(cg, 6);
+
+            /* output_c_base: rsi = r9 + c*6272.
+             * mov rsi, rax : 48 89 C6
+             * imul rsi, rsi, 6272 = 0x1880 (imm32 form):
+             *   REX.W 69 /r id  →  48 69 F6 <imm32>
+             * add rsi, r9 : 4C 01 CE
+             */
+            b = BUF(cg); b[0]=0x48; b[1]=0x89; b[2]=0xC6; EMIT(cg, 3);
+            b = BUF(cg);
+            b[0]=0x48; b[1]=0x69; b[2]=0xF6;
+            int32_t k6272 = 6272;
+            memcpy(b+3, &k6272, 4);
+            EMIT(cg, 7);
+            b = BUF(cg); b[0]=0x4C; b[1]=0x01; b[2]=0xCE; EMIT(cg, 3);
+
+            /* xor ecx, ecx — y = 0 */
+            pn = emit_xor_reg_reg(BUF(cg), REG_RCX, REG_RCX); EMIT(cg, pn);
+
+            /* ═══ Y loop ═══════════════════════════════════════════ */
+            size_t y_loop_start = cg->code_size;
+            /* cmp rcx, 28 : 48 83 F9 1C */
+            b = BUF(cg); b[0]=0x48; b[1]=0x83; b[2]=0xF9; b[3]=28; EMIT(cg, 4);
+            /* jge .next_c (rel32 placeholder) */
+            size_t jge_next_c_pos = cg->code_size;
+            b = BUF(cg); b[0]=0x0F; b[1]=0x8D; b[2]=0; b[3]=0; b[4]=0; b[5]=0; EMIT(cg, 6);
+
+            /* r12 = rdi + y*240  (padded row 0).
+             * 240 > 127 so we need the imm32 form of imul (opcode 0x69).
+             *   mov r12, rcx        : 49 89 CC
+             *   imul r12, r12, 240  : 4D 69 E4 <imm32>
+             *   add r12, rdi        : 49 01 FC */
+            b = BUF(cg); b[0]=0x49; b[1]=0x89; b[2]=0xCC; EMIT(cg, 3);
+            b = BUF(cg); b[0]=0x4D; b[1]=0x69; b[2]=0xE4;
+            int32_t k240 = 240;
+            memcpy(b+3, &k240, 4);
+            EMIT(cg, 7);
+            b = BUF(cg); b[0]=0x49; b[1]=0x01; b[2]=0xFC; EMIT(cg, 3);
+
+            /* lea r13, [r12 + 240]  — disp32 since 240 > 127 signed.
+             * 4D 8D AC 24 <disp32> */
+            b = BUF(cg); b[0]=0x4D; b[1]=0x8D; b[2]=0xAC; b[3]=0x24;
+            memcpy(b+4, &k240, 4);
+            EMIT(cg, 8);
+            /* lea r14, [r12 + 480]  — disp32 */
+            b = BUF(cg); b[0]=0x4D; b[1]=0x8D; b[2]=0xB4; b[3]=0x24;
+            int32_t d480 = 480;
+            memcpy(b+4, &d480, 4);
+            EMIT(cg, 8);
+
+            /* r11 = rsi + y*224  (output row base for current c, y).
+             * 224 > 127 so imul with imm32.
+             *   mov r11, rcx        : 49 89 CB
+             *   imul r11, r11, 224  : 4D 69 DB <imm32>
+             *   add r11, rsi        : 49 01 F3 */
+            b = BUF(cg); b[0]=0x49; b[1]=0x89; b[2]=0xCB; EMIT(cg, 3);
+            b = BUF(cg); b[0]=0x4D; b[1]=0x69; b[2]=0xDB;
+            int32_t k224 = 224;
+            memcpy(b+3, &k224, 4);
+            EMIT(cg, 7);
+            b = BUF(cg); b[0]=0x49; b[1]=0x01; b[2]=0xF3; EMIT(cg, 3);
+
+            /* xor edx, edx — x_start_bytes = 0 */
+            pn = emit_xor_reg_reg(BUF(cg), REG_RDX, REG_RDX); EMIT(cg, pn);
+
+            /* ═══ X chunk loop ═══════════════════════════════════════ */
+            size_t x_loop_start = cg->code_size;
+            /* cmp rdx, 224 : 48 81 FA E0 00 00 00 — 7 bytes (disp32 imm).
+             * Use cmp rdx, imm8 form if 224 fits signed byte? 224 > 127, no. */
+            b = BUF(cg); b[0]=0x48; b[1]=0x81; b[2]=0xFA;
+            int32_t imm224 = 224;
+            memcpy(b+3, &imm224, 4);
+            EMIT(cg, 7);
+            /* jge .next_y (rel32 placeholder) */
+            size_t jge_next_y_pos = cg->code_size;
+            b = BUF(cg); b[0]=0x0F; b[1]=0x8D; b[2]=0; b[3]=0; b[4]=0; b[5]=0; EMIT(cg, 6);
+
+            /* vmovapd ymm10, ymm9  — acc = bias broadcast */
+            cg_vmovapd(cg, 10, 9);
+
+            /* Helper lambda — conceptually — for emitting
+             *   vmovupd ymm11, [base_reg + rdx + disp8]   (SIB with *1, base)
+             *   vfmadd231pd ymm10, ymm11, ymm_w
+             *
+             * vmovupd ymm11, [r12+rdx+disp8]:
+             *   VEX.256.F3.0F.W? 10 /r  (load form; we use prefix F3 for movUpd)
+             *   Actually vmovupd is VEX.256.66.0F 10 /r for packed double.
+             *   Wait: vmovupd is 66 0F 10 /r.  vmovups is 0F 10.  vmovupd is 66 0F 10.
+             *   But SIB still applies.  VEX encoding:
+             *     byte1: C4
+             *     byte2: R_bar<<7 | X_bar<<6 | B_bar<<5 | mmmmm=1 (0F escape)
+             *       R_bar: ymm11 dst → (11>=8) so R_bar=0
+             *       X_bar: SIB index is rdx (low) — X_bar=1
+             *       B_bar: SIB base is r12/r13/r14 — B_bar=0
+             *     byte3: W=0 | vvvv=1111 | L=1 | pp=01 = 0x7D
+             *     opcode: 0x10
+             *     modrm: mod=01 (disp8) | reg=ymm11&7=3 | r/m=100 (SIB)
+             *            → 0x40 | (3<<3) | 4 = 0x5C
+             *     SIB:   scale=0, index=rdx(010), base=base_reg&7
+             *            → (0<<6) | (2<<3) | base_lo = 0x10 | base_lo
+             *
+             * For ymm11 as dst (R_bar=0), byte2 = (0<<7)|(1<<6)|(0<<5)|1 = 0x41.
+             */
+            /* Macro-ish: emit vmovupd ymm11, [base_high + rdx + disp8] */
+            #define EMIT_LOAD(base_lo, disp) do {                             \
+                b = BUF(cg);                                                  \
+                b[0] = 0xC4; b[1] = 0x41; b[2] = 0x7D; b[3] = 0x10;           \
+                b[4] = 0x5C;                                                  \
+                b[5] = 0x10 | (base_lo);                                      \
+                b[6] = (uint8_t)(disp);                                       \
+                EMIT(cg, 7);                                                  \
+            } while (0)
+
+            /* ky = 0 row (r12, low = 4) */
+            EMIT_LOAD(4, 0);  cg_vfmadd231pd(cg, 10, 11, 0);
+            EMIT_LOAD(4, 8);  cg_vfmadd231pd(cg, 10, 11, 1);
+            EMIT_LOAD(4, 16); cg_vfmadd231pd(cg, 10, 11, 2);
+            /* ky = 1 row (r13, low = 5) */
+            EMIT_LOAD(5, 0);  cg_vfmadd231pd(cg, 10, 11, 3);
+            EMIT_LOAD(5, 8);  cg_vfmadd231pd(cg, 10, 11, 4);
+            EMIT_LOAD(5, 16); cg_vfmadd231pd(cg, 10, 11, 5);
+            /* ky = 2 row (r14, low = 6) */
+            EMIT_LOAD(6, 0);  cg_vfmadd231pd(cg, 10, 11, 6);
+            EMIT_LOAD(6, 8);  cg_vfmadd231pd(cg, 10, 11, 7);
+            EMIT_LOAD(6, 16); cg_vfmadd231pd(cg, 10, 11, 8);
+
+            #undef EMIT_LOAD
+
+            /* vmovupd [r11 + rdx], ymm10
+             *   Store form: opcode 0x11 (vs load 0x10).
+             *   For ymm10 dst (R_bar=0), byte2 = (0<<7)|(1<<6)|(0<<5)|1 = 0x41
+             *   byte3 = 0x7D
+             *   opcode = 0x11
+             *   modrm: mod=00 (no disp needed when base_lo != 5), reg=ymm10&7=2, r/m=100 (SIB)
+             *          r11 low = 3, so mod=00 is fine.
+             *   SIB: scale=0, index=rdx, base=r11(011) → (2<<3)|3 = 0x13
+             */
+            b = BUF(cg);
+            b[0] = 0xC4; b[1] = 0x41; b[2] = 0x7D; b[3] = 0x11;
+            b[4] = 0x00 | (2 << 3) | 4;   /* mod=00, reg=2, r/m=100 */
+            b[5] = 0x13;                   /* SIB: scale=1, index=rdx, base=r11 */
+            EMIT(cg, 6);
+
+            /* add rdx, 32 : 48 83 C2 20 */
+            b = BUF(cg); b[0]=0x48; b[1]=0x83; b[2]=0xC2; b[3]=0x20; EMIT(cg, 4);
+            /* jmp .x_loop (rel32) */
+            {
+                int32_t back = (int32_t)((int64_t)x_loop_start - (int64_t)(cg->code_size + 5));
+                b = BUF(cg); b[0]=0xE9;
+                memcpy(b+1, &back, 4);
+                EMIT(cg, 5);
+            }
+
+            /* Patch jge .next_y → here */
+            {
+                int32_t off = (int32_t)((int64_t)cg->code_size - (int64_t)(jge_next_y_pos + 6));
+                memcpy(cg->code + jge_next_y_pos + 2, &off, 4);
+            }
+
+            /* inc rcx : 48 FF C1 */
+            b = BUF(cg); b[0]=0x48; b[1]=0xFF; b[2]=0xC1; EMIT(cg, 3);
+            /* jmp .y_loop (rel32) */
+            {
+                int32_t back = (int32_t)((int64_t)y_loop_start - (int64_t)(cg->code_size + 5));
+                b = BUF(cg); b[0]=0xE9;
+                memcpy(b+1, &back, 4);
+                EMIT(cg, 5);
+            }
+
+            /* Patch jge .next_c → here */
+            {
+                int32_t off = (int32_t)((int64_t)cg->code_size - (int64_t)(jge_next_c_pos + 6));
+                memcpy(cg->code + jge_next_c_pos + 2, &off, 4);
+            }
+
+            /* inc rax : 48 FF C0 */
+            b = BUF(cg); b[0]=0x48; b[1]=0xFF; b[2]=0xC0; EMIT(cg, 3);
+            /* jmp .channel_loop (rel32) */
+            {
+                int32_t back = (int32_t)((int64_t)channel_loop_start - (int64_t)(cg->code_size + 5));
+                b = BUF(cg); b[0]=0xE9;
+                memcpy(b+1, &back, 4);
+                EMIT(cg, 5);
+            }
+
+            /* Patch jge .done → here */
+            {
+                int32_t off = (int32_t)((int64_t)cg->code_size - (int64_t)(jge_done_pos + 6));
+                memcpy(cg->code + jge_done_pos + 2, &off, 4);
+            }
+
+            /* ═══ Epilog ═══════════════════════════════════════════ */
+            /* vzeroupper : C5 F8 77 */
+            b = BUF(cg); b[0]=0xC5; b[1]=0xF8; b[2]=0x77; EMIT(cg, 3);
+            /* pop r14: 41 5E */
+            b = BUF(cg); b[0]=0x41; b[1]=0x5E; EMIT(cg, 2);
+            /* pop r13: 41 5D */
+            b = BUF(cg); b[0]=0x41; b[1]=0x5D; EMIT(cg, 2);
+            /* pop r12: 41 5C */
+            b = BUF(cg); b[0]=0x41; b[1]=0x5C; EMIT(cg, 2);
+            /* pop rbx */
+            pn = emit_pop(BUF(cg), REG_RBX); EMIT(cg, pn);
+            /* add rsp, 32 — drop 4 pushed args */
+            b = BUF(cg); b[0]=0x48; b[1]=0x83; b[2]=0xC4; b[3]=0x20; EMIT(cg, 4);
+            /* xor eax, eax — return 0 */
+            pn = emit_xor_reg_reg(BUF(cg), REG_RAX, REG_RAX); EMIT(cg, pn);
+            return 1;
+        }
+
         if (strcmp(name, "arr_f64_adam_apply") == 0 && argc == 5) {
             /* Adam's per-element weight update, vectorised:
              *

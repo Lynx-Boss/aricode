@@ -271,6 +271,51 @@ run_test "vec_log1p_moderate" /tmp/edge_vec_log1p.ari "0.000000
 2.3025
 0.9999"
 
+# #7d  arr_f64_conv2d_3x3_p1 — spot-check two known-output cases.
+# Input is pre-padded (30×30).  Caller owns padding; this builtin is
+# the straight-line AVX2 convolution.
+cat > /tmp/edge_conv2d.ari << 'EOF'
+fn main() -> i32 {
+    // padded[30*30] — all zeros except centre at (15, 15) = 1.0.
+    let padded: i32 = arr_f64_new(900);
+    let i: i32 = 0;
+    while (i < 900) { arr_f64_set(padded, i, 0.0); i += 1; }
+    arr_f64_set(padded, 15 * 30 + 15, 1.0);
+
+    // 2 output channels.  Channel 0: averaging 1/9 kernel.
+    // Channel 1: identity (centre of kernel = 1, rest 0).
+    let weights: i32 = arr_f64_new(2 * 9);
+    let k: i32 = 0;
+    while (k < 9) { arr_f64_set(weights, k, 1.0 / 9.0); k += 1; }
+    k = 9;
+    while (k < 18) { arr_f64_set(weights, k, 0.0); k += 1; }
+    arr_f64_set(weights, 9 + 4, 1.0);   // channel 1, position (1,1)
+
+    let bias: i32 = arr_f64_new(2);
+    arr_f64_set(bias, 0, 0.0);
+    arr_f64_set(bias, 1, 0.0);
+
+    let output: i32 = arr_f64_new(2 * 784);
+    arr_f64_conv2d_3x3_p1(padded, weights, bias, output, 2);
+
+    // Channel 0 (averaging): the 1.0 at padded (15, 15) spreads to the
+    // 3×3 neighbourhood in OUTPUT coords.  Padded(15,15) means output
+    // positions (14, 14), (14, 13), (14, 15), (13, 14), ..., (15, 15)
+    // all receive 1/9.  Elsewhere the output is 0.
+    print_f64(arr_f64_get(output, 14 * 28 + 14), 4);   // 0.1111
+    print_f64(arr_f64_get(output, 12 * 28 + 12), 4);   // 0.0000
+    // Channel 1 (identity): padded(15,15) is the centre of the 3×3
+    // window over output(14,14), with kernel centre = 1 → output = 1.
+    print_f64(arr_f64_get(output, 784 + 14 * 28 + 14), 4);   // 1.0000
+    print_f64(arr_f64_get(output, 784 + 13 * 28 + 13), 4);   // 0.0000
+    return 0;
+}
+EOF
+run_test "conv2d_3x3_spot_check" /tmp/edge_conv2d.ari "0.1111
+0.0000
+1.0000
+0.0000" "averaging + identity kernels on centre-pixel input"
+
 # #7b  arr_f64_adam_apply — bit-exact match with scalar reference across
 # the vec/tail boundary (n=5 takes one vec step + one scalar iter).
 # With w=1.0, m=0.5, v=0.25, lr=0.2, eps=0: step = 0.2 * 0.5 / 0.5 = 0.2

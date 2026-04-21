@@ -94,12 +94,21 @@ Compiler-side AVX2 tensor builtins (`arr_f64_*`):
 | `arr_f64_log`, `arr_f64_log1p`       |                      |
 | `arr_f64_softmax`                    |                      |
 | `arr_f64_adam_apply`                 |                      |
+| `arr_f64_conv2d_3x3_p1`              |                      |
 
-Conv/pool ship as pure-`.ari` helpers in `aricode-ml/conv2d.ari` —
-`conv2d_im2col`, `conv2d_forward`, `conv2d_backward_weights`,
-`maxpool_2x2_forward` / `_backward`.  They lean on existing AVX2
-array builtins in the hot paths; turning conv2d into a single
-compiler builtin is the next iteration.
+`arr_f64_conv2d_3x3_p1(padded_input, weights, bias, output, C_out)`
+is a direct-convolution AVX2 kernel hardcoded for MNIST-size CNNs
+(C_in = 1, 28 × 28 spatial, 3 × 3 kernel, pad 1, stride 1).  Caller
+pre-pads input to 30 × 30; the builtin pre-broadcasts the 9 kernel
+weights once per output channel, then fuses 9 `vfmadd231pd` per
+4-wide output chunk — 28 rows × 7 chunks × 8 channels × 9 FMAs per
+sample.
+
+Pool and backward stay as pure-`.ari` helpers in
+`aricode-ml/conv2d.ari` (`conv2d_im2col`, `conv2d_backward_weights`,
+`maxpool_2x2_forward` / `_backward`).  A `conv2d_forward_fast`
+wrapper composes `conv2d_pad_28_to_30` + `arr_f64_conv2d_3x3_p1` for
+a 1-liner drop-in.
 
 ### MNIST demo — up to 98.66 % test accuracy
 

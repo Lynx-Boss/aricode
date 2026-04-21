@@ -4847,6 +4847,68 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             pn = emit_xor_reg_reg(BUF(cg), REG_RAX, REG_RAX); EMIT(cg, pn);
             return 1;
         }
+        if (strcmp(name, "arr_f64_copy_slice") == 0 && argc == 5) {
+            /* Copy n f64 elements from src[src_offset..] into
+             * dst[dst_offset..].  The explicit length decouples this
+             * from dst's total size, letting callers place copies
+             * mid-buffer — needed by conv2d_im2col to fill the valid
+             * interior of a 28×28 row within a 784-long buffer while
+             * zero-padding the borders with arr_f64_fill.
+             *
+             * Args (children[1..5]):  src, src_offset, dst, dst_offset, n. */
+            emit_expression(cg, node->children[5]); /* n */
+            int pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
+            emit_expression(cg, node->children[4]); /* dst_offset */
+            pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
+            emit_expression(cg, node->children[3]); /* dst */
+            pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
+            emit_expression(cg, node->children[2]); /* src_offset */
+            pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
+            emit_expression(cg, node->children[1]); /* src → RAX */
+            uint8_t *b;
+
+            /* Stack after 4 pushes:
+             *   [rsp+0]  = src_offset
+             *   [rsp+8]  = dst
+             *   [rsp+16] = dst_offset
+             *   [rsp+24] = n
+             */
+            /* mov rsi, [rsp+0]   — src_offset */
+            b = BUF(cg); b[0]=0x48; b[1]=0x8B; b[2]=0x34; b[3]=0x24; EMIT(cg, 4);
+            /* lea rsi, [rax + rsi*8]  —  rsi = src + src_offset·8 */
+            b = BUF(cg); b[0]=0x48; b[1]=0x8D; b[2]=0x34; b[3]=0xF0; EMIT(cg, 4);
+            /* mov rdi, [rsp+8]   — dst */
+            b = BUF(cg); b[0]=0x48; b[1]=0x8B; b[2]=0x7C; b[3]=0x24; b[4]=0x08; EMIT(cg, 5);
+            /* mov rdx, [rsp+16]  — dst_offset */
+            b = BUF(cg); b[0]=0x48; b[1]=0x8B; b[2]=0x54; b[3]=0x24; b[4]=0x10; EMIT(cg, 5);
+            /* lea rdi, [rdi + rdx*8]  —  rdi = dst + dst_offset·8 */
+            b = BUF(cg); b[0]=0x48; b[1]=0x8D; b[2]=0x3C; b[3]=0xD7; EMIT(cg, 4);
+            /* mov rcx, [rsp+24]  — n */
+            b = BUF(cg); b[0]=0x48; b[1]=0x8B; b[2]=0x4C; b[3]=0x24; b[4]=0x18; EMIT(cg, 5);
+
+            /* rdx = n & ~3 */
+            pn = emit_mov_reg_reg(BUF(cg), REG_RDX, REG_RCX); EMIT(cg, pn);
+            b = BUF(cg); b[0]=0x48; b[1]=0x83; b[2]=0xE2; b[3]=0xFC; EMIT(cg, 4);
+
+            /* xor rax, rax — loop index (reusing RAX now that src is in RSI) */
+            pn = emit_xor_reg_reg(BUF(cg), REG_RAX, REG_RAX); EMIT(cg, pn);
+
+            CgCountedLoop vec = cg_loop_begin(cg, REG_RAX, REG_RDX);
+            cg_vmovupd_ymm_base_idx(cg, 0, REG_RSI, REG_RAX, 0x10);
+            cg_vmovupd_ymm_base_idx(cg, 0, REG_RDI, REG_RAX, 0x11);
+            cg_loop_end(cg, vec, 4);
+
+            CgCountedLoop tail = cg_loop_begin(cg, REG_RAX, REG_RCX);
+            cg_movsd_xmm_base_idx(cg, 0, REG_RSI, REG_RAX, 0x10);
+            cg_movsd_xmm_base_idx(cg, 0, REG_RDI, REG_RAX, 0x11);
+            cg_loop_end(cg, tail, 1);
+
+            /* vzeroupper + drop 4 pushed args + return 0. */
+            b = BUF(cg); b[0]=0xC5; b[1]=0xF8; b[2]=0x77; EMIT(cg, 3);
+            b = BUF(cg); b[0]=0x48; b[1]=0x83; b[2]=0xC4; b[3]=0x20; EMIT(cg, 4);
+            pn = emit_xor_reg_reg(BUF(cg), REG_RAX, REG_RAX); EMIT(cg, pn);
+            return 1;
+        }
         if (strcmp(name, "arr_f64_copy_at") == 0 && argc == 3) {
             /* Copy `dst.length` f64 elements from src[src_offset..] into
              * dst[0..dst.length].  Four elements per vmovupd, scalar

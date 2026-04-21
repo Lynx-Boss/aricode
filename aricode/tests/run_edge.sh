@@ -271,6 +271,34 @@ run_test "vec_log1p_moderate" /tmp/edge_vec_log1p.ari "0.000000
 2.3025
 0.9999"
 
+# #7g  arr_f64_copy_slice — copy with both src and dst offsets.
+cat > /tmp/edge_copy_slice.ari << 'EOF'
+fn main() -> i32 {
+    // src = 0, 1, 2, ..., 9
+    let src: i32 = arr_f64_new(10);
+    let i: i32 = 0;
+    while (i < 10) { arr_f64_set(src, i, int_to_float(i)); i += 1; }
+
+    // Sentinel-fill dst with 99 so we can see which cells get overwritten.
+    let dst: i32 = arr_f64_new(10);
+    arr_f64_fill(dst, 99.0);
+
+    // Copy src[2..7] (5 elements) into dst[3..8].  Boundaries stay 99.
+    arr_f64_copy_slice(src, 2, dst, 3, 5);
+    print_f64(arr_f64_get(dst, 2), 2);   // 99.00 (untouched)
+    print_f64(arr_f64_get(dst, 3), 2);   //  2.00 (first copied)
+    print_f64(arr_f64_get(dst, 6), 2);   //  5.00 (last of vec)
+    print_f64(arr_f64_get(dst, 7), 2);   //  6.00 (scalar tail)
+    print_f64(arr_f64_get(dst, 8), 2);   // 99.00 (untouched)
+    return 0;
+}
+EOF
+run_test "arr_f64_copy_slice_mid" /tmp/edge_copy_slice.ari "99.00
+2.00
+5.00
+6.00
+99.00" "copy_slice reads from src offset and writes to dst offset"
+
 # #7f  arr_f64_copy_at — slice copy with vec + scalar tail.
 cat > /tmp/edge_copy_at.ari << 'EOF'
 fn main() -> i32 {

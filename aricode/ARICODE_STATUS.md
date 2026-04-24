@@ -4,7 +4,7 @@ Honest, number-backed picture of what the compiler can do, what's
 fast, what's slow, and what's still on the backlog.  Updated after
 each performance or feature push.
 
-Last updated: 2026-04-24 (threading: thread_spawn fix + atomic_add_i64 + 4.0× parallel matvec demo)
+Last updated: 2026-04-25 (threading: + atomic_add_f64, + parallel MNIST eval (98.66 %, 10 % wall-time drop))
 
 ---
 
@@ -228,6 +228,7 @@ across threads:
 |-------------------------------------------|-----------------------------------------------------|
 | `thread_spawn(func)` / `(func, arg)`      | `clone(CLONE_VM|…|THREAD, mmap'd stack)` syscall 56. Pre-seeds the child's new stack with the RIP-relative-resolved absolute address of `func` (and optionally `arg` for RDI) so the child's `pop rax ; pop rdi ; call rax` reaches the function. Returns child tid. |
 | `atomic_add_i64(base, idx, delta)`        | one `lock xadd` — uninterruptible fetch-and-add, returns the old value. |
+| `atomic_add_f64(base, idx, delta)`        | `lock cmpxchg` retry loop on f64 bits (x86 has no atomic FADD). Returns the old value.  Slower than the i64 form under heavy contention — prefer per-thread buffers + a serial reduction for gradient aggregation. |
 | `thread_wait(pid)`, `thread_exit(code)`   | thin wrappers on `wait4` / `exit`. |
 
 Previous state: `thread_spawn` was broken — it clone()'d and then
@@ -238,7 +239,7 @@ slot(s) of the child's mmap'd stack with the func address (and arg
 if two-arg form) before the clone syscall, so `pop rax ; call rax`
 on the child side actually runs the function.
 
-**Benchmark** — `aricode-ml/examples/threading/parallel_matvec.ari`
+**Benchmark 1 — pure compute** — `aricode-ml/examples/threading/parallel_matvec.ari`
 computes a 512 × 512 matvec, 10 000 iterations, four workers splitting
 disjoint output rows and calling `arr_f64_dot_range` (the AVX2 dot
 builtin).  Matrix sized to fit in L2 per worker so the test isolates
@@ -252,6 +253,25 @@ compute parallelism from memory-bandwidth effects.
 Bit-identical `-95.856602` checksum across both binaries — same
 arithmetic, different work distribution.  `user / real ≈ 4.0` ⇒
 effective 4-core occupancy.
+
+**Benchmark 2 — real ML workload** — `aricode-ml/examples/mnist/mnist_cnn_par.ari`
+is a fork of `mnist_cnn.ari` that parallelises the per-epoch test-set
+eval.  Four workers each evaluate 2500 of the 10 000 MNIST test
+samples using their own scratch activation buffers; model weights are
+shared read-only.  Per-worker argmax tallies fold into one shared
+counter via a single `atomic_add_i64` per worker (not per sample).
+
+| Variant            | Wall time | Test acc | Notes                                  |
+|--------------------|----------:|---------:|----------------------------------------|
+| `mnist_cnn.ari`    |    97 s   | 98.66 %  | serial training + serial eval          |
+| `mnist_cnn_par.ari`|    88 s   | 98.66 %  | serial training + **parallel eval**    |
+
+Eval phase drops from ~1.2 s to ~0.3 s per epoch — ~10 % total
+wall-time win because training still dominates.  Final accuracy is
+bit-identical (training is deterministic; eval is a parallel reduction
+of argmax comparisons).  Parallel training (per-thread gradient
+buffers + serial reduction) is the next step toward a proper multi-core
+win on the whole loop.
 
 **Caveats**
 - `thread_wait` uses `wait4`, which returns `-ECHILD` for CLONE_THREAD
@@ -273,7 +293,7 @@ Two complementary suites in `aricode/tests/`:
 | Suite          | Tests | Runtime | Covers                                    |
 |----------------|------:|--------:|-------------------------------------------|
 | `run_all.sh`   |    39 |   ~90 ms | Arithmetic, strings, arrays, error handling, file I/O, SIMD basics, imports, memory |
-| `run_edge.sh`  |    39 |  ~2.5 s | Softmax scalar tails & underflow clamp, vec exp/expm1 range, f64 return-contract (xmm0 + rax), hot-var register allocation, branch peephole, short-circuit `&&`/`||`, CNN forward/backward spot checks, threading (spawn, arg-passing, atomic contention) |
+| `run_edge.sh`  |    40 |  ~2.5 s | Softmax scalar tails & underflow clamp, vec exp/expm1 range, f64 return-contract (xmm0 + rax), hot-var register allocation, branch peephole, short-circuit `&&`/`||`, CNN forward/backward spot checks, threading (spawn, arg-passing, i64 + f64 atomic contention) |
 
 Run both with one command:
 
@@ -308,7 +328,7 @@ caught in under 100 ms.
 | `math_pow` / pow_int scalar   | shipped (stdlib) |
 | `thread_spawn(func[, arg])`   | shipped      |
 | `atomic_add_i64`              | shipped (`lock xadd`) |
-| `atomic_add_f64`              | **not shipped** — use per-thread buffers + serial reduction |
+| `atomic_add_f64`              | shipped (`lock cmpxchg` loop) |
 | Futex-based thread_wait       | **not shipped** (spin-on-counter barrier works today) |
 | Instruction scheduler         | **not shipped** |
 | Auto-vectoriser pass          | **not shipped** |

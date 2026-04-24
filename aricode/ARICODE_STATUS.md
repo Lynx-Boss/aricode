@@ -4,7 +4,7 @@ Honest, number-backed picture of what the compiler can do, what's
 fast, what's slow, and what's still on the backlog.  Updated after
 each performance or feature push.
 
-Last updated: 2026-04-25 (parallel MNIST training: 97 s → 32.5 s, 2.98× wall-time, accuracy preserved)
+Last updated: 2026-04-25 (compute-dominated loops 2.5× faster; Leibniz 100M now 1.66× vs gcc -O2)
 
 ---
 
@@ -74,12 +74,26 @@ manageable.
 
 | Benchmark | C -O2 | aricode | ratio vs C |
 |-----------|------:|--------:|-----------:|
-| Leibniz (π, 100 M terms, divsd-bound)       | 94 ms  | 150 ms  | **1.60×** |
-| varmul (k²-sum accumulator, f64-heavy loop) | 73 ms  | 118 ms  | **1.62×** |
+| Leibniz (π, 100 M terms, divsd-bound)       | 100 ms | 166 ms | **1.66×** |
+| varmul (k²-sum accumulator, f64-heavy loop) |  73 ms | 118 ms | **1.62×** |
 
 Starting point was 4.2-4.8× slower; the chain of codegen
 optimisations listed in `project_instruction_scheduling` (memory)
-closed roughly 60 % of the gap.
+closed roughly 60-65 % of the gap.  Latest wins (2026-04-25):
+
+- **Hot-GP binop fast path** — when the right operand of an integer
+  binop is a callee-saved hot-GP identifier (r12-r15), skip the
+  stack stash and read it directly as the RCX source.  `while (i < n)`
+  with both in hot-GP goes from 7 insns down to 3.
+- **Hot-XMM binop fast path** — when the right operand is a hot-XMM
+  identifier (xmm8-15), use its home register directly as the
+  addsd/subsd/mulsd/divsd source.  Saves 3-4 movapd per float binop
+  in register-pinned inner loops.
+- Latent bug unmasked by the hot-XMM path: emit_var_decl /
+  emit_assignment inferred "rhs is float?" from emit_expression's
+  top-level return, which was wrong for nested `(a*b)+c` and
+  triggered a stale-rax reload.  Now typed with the recursive
+  `expr_is_float` walker.
 
 The remaining ~1.6× is largely divsd latency (14-20 c on Zen 3)
 and the lack of a proper instruction scheduler.  An auto-vectoriser

@@ -565,6 +565,43 @@ static int emit_identifier(CodegenState *cg, const ASTNode *node) {
 }
 
 /*
+ * If `node` is a hot-GP-backed identifier, return its cached register
+ * index (r12..r15).  Otherwise -1.
+ *
+ * Reading a hot-GP register has no side effect, so when both sides of
+ * an integer binop are hot-GP identifiers we can skip the stack
+ * stash entirely and go straight into `cmp r_left, r_right` style
+ * emission.  The tightest inner-loop wins come from this —
+ * `while (i < n)` with both `i` and `n` pinned to callee-saved GP
+ * regs used to emit 7 insns (mov/push/mov/mov/pop/cmp/jcc); after
+ * the fast path it's 2 (cmp/jcc).
+ */
+static int node_hot_gp_reg(CodegenState *cg, const ASTNode *node) {
+    if (!node || node->type != NODE_IDENTIFIER || !node->string_val) return -1;
+    LocalVar *v = find_local(cg, node->string_val);
+    if (!v || v->hot_gp < 0) return -1;
+    return v->hot_gp;
+}
+
+/*
+ * f64 counterpart of node_hot_gp_reg — if `node` is a hot-XMM-backed
+ * f64 identifier, return its xmm index (xmm8..xmm15).  Else -1.
+ *
+ * The arithmetic instructions (addsd/subsd/mulsd/divsd) all accept
+ * an extended xmm register as their right operand via REX.B, so we
+ * can skip the classic "stash left / load right into xmm1 / unstash"
+ * dance and emit the op directly against the hot register.  For
+ * `sum + sign / denom` in the Leibniz hot loop that saves ~4 insns
+ * per binop.
+ */
+static int node_hot_xmm_reg(CodegenState *cg, const ASTNode *node) {
+    if (!node || node->type != NODE_IDENTIFIER || !node->string_val) return -1;
+    LocalVar *v = find_local(cg, node->string_val);
+    if (!v || v->hot_xmm < 0) return -1;
+    return v->hot_xmm;
+}
+
+/*
  * PEEPHOLE: Check if binary op right operand is an immediate constant.
  * If so, we can avoid the push/pop dance and use reg,imm instructions.
  */
@@ -868,6 +905,15 @@ static void emit_binary_op(CodegenState *cg, const ASTNode *node) {
         /* Evaluate left → xmm0 (also rax). */
         emit_expression(cg, left);
 
+        /* xmm_right: the xmm register holding the right operand when we
+         * reach the arithmetic opcode.  Default is xmm1 (the classic
+         * path loads right into xmm1).  When right is a hot-xmm
+         * identifier we skip the stash entirely and use its home reg
+         * directly as the arithmetic source — saves 4 insns per binop
+         * (stash, unstash, movapd into xmm1, drop-rax peephole). */
+        int xmm_right = 1;
+        int right_hot = node_hot_xmm_reg(cg, right);
+
         int stash_xmm = 2 + cg->float_depth;
         /* Right must be call-free (a call would clobber xmm_stash during
          * right evaluation).  Left may have calls — emit_expression(left)
@@ -876,7 +922,13 @@ static void emit_binary_op(CodegenState *cg, const ASTNode *node) {
          * right after left is safe. */
         int use_xmm_stash = (cg->float_depth < 6) && !subtree_has_call(right);
 
-        if (use_xmm_stash) {
+        if (right_hot >= 0) {
+            /* Right is a hot-xmm local — xmm0 holds left, xmm_right_hot
+             * holds right.  The wasted `movq rax, xmm0` tail of left's
+             * read is safe to drop: in this fast path rax is never used. */
+            peephole_drop_movq_rax_xmm0(cg);
+            xmm_right = right_hot;
+        } else if (use_xmm_stash) {
             /* If left ended with a wasted `movq rax, xmm0` — the exit
              * pattern from any float binop and from emit_identifier's
              * hot path — drop it before stashing.  In the xmm-stash
@@ -902,20 +954,20 @@ static void emit_binary_op(CodegenState *cg, const ASTNode *node) {
             n = emit_add_reg_imm(BUF(cg), REG_RSP, 8); EMIT(cg, n);
         }
 
-        /* xmm0 = left, xmm1 = right */
+        /* xmm0 = left, xmm_right = right (xmm1 by default, or hot-xmm home) */
         if (strcmp(op, "+") == 0) {
-            n = emit_addsd(BUF(cg), 0, 1); EMIT(cg, n);
+            n = emit_addsd(BUF(cg), 0, xmm_right); EMIT(cg, n);
         } else if (strcmp(op, "-") == 0) {
-            n = emit_subsd(BUF(cg), 0, 1); EMIT(cg, n);
+            n = emit_subsd(BUF(cg), 0, xmm_right); EMIT(cg, n);
         } else if (strcmp(op, "*") == 0) {
-            n = emit_mulsd(BUF(cg), 0, 1); EMIT(cg, n);
+            n = emit_mulsd(BUF(cg), 0, xmm_right); EMIT(cg, n);
         } else if (strcmp(op, "/") == 0) {
-            n = emit_divsd(BUF(cg), 0, 1); EMIT(cg, n);
+            n = emit_divsd(BUF(cg), 0, xmm_right); EMIT(cg, n);
         } else if (strcmp(op, "<") == 0 || strcmp(op, ">") == 0 ||
                    strcmp(op, "<=") == 0 || strcmp(op, ">=") == 0 ||
                    strcmp(op, "==") == 0 || strcmp(op, "!=") == 0) {
             /* ucomisd sets CF and ZF */
-            n = emit_ucomisd(BUF(cg), 0, 1); EMIT(cg, n);
+            n = emit_ucomisd(BUF(cg), 0, xmm_right); EMIT(cg, n);
             if (strcmp(op, "<") == 0) {
                 /* below: CF=1 */
                 uint8_t *b = BUF(cg);
@@ -1030,22 +1082,24 @@ static void emit_binary_op(CodegenState *cg, const ASTNode *node) {
 
     /* ---- GENERAL PATH: both sides non-constant ---- */
     if (!use_imm) {
-        /* Evaluate left operand -> RAX */
+        /* Evaluate left through emit_expression so its "rax already has
+         * this value" peephole can drop the reload after a just-written
+         * hot-GP local (the `i = i + 1 ; i < n` pattern in hot loops). */
         emit_expression(cg, left);
 
-        /* Push left result */
-        n = emit_push(BUF(cg), REG_RAX);
-        EMIT(cg, n);
-
-        /* Evaluate right operand -> RAX */
-        emit_expression(cg, right);
-
-        /* Move right to RCX, pop left into RAX */
-        n = emit_mov_reg_reg(BUF(cg), REG_RCX, REG_RAX);
-        EMIT(cg, n);
-
-        n = emit_pop(BUF(cg), REG_RAX);
-        EMIT(cg, n);
+        /* Fast path: skip the stack stash when the right operand is a
+         * hot-GP identifier — reading it is a single mov with no effect
+         * on rax, so there's nothing to protect.  Saves 4 insns per
+         * `<expr> cmp hot_gp` in the hot loop body. */
+        int right_gp = node_hot_gp_reg(cg, right);
+        if (right_gp >= 0) {
+            n = emit_mov_reg_reg(BUF(cg), REG_RCX, right_gp); EMIT(cg, n);
+        } else {
+            n = emit_push(BUF(cg), REG_RAX); EMIT(cg, n);
+            emit_expression(cg, right);
+            n = emit_mov_reg_reg(BUF(cg), REG_RCX, REG_RAX); EMIT(cg, n);
+            n = emit_pop(BUF(cg), REG_RAX); EMIT(cg, n);
+        }
     }
 
     /* Now: RAX = left, RCX = right */
@@ -1860,13 +1914,17 @@ static void emit_var_decl(CodegenState *cg, const ASTNode *node) {
     }
 
     if (init_expr) {
+        /* Compute float-ness recursively before evaluating — emit_expression
+         * only reports the shape of the top-level node, not nested binops
+         * like `(a * b) + c`, which leads to a stale-rax reload below. */
+        int init_is_float = expr_is_float(cg, init_expr);
         int expr_type = emit_expression(cg, init_expr);
         /* Only infer float type if no explicit type annotation.
          * If the variable has `: i32` or other int type, respect it. */
         int has_type_annotation = (node->child_count >= 1 &&
                                    node->children[0] &&
                                    node->children[0]->type == NODE_TYPE_ANNOTATION);
-        if (expr_type == 1 && !v->is_float && !has_type_annotation) {
+        if ((expr_type == 1 || init_is_float) && !v->is_float && !has_type_annotation) {
             v->is_float = 1;
         }
 
@@ -1879,8 +1937,10 @@ static void emit_var_decl(CodegenState *cg, const ASTNode *node) {
         if (going_hot_xmm) {
             /* Skip the dead stack write; cache holds source of truth. */
             v->hot_xmm = cg->next_hot_xmm++;
-            peephole_drop_movq_rax_xmm0(cg);    /* eliminate wasted movq */
-            if (expr_type != 1) {
+            int dropped = peephole_drop_movq_rax_xmm0(cg);
+            if (!init_is_float && !dropped) {
+                /* Integer rvalue whose last act wasn't a xmm→rax sync —
+                 * rax has the bits, xmm0 doesn't.  Reload explicitly. */
                 n = emit_movq_xmm_reg(BUF(cg), 0, REG_RAX); EMIT(cg, n);
             }
             n = emit_movapd_xmm_xmm(BUF(cg), v->hot_xmm, 0); EMIT(cg, n);
@@ -2127,8 +2187,15 @@ static void emit_assignment(CodegenState *cg, const ASTNode *node) {
         }
     }
 
+    /* Type the rvalue recursively — emit_expression's return value only
+     * inspects immediate children, so a float value produced by a
+     * nested expression like `(a * b) + c` shows up as "not float" and
+     * triggers a stale-rax reload below.  `expr_is_float` walks the
+     * whole tree and gets it right. */
+    int rhs_is_float = expr_is_float(cg, node->children[1]);
+
     /* Evaluate rvalue -> RAX (and xmm0 if float). */
-    int rhs_is_float = emit_expression(cg, node->children[1]);
+    emit_expression(cg, node->children[1]);
 
     int n;
     /* In hot-var mode the backing stack slot is write-only dead code:
@@ -2137,8 +2204,11 @@ static void emit_assignment(CodegenState *cg, const ASTNode *node) {
      * the cache.  The function body is known to be xmm-safe, so no
      * call can make us reload the slot before the function returns. */
     if (v->hot_xmm >= 0) {
-        peephole_drop_movq_rax_xmm0(cg);      /* eliminate wasted movq */
-        if (!rhs_is_float) {
+        int dropped = peephole_drop_movq_rax_xmm0(cg);
+        if (!rhs_is_float && !dropped) {
+            /* Integer rvalue whose last act wasn't a xmm→rax sync —
+             * rax has the bits, xmm0 doesn't.  Reload xmm0 explicitly.
+             * (When the peephole fires, xmm0 already mirrors rax.) */
             n = emit_movq_xmm_reg(BUF(cg), 0, REG_RAX); EMIT(cg, n);
         }
         n = emit_movapd_xmm_xmm(BUF(cg), v->hot_xmm, 0); EMIT(cg, n);

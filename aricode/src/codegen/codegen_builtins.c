@@ -3160,6 +3160,84 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x7E; b[4]=0xC0; EMIT(cg, 5);
             return 1;
         }
+        if (strcmp(name, "arr_f64_sum_range") == 0 && argc == 3) {
+            /* Sum n consecutive f64 elements starting at buf[offset].
+             * Eliminates the scratch-copy step in the common "sum a
+             * row of a flat matrix" pattern — e.g., conv2d's per-
+             * channel bias gradient. */
+            emit_expression(cg, node->children[3]); /* n */
+            int pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
+            emit_expression(cg, node->children[2]); /* offset */
+            pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
+            emit_expression(cg, node->children[1]); /* buf → RAX */
+            uint8_t *b;
+
+            pn = emit_pop(BUF(cg), REG_RSI); EMIT(cg, pn);   /* offset */
+            pn = emit_pop(BUF(cg), REG_RCX); EMIT(cg, pn);   /* n */
+
+            /* RDI = buf + offset * 8 */
+            b = BUF(cg); b[0]=0x48; b[1]=0xC1; b[2]=0xE6; b[3]=0x03; EMIT(cg, 4);
+            b = BUF(cg); b[0]=0x48; b[1]=0x01; b[2]=0xF0; EMIT(cg, 3);
+            pn = emit_mov_reg_reg(BUF(cg), REG_RDI, REG_RAX); EMIT(cg, pn);
+
+            /* xorpd xmm0, xmm0  (accumulator = 0) */
+            b = BUF(cg); b[0]=0x66; b[1]=0x0F; b[2]=0x57; b[3]=0xC0; EMIT(cg, 4);
+
+            pn = emit_xor_reg_reg(BUF(cg), REG_RSI, REG_RSI); EMIT(cg, pn);
+            CgCountedLoop lp = cg_loop_begin(cg, REG_RSI, REG_RCX);
+            cg_movsd_xmm_base_idx(cg, 1, REG_RDI, REG_RSI, 0x10);
+            pn = emit_addsd(BUF(cg), 0, 1); EMIT(cg, pn);
+            cg_loop_end(cg, lp, 1);
+
+            /* movq rax, xmm0  (f64 return contract) */
+            b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x7E; b[4]=0xC0; EMIT(cg, 5);
+            return 1;
+        }
+        if (strcmp(name, "arr_f64_dot_range") == 0 && argc == 5) {
+            /* Dot product of n elements:  Σ a[off_a+i] · b[off_b+i].
+             * Lets callers avoid copying slices of a flat matrix into
+             * a scratch buffer before feeding arr_f64_dot. */
+            emit_expression(cg, node->children[5]); /* n */
+            int pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
+            emit_expression(cg, node->children[4]); /* off_b */
+            pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
+            emit_expression(cg, node->children[3]); /* b */
+            pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
+            emit_expression(cg, node->children[2]); /* off_a */
+            pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
+            emit_expression(cg, node->children[1]); /* a → RAX */
+            uint8_t *b;
+
+            /* Stack layout after 4 pushes:
+             *   [rsp+0]  = off_a     [rsp+8]  = b
+             *   [rsp+16] = off_b     [rsp+24] = n  */
+            /* RDI = a + off_a*8 */
+            b = BUF(cg); b[0]=0x48; b[1]=0x8B; b[2]=0x34; b[3]=0x24; EMIT(cg, 4);          /* mov rsi, [rsp+0] */
+            b = BUF(cg); b[0]=0x48; b[1]=0x8D; b[2]=0x3C; b[3]=0xF0; EMIT(cg, 4);          /* lea rdi, [rax + rsi*8] */
+            /* R8 = b + off_b*8 */
+            b = BUF(cg); b[0]=0x4C; b[1]=0x8B; b[2]=0x44; b[3]=0x24; b[4]=0x08; EMIT(cg, 5); /* mov r8, [rsp+8] */
+            b = BUF(cg); b[0]=0x48; b[1]=0x8B; b[2]=0x54; b[3]=0x24; b[4]=0x10; EMIT(cg, 5); /* mov rdx, [rsp+16] */
+            b = BUF(cg); b[0]=0x49; b[1]=0x8D; b[2]=0x04; b[3]=0xD0; EMIT(cg, 4);          /* lea rax, [r8 + rdx*8]  (REX.WB for r8 base) */
+            pn = emit_mov_reg_reg(BUF(cg), 8 /* R8 */, REG_RAX); EMIT(cg, pn);              /* r8 = start of b */
+            /* RCX = n */
+            b = BUF(cg); b[0]=0x48; b[1]=0x8B; b[2]=0x4C; b[3]=0x24; b[4]=0x18; EMIT(cg, 5);
+
+            /* xorpd xmm0, xmm0 */
+            b = BUF(cg); b[0]=0x66; b[1]=0x0F; b[2]=0x57; b[3]=0xC0; EMIT(cg, 4);
+
+            pn = emit_xor_reg_reg(BUF(cg), REG_RSI, REG_RSI); EMIT(cg, pn);
+            CgCountedLoop lp = cg_loop_begin(cg, REG_RSI, REG_RCX);
+            cg_movsd_xmm_base_idx(cg, 1, REG_RDI, REG_RSI, 0x10);
+            cg_movsd_xmm_base_idx(cg, 2, 8 /* R8 */, REG_RSI, 0x10);
+            pn = emit_mulsd(BUF(cg), 1, 2); EMIT(cg, pn);
+            pn = emit_addsd(BUF(cg), 0, 1); EMIT(cg, pn);
+            cg_loop_end(cg, lp, 1);
+
+            /* Drop 4 pushed args + movq rax, xmm0. */
+            b = BUF(cg); b[0]=0x48; b[1]=0x83; b[2]=0xC4; b[3]=0x20; EMIT(cg, 4);
+            b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x7E; b[4]=0xC0; EMIT(cg, 5);
+            return 1;
+        }
         if (strcmp(name, "arr_f64_sum_kahan") == 0 && argc == 1) {
             /* Kahan compensated summation — recovers bits lost to rounding.
              *

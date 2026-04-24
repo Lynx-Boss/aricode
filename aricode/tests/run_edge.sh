@@ -271,6 +271,30 @@ run_test "vec_log1p_moderate" /tmp/edge_vec_log1p.ari "0.000000
 2.3025
 0.9999"
 
+# #7h  arr_f64_sum_range + arr_f64_dot_range — slice reductions.
+cat > /tmp/edge_range.ari << 'EOF'
+fn main() -> i32 {
+    let a: i32 = arr_f64_new(10);
+    let i: i32 = 0;
+    while (i < 10) { arr_f64_set(a, i, int_to_float(i)); i += 1; }
+    // Σ a[0..10] = 0+1+...+9 = 45
+    print_f64(arr_f64_sum_range(a, 0, 10), 2);
+    // Σ a[3..8] = 3+4+5+6+7 = 25
+    print_f64(arr_f64_sum_range(a, 3, 5), 2);
+
+    let b: i32 = arr_f64_new(10);
+    i = 0;
+    while (i < 10) { arr_f64_set(b, i, 2.0); i += 1; }
+    // Σ a[2..6] · b[3..7]  where b is all 2.0
+    //  = 2·(2+3+4+5) = 28
+    print_f64(arr_f64_dot_range(a, 2, b, 3, 4), 2);
+    return 0;
+}
+EOF
+run_test "arr_f64_range_reduce" /tmp/edge_range.ari "45.00
+25.00
+28.00" "slice-aware sum and dot reductions"
+
 # #7g  arr_f64_copy_slice — copy with both src and dst offsets.
 cat > /tmp/edge_copy_slice.ari << 'EOF'
 fn main() -> i32 {

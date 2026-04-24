@@ -319,6 +319,7 @@ static AriType *builtin_return_type(const char *name) {
         {"thread_wait",     TYPE_I32},
         {"thread_exit",     TYPE_VOID},
         {"atomic_add_i64",  TYPE_I32},
+        {"atomic_add_f64",  TYPE_F64},
         /* i32 — dec (decimal literal, treated as i32 for type checking) */
         {"dec",             TYPE_I32},
         /* i32 — epoll */

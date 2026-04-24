@@ -5728,6 +5728,88 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             return 1;
         }
 
+        if (strcmp(name, "atomic_add_f64") == 0 && argc == 3) {
+            /* atomic_add_f64(base, idx, delta) -> f64
+             *
+             * Atomically updates an f64 slot using a `lock cmpxchg` loop —
+             * x86 has no atomic FADD, but a load / compute / compare-and-
+             * swap cycle gives us the same contract:
+             *
+             *   retry: rax = [mem] ;
+             *          xmm0 = rax_as_f64 + delta ;
+             *          rdi  = xmm0_bits ;
+             *          if (lock cmpxchg [mem], rdi succeeds) break ;
+             *          else rax is now the value that displaced us, retry ;
+             *
+             * Returns the old value (in both rax and xmm0 — the aricode
+             * f64 return contract wants both populated).  Contention
+             * makes this noticeably slower than atomic_add_i64; prefer
+             * per-thread gradient buffers + a serial reduction when you
+             * can. */
+            int pn; uint8_t *b;
+
+            emit_expression(cg, node->children[3]); /* delta (f64 bits → RAX) */
+            pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
+            emit_expression(cg, node->children[2]); /* idx */
+            pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
+            emit_expression(cg, node->children[1]); /* base */
+            pn = emit_pop(BUF(cg), REG_RCX); EMIT(cg, pn); /* RCX = idx */
+            pn = emit_pop(BUF(cg), REG_RDX); EMIT(cg, pn); /* RDX = delta bits */
+
+            /* Bounds. */
+            pn = emit_mov_reg_mem(BUF(cg), REG_RSI, REG_RAX, -8); EMIT(cg, pn);
+            pn = emit_cmp_reg_reg(BUF(cg), REG_RCX, REG_RSI); EMIT(cg, pn);
+            size_t jb_pos = cg->code_size;
+            b = BUF(cg); b[0]=0x0F; b[1]=0x82; memset(b+2,0,4); EMIT(cg, 6);
+            {
+                const char *errmsg = "Runtime error: atomic_add_f64 index out of bounds\n";
+                emit_runtime_error(cg, errmsg, strlen(errmsg));
+            }
+            int32_t jb_off = (int32_t)(cg->code_size - (jb_pos + 6));
+            memcpy(cg->code + jb_pos + 2, &jb_off, 4);
+
+            /* RSI = base + idx*8 */
+            b = BUF(cg);
+            b[0] = rex(1, reg_ext(REG_RSI), reg_ext(REG_RCX), reg_ext(REG_RAX));
+            b[1] = 0x8D;
+            b[2] = modrm(0, REG_RSI & 7, 4);
+            b[3] = (uint8_t)((3 << 6) | ((REG_RCX & 7) << 3) | (REG_RAX & 7));
+            EMIT(cg, 4);
+
+            /* movq xmm1, rdx — xmm1 = delta. 66 48 0F 6E CA */
+            b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xCA;
+            EMIT(cg, 5);
+
+            /* Initial load: mov rax, [rsi]  —  48 8B 06 */
+            b = BUF(cg); b[0]=0x48; b[1]=0x8B; b[2]=0x06; EMIT(cg, 3);
+
+            /* Retry loop.  On cmpxchg failure, rax is auto-loaded with the
+             * current memory value, so we don't need an explicit reload. */
+            size_t retry_pos = cg->code_size;
+
+            /* movq xmm0, rax — xmm0 = old value as f64. */
+            b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xC0;
+            EMIT(cg, 5);
+            /* addsd xmm0, xmm1 — xmm0 = old + delta. */
+            b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x58; b[3]=0xC1; EMIT(cg, 4);
+            /* movq rdi, xmm0 — rdi = new bits. */
+            b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x7E; b[4]=0xC7;
+            EMIT(cg, 5);
+            /* lock cmpxchg [rsi], rdi — F0 48 0F B1 3E */
+            b = BUF(cg); b[0]=0xF0; b[1]=0x48; b[2]=0x0F; b[3]=0xB1; b[4]=0x3E;
+            EMIT(cg, 5);
+            /* jne retry — 0F 85 rel32 */
+            int32_t back = (int32_t)((int64_t)retry_pos - (int64_t)(cg->code_size + 6));
+            b = BUF(cg); b[0]=0x0F; b[1]=0x85;
+            memcpy(b+2, &back, 4); EMIT(cg, 6);
+
+            /* On success, rax holds the OLD bits.  Populate xmm0 too so the
+             * f64 return contract is satisfied. */
+            b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xC0;
+            EMIT(cg, 5);
+            return 1;
+        }
+
         if (strcmp(name, "atomic_add_i64") == 0 && argc == 3) {
             /* atomic_add_i64(base, idx, delta) -> i64
              *

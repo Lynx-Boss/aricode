@@ -932,6 +932,38 @@ fn main() -> i32 {
 EOF
 run_test "atomic_add_contention" /tmp/edge_atomic_add.ari "40000" "lock xadd keeps the count exact under 4-way race"
 
+# #26  atomic_add_f64 under contention — x86 has no atomic FADD, so
+# it's a `lock cmpxchg` loop on f64 bits.  40 000 sequential 1.0
+# increments must yield 40000.00 exactly when split four ways.
+cat > /tmp/edge_atomic_f64.ari << 'EOF'
+fn f64_bump(sh: i32) -> i32 {
+    let i: i32 = 0;
+    while (i < 10000) {
+        atomic_add_f64(sh, 0, 1.0);
+        i = i + 1;
+    }
+    atomic_add_i64(sh, 1, 1);
+    return 0;
+}
+
+fn main() -> i32 {
+    let sh: i32 = arr_f64_new(2);
+    arr_f64_set(sh, 0, 0.0);
+    arr_f64_set(sh, 1, 0.0);
+    let t1: i32 = thread_spawn(f64_bump, sh);
+    let t2: i32 = thread_spawn(f64_bump, sh);
+    let t3: i32 = thread_spawn(f64_bump, sh);
+    let t4: i32 = thread_spawn(f64_bump, sh);
+    while (arr_get(sh, 1) < 4) {
+        let pause: i32 = 0;
+        while (pause < 1000) { pause = pause + 1; }
+    }
+    print_f64(arr_f64_get(sh, 0), 2);
+    return 0;
+}
+EOF
+run_test "atomic_add_f64_contention" /tmp/edge_atomic_f64.ari "40000.00" "cmpxchg loop keeps f64 sum exact under race"
+
 # ────────────────────────────────────────────────────────────────────
 
 echo ""

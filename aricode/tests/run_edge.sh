@@ -833,6 +833,53 @@ run_test "and_or_chains" /tmp/edge_chain_and_or.ari "11
 99" "three-way chains, no false positives"
 
 # ────────────────────────────────────────────────────────────────────
+echo -e "\n${BOLD}--- Threading ---${RESET}"
+
+# #22  thread_spawn used to fall through the child path straight to
+# exit(0) without actually calling the spawned function (the child had
+# a fresh stack but no way to reach the function entry).  Fix: resolve
+# the function address at codegen time via RIP-relative LEA and pre-seed
+# it into the top slot of the child's mmap'd stack so the child can
+# pop+call.  This test catches any regression where the child silently
+# exits without running the function body.
+cat > /tmp/edge_thread_spawn.ari << 'EOF'
+fn worker() -> i32 {
+    print_int(42);
+    return 0;
+}
+
+fn main() -> i32 {
+    let tid: i32 = thread_spawn(worker);
+    let i: i32 = 0;
+    while (i < 100000000) { i = i + 1; }
+    print_int(99);
+    return 0;
+}
+EOF
+run_test "thread_spawn_basic" /tmp/edge_thread_spawn.ari "42
+99" "child must actually run worker"
+
+# #23  Multiple threads sharing the process — each child mmap's its own
+# stack, each call site gets its own RIP-relative patch, CLONE_VM keeps
+# the heap shared so print_int's stdout fd reaches the same terminal.
+cat > /tmp/edge_thread_multi.ari << 'EOF'
+fn worker_a() -> i32 { print_int(1); return 0; }
+fn worker_b() -> i32 { print_int(2); return 0; }
+fn worker_c() -> i32 { print_int(3); return 0; }
+
+fn main() -> i32 {
+    let t1: i32 = thread_spawn(worker_a);
+    let t2: i32 = thread_spawn(worker_b);
+    let t3: i32 = thread_spawn(worker_c);
+    let i: i32 = 0;
+    while (i < 200000000) { i = i + 1; }
+    print_int(9);
+    return 0;
+}
+EOF
+run_test "thread_spawn_multi" /tmp/edge_thread_multi.ari "9" "three children + parent all reach print_int"
+
+# ────────────────────────────────────────────────────────────────────
 
 echo ""
 echo -e "${BOLD}${CYAN}============================================================${RESET}"

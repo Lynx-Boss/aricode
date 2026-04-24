@@ -4,7 +4,7 @@ Honest, number-backed picture of what the compiler can do, what's
 fast, what's slow, and what's still on the backlog.  Updated after
 each performance or feature push.
 
-Last updated: 2026-04-25 (threading: + atomic_add_f64, + parallel MNIST eval (98.66 %, 10 % wall-time drop))
+Last updated: 2026-04-25 (parallel MNIST training: 97 s → 32.5 s, 2.98× wall-time, accuracy preserved)
 
 ---
 
@@ -254,24 +254,31 @@ Bit-identical `-95.856602` checksum across both binaries — same
 arithmetic, different work distribution.  `user / real ≈ 4.0` ⇒
 effective 4-core occupancy.
 
-**Benchmark 2 — real ML workload** — `aricode-ml/examples/mnist/mnist_cnn_par.ari`
-is a fork of `mnist_cnn.ari` that parallelises the per-epoch test-set
-eval.  Four workers each evaluate 2500 of the 10 000 MNIST test
-samples using their own scratch activation buffers; model weights are
-shared read-only.  Per-worker argmax tallies fold into one shared
-counter via a single `atomic_add_i64` per worker (not per sample).
+**Benchmark 2 — real ML workload (MNIST CNN)** — three variants of the
+same 98.6 %-accuracy model, increasing amount of parallelism:
 
-| Variant            | Wall time | Test acc | Notes                                  |
-|--------------------|----------:|---------:|----------------------------------------|
-| `mnist_cnn.ari`    |    97 s   | 98.66 %  | serial training + serial eval          |
-| `mnist_cnn_par.ari`|    88 s   | 98.66 %  | serial training + **parallel eval**    |
+| Variant              | Wall time | Test acc | Parallelism                          |
+|----------------------|----------:|---------:|--------------------------------------|
+| `mnist_cnn.ari`      |   97 s    | 98.66 %  | serial                               |
+| `mnist_cnn_par.ari`  |   88 s    | 98.66 %  | parallel eval only                   |
+| `mnist_cnn_par2.ari` | **32.5 s**| 98.65 %  | **parallel training + eval**         |
 
-Eval phase drops from ~1.2 s to ~0.3 s per epoch — ~10 % total
-wall-time win because training still dominates.  Final accuracy is
-bit-identical (training is deterministic; eval is a parallel reduction
-of argmax comparisons).  Parallel training (per-thread gradient
-buffers + serial reduction) is the next step toward a proper multi-core
-win on the whole loop.
+`mnist_cnn_par2.ari` — four workers split the 64-sample mini-batch,
+each accumulates into its OWN copy of the six gradient buffers
+(dW_conv, db_conv, dW_fc1, db_fc1, dW_fc2, db_fc2).  The parent folds
+worker[1..3] into worker[0] via `arr_f64_add_scaled` (six AVX2 calls
+per worker), then runs AdamW + weight decay once against worker[0]'s
+summed gradient.  Per-worker scratch activation buffers live in
+shared memory and each worker has its own `im2col_rows`, `t_lbl`, `dy`,
+`dhid`, `dpool`, `dconv` — so there's zero contention on the hot
+forward/backward path.  Loss aggregates via one `atomic_add_f64` per
+worker per batch, not per sample.
+
+2.98× wall-time over the serial build, `user / real ≈ 3.9` ⇒ effective
+4-core occupancy on the training loop.  Final accuracy 98.65 % is
+within 0.01 % of the serial 98.66 % — the tiny drift is the expected
+float-summation-order variance when 64 per-sample gradients reduce as
+(0..15)+(16..31)+(32..47)+(48..63) instead of 0+1+…+63.
 
 **Caveats**
 - `thread_wait` uses `wait4`, which returns `-ECHILD` for CLONE_THREAD

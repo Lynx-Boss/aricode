@@ -879,6 +879,59 @@ fn main() -> i32 {
 EOF
 run_test "thread_spawn_multi" /tmp/edge_thread_multi.ari "9" "three children + parent all reach print_int"
 
+# #24  thread_spawn(func, arg) — the worker receives arg in RDI so it
+# can operate on shared state (pointer, counter, slot index).  Pre-seed
+# two stack slots instead of one and `pop rdi` before the indirect call.
+cat > /tmp/edge_thread_spawn_arg.ari << 'EOF'
+fn worker(shared: i32) -> i32 {
+    arr_set(shared, 0, 123);
+    return 0;
+}
+
+fn main() -> i32 {
+    let buf: i32 = arr_new(1);
+    arr_set(buf, 0, 0);
+    let tid: i32 = thread_spawn(worker, buf);
+    let i: i32 = 0;
+    while (i < 100000000) { i = i + 1; }
+    print_int(arr_get(buf, 0));
+    return 0;
+}
+EOF
+run_test "thread_spawn_arg" /tmp/edge_thread_spawn_arg.ari "123" "worker receives shared-mem pointer"
+
+# #25  atomic_add_i64 under real contention — 4 workers each bump the
+# same counter 10_000 times.  Without `lock xadd` the count drops below
+# 40_000 because racing non-atomic read-modify-write loses updates.
+cat > /tmp/edge_atomic_add.ari << 'EOF'
+fn bump_10k(counter: i32) -> i32 {
+    let i: i32 = 0;
+    while (i < 10000) {
+        atomic_add_i64(counter, 0, 1);
+        i = i + 1;
+    }
+    atomic_add_i64(counter, 1, 1);    // "done" marker
+    return 0;
+}
+
+fn main() -> i32 {
+    let a: i32 = arr_new(2);
+    arr_set(a, 0, 0);
+    arr_set(a, 1, 0);
+    let t1: i32 = thread_spawn(bump_10k, a);
+    let t2: i32 = thread_spawn(bump_10k, a);
+    let t3: i32 = thread_spawn(bump_10k, a);
+    let t4: i32 = thread_spawn(bump_10k, a);
+    while (arr_get(a, 1) < 4) {
+        let pause: i32 = 0;
+        while (pause < 1000) { pause = pause + 1; }
+    }
+    print_int(arr_get(a, 0));
+    return 0;
+}
+EOF
+run_test "atomic_add_contention" /tmp/edge_atomic_add.ari "40000" "lock xadd keeps the count exact under 4-way race"
+
 # ────────────────────────────────────────────────────────────────────
 
 echo ""

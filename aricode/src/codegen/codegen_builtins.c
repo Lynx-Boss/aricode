@@ -5573,29 +5573,43 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
          * thread_exit(code) → (does not return)
          *   Exits the current thread
          */
-        if (strcmp(name, "thread_spawn") == 0 && argc == 1) {
-            /* thread_spawn(func):  Spawn a new thread that runs `func()`.
+        if (strcmp(name, "thread_spawn") == 0 && (argc == 1 || argc == 2)) {
+            /* thread_spawn(func)          — spawn worker with no arg
+             * thread_spawn(func, arg)     — spawn worker; arg goes in RDI
+             *                               (SysV first integer arg)
              *
              * Returns the child tid in RAX on the parent side.  `func` must
              * be a bare function identifier — resolved at codegen time.
              *
              * Flow (CLONE_VM ⇒ memory is shared between threads):
              *   1. mmap a fresh 64 KiB stack for the child.
-             *   2. Pre-seed the top slot of that stack with the absolute
-             *      address of func (computed via RIP-relative LEA so the
-             *      call_patches pass can resolve forward references).
+             *   2. Pre-seed the top slots of that stack.  Layout depends on
+             *      argc: [rsp]=func_addr for argc=1, or
+             *      [rsp]=func_addr, [rsp+8]=arg for argc=2.  The address of
+             *      func is resolved via RIP-relative LEA and the existing
+             *      call_patches rel32 mechanism, so forward references
+             *      within the compilation unit resolve correctly.
              *   3. clone(CLONE_VM|CLONE_FS|CLONE_FILES|CLONE_SIGHAND|
              *      CLONE_THREAD, stack_top) — syscall 56.  Child wakes up
-             *      with RSP = stack_top, [RSP] = func_addr.
-             *   4. Child:  pop rax ; call rax ; exit(0).
+             *      with RSP at the lowest pre-seeded slot.
+             *   4. Child:  pop rax [; pop rdi] ; call rax ; exit(0).
              *   5. Parent:  RAX already holds child_tid from clone. */
             int pn; uint8_t *b;
 
-            /* Argument must be a bare function identifier. */
+            /* First child must be a bare function identifier. */
             const ASTNode *fn_arg = node->children[1];
             if (fn_arg->type != NODE_IDENTIFIER || !fn_arg->string_val) {
-                cg_error(cg, "thread_spawn: argument must be a function name");
+                cg_error(cg, "thread_spawn: first argument must be a function name");
                 return 1;
+            }
+            const int has_arg = (argc == 2);
+
+            /* If we're passing an argument, evaluate it first and stash on
+             * the parent's stack so it survives the mmap syscall (which
+             * clobbers rax/rcx/r11 but leaves rsp untouched). */
+            if (has_arg) {
+                emit_expression(cg, node->children[2]);     /* arg → RAX */
+                pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
             }
 
             /* mmap(0, 65536, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS|MAP_STACK, -1, 0) */
@@ -5611,13 +5625,25 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             pn = emit_mov_reg_imm32(BUF(cg), REG_RAX, 9); EMIT(cg, pn);     /* __NR_mmap */
             pn = emit_syscall(BUF(cg)); EMIT(cg, pn);
 
-            /* RAX = stack base.  Load absolute address of func into RCX via
-             * RIP-relative LEA, then write it into [rax + 65528] — the top
-             * slot of the child's stack.  patch_calls() fills in the rel32
-             * once all function offsets are known, so forward references
-             * work.  The rel32 is the same shape as a CALL rel32 target
-             * (disp = target_off - (rel_pos + 4)), which is exactly what
-             * patch_calls already computes. */
+            /* RAX = stack base.  The child stack layout we seed:
+             *   argc==1:  [base+65528]=func_addr                ; RSP=base+65528
+             *   argc==2:  [base+65520]=func_addr  [base+65528]=arg   ; RSP=base+65520
+             * Reserving the top 8 bytes lets the child's `call rax` push a
+             * return address without running off the end of the mmap'd region.
+             *
+             * func_addr is loaded via RIP-relative LEA whose rel32 we
+             * register with call_patches — that resolves forward refs once
+             * all function offsets are known.  The patch formula
+             * (target_off - (rel_pos + 4)) is identical to what CALL uses,
+             * so we reuse the existing patch mechanism unchanged. */
+            if (has_arg) {
+                /* Retrieve saved arg and plant it at [rax+65528]. */
+                pn = emit_pop(BUF(cg), REG_RDX); EMIT(cg, pn);
+                b = BUF(cg); b[0]=0x48; b[1]=0x89; b[2]=0x90;                /* mov [rax+disp32], rdx */
+                int32_t arg_disp = 65528;
+                memcpy(b+3, &arg_disp, 4); EMIT(cg, 7);
+            }
+
             if (cg->patch_count >= sizeof(cg->call_patches)/sizeof(cg->call_patches[0])) {
                 cg_error(cg, "thread_spawn: too many pending call patches");
                 return 1;
@@ -5629,14 +5655,14 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             cg->patch_count++;
             EMIT(cg, 7);
 
-            /* mov [rax + 65528], rcx  (seed top of child stack) */
+            /* mov [rax + func_slot], rcx */
+            int32_t func_slot = has_arg ? 65520 : 65528;
             b = BUF(cg); b[0]=0x48; b[1]=0x89; b[2]=0x88;
-            int32_t seed_disp = 65528;
-            memcpy(b+3, &seed_disp, 4); EMIT(cg, 7);
+            memcpy(b+3, &func_slot, 4); EMIT(cg, 7);
 
-            /* Child RSP = base + 65528 (stack grows down). */
+            /* Child RSP = base + func_slot (pop order: func addr, then arg). */
             pn = emit_mov_reg_reg(BUF(cg), REG_RSI, REG_RAX); EMIT(cg, pn);
-            pn = emit_add_reg_imm(BUF(cg), REG_RSI, 65528); EMIT(cg, pn);
+            pn = emit_add_reg_imm(BUF(cg), REG_RSI, func_slot); EMIT(cg, pn);
 
             /* clone(CLONE_VM|CLONE_FS|CLONE_FILES|CLONE_SIGHAND|CLONE_THREAD, child_stack)
              * flags = 0x00010F00 — syscall 56: rdi=flags, rsi=child_stack */
@@ -5654,6 +5680,9 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
 
             /* === CHILD PATH === */
             b = BUF(cg); b[0]=0x58; EMIT(cg, 1);                             /* pop rax (func addr) */
+            if (has_arg) {
+                b = BUF(cg); b[0]=0x5F; EMIT(cg, 1);                         /* pop rdi (worker arg) */
+            }
             b = BUF(cg); b[0]=0xFF; b[1]=0xD0; EMIT(cg, 2);                  /* call rax */
             pn = emit_xor_reg_reg(BUF(cg), REG_RDI, REG_RDI); EMIT(cg, pn); /* exit code 0 */
             pn = emit_mov_reg_imm32(BUF(cg), REG_RAX, 60); EMIT(cg, pn);    /* __NR_exit */
@@ -5696,6 +5725,61 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             pn = emit_mov_reg_reg(BUF(cg), REG_RDI, REG_RAX); EMIT(cg, pn);
             pn = emit_mov_reg_imm32(BUF(cg), REG_RAX, 60); EMIT(cg, pn);
             pn = emit_syscall(BUF(cg)); EMIT(cg, pn);
+            return 1;
+        }
+
+        if (strcmp(name, "atomic_add_i64") == 0 && argc == 3) {
+            /* atomic_add_i64(base, idx, delta) -> i64
+             *
+             * Atomically computes  [base + idx*8] += delta  and returns the
+             * OLD value.  `lock xadd` is the x86 fetch-and-add primitive —
+             * the destination register is overwritten with the previous
+             * memory contents, so one instruction gives us both "commit the
+             * update" and "observe what was there before" in a single
+             * uninterruptible operation.
+             *
+             * Intended for thread barriers and lock-free counters: workers
+             * spawned via thread_spawn share the same mmap'd heap under
+             * CLONE_VM, so an arr_new'd slot is visible to every thread.
+             * Bounds-checked like arr_set. */
+            int pn; uint8_t *b;
+
+            emit_expression(cg, node->children[3]); /* delta → RAX */
+            pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
+            emit_expression(cg, node->children[2]); /* idx → RAX */
+            pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
+            emit_expression(cg, node->children[1]); /* base → RAX */
+            pn = emit_pop(BUF(cg), REG_RCX); EMIT(cg, pn); /* RCX = idx */
+            pn = emit_pop(BUF(cg), REG_RDX); EMIT(cg, pn); /* RDX = delta */
+
+            /* Bounds: length at [base-8], unsigned compare catches negative. */
+            pn = emit_mov_reg_mem(BUF(cg), REG_RSI, REG_RAX, -8); EMIT(cg, pn);
+            pn = emit_cmp_reg_reg(BUF(cg), REG_RCX, REG_RSI); EMIT(cg, pn);
+            size_t jb_pos = cg->code_size;
+            b = BUF(cg); b[0]=0x0F; b[1]=0x82; memset(b+2,0,4); EMIT(cg, 6);
+            {
+                const char *errmsg = "Runtime error: atomic_add_i64 index out of bounds\n";
+                emit_runtime_error(cg, errmsg, strlen(errmsg));
+            }
+            int32_t jb_off = (int32_t)(cg->code_size - (jb_pos + 6));
+            memcpy(cg->code + jb_pos + 2, &jb_off, 4);
+
+            /* lea rsi, [rax + rcx*8]  — address of target slot */
+            b = BUF(cg);
+            b[0] = rex(1, reg_ext(REG_RSI), reg_ext(REG_RCX), reg_ext(REG_RAX));
+            b[1] = 0x8D;
+            b[2] = modrm(0, REG_RSI & 7, 4);
+            b[3] = (uint8_t)((3 << 6) | ((REG_RCX & 7) << 3) | (REG_RAX & 7));
+            EMIT(cg, 4);
+
+            /* lock xadd [rsi], rdx  — F0 48 0F C1 /r */
+            b = BUF(cg);
+            b[0] = 0xF0; b[1] = 0x48; b[2] = 0x0F; b[3] = 0xC1;
+            b[4] = modrm(0, REG_RDX & 7, REG_RSI & 7);
+            EMIT(cg, 5);
+
+            /* Return old value in rax. */
+            pn = emit_mov_reg_reg(BUF(cg), REG_RAX, REG_RDX); EMIT(cg, pn);
             return 1;
         }
 

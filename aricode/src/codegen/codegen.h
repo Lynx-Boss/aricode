@@ -137,11 +137,17 @@ typedef struct {
     int         use_avx2;          /* 1 = emit AVX2 (256-bit) instructions */
     int         precision;         /* 6=fast(5 terms), 8=default(7), 15=strict(10) */
 
-    /* Error string dedup cache — stores code offsets of embedded error strings */
+    /* Runtime-error handler dedup cache.  Per unique error message we
+     * emit the full handler block (embedded string, write to stderr,
+     * try/catch unwind, exit) exactly once — the first time a caller
+     * hits it.  Subsequent callers get a 5-byte `jmp rel32` to the
+     * cached handler entry point, saving ~35 bytes per repeat.  Big
+     * wins on programs with many integer divisions. */
     struct {
-        const char *text;     /* pointer to static error string          */
-        size_t      code_pos; /* position in code buffer where embedded  */
-        size_t      len;      /* length of the string                    */
+        const char *text;         /* pointer to static error string      */
+        size_t      code_pos;     /* position of embedded string bytes   */
+        size_t      handler_pos;  /* position of the handler entry point */
+        size_t      len;
     } error_strings[16];
     size_t      error_string_count;
 } CodegenState;

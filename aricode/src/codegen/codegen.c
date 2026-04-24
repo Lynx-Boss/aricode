@@ -145,32 +145,42 @@ static void cg_emit_catch_unwind_check(CodegenState *cg, int set_rax_one) {
 void emit_runtime_error(CodegenState *cg, const char *errmsg, size_t errmsg_len) {
     int n; uint8_t *b;
 
-    /* Check if this error string was already embedded */
-    size_t str_pos = 0;
-    int found = 0;
+    /* Fast path: if we've already emitted a handler for this exact error
+     * string, just jump to it.  Per-callsite cost drops from ~40 bytes of
+     * inline handler to 5 bytes of rel32 jmp. */
     for (size_t i = 0; i < cg->error_string_count; i++) {
         if (cg->error_strings[i].text == errmsg) {
-            str_pos = cg->error_strings[i].code_pos;
-            found = 1;
-            break;
+            size_t target = cg->error_strings[i].handler_pos;
+            int32_t rel = (int32_t)((int64_t)target - (int64_t)(cg->code_size + 5));
+            b = BUF(cg);
+            b[0] = 0xE9;
+            memcpy(b + 1, &rel, 4);
+            EMIT(cg, 5);
+            return;
         }
     }
 
-    if (!found) {
-        /* Embed string: JMP over data, then string bytes */
-        size_t jmp_str = cg->code_size;
-        n = emit_jmp(BUF(cg), 0); EMIT(cg, n);
-        str_pos = cg->code_size;
-        memcpy(BUF(cg), errmsg, errmsg_len);
-        cg->code_size += errmsg_len;
-        cg_patch_jmp_rel32(cg, jmp_str);
-        /* Cache it */
-        if (cg->error_string_count < 16) {
-            cg->error_strings[cg->error_string_count].text = errmsg;
-            cg->error_strings[cg->error_string_count].code_pos = str_pos;
-            cg->error_strings[cg->error_string_count].len = errmsg_len;
-            cg->error_string_count++;
-        }
+    /* Slow (first-time) path: emit the string, record the handler entry
+     * point, then the full handler body.  Subsequent calls with the same
+     * errmsg will jump to the recorded entry point above. */
+
+    /* Embed string: JMP over data, then string bytes. */
+    size_t jmp_str = cg->code_size;
+    n = emit_jmp(BUF(cg), 0); EMIT(cg, n);
+    size_t str_pos = cg->code_size;
+    memcpy(BUF(cg), errmsg, errmsg_len);
+    cg->code_size += errmsg_len;
+    cg_patch_jmp_rel32(cg, jmp_str);
+
+    /* Entry point for subsequent callers: the lea+mov+syscall+exit
+     * sequence below.  Record it before emitting any of those bytes. */
+    size_t handler_pos = cg->code_size;
+    if (cg->error_string_count < 16) {
+        cg->error_strings[cg->error_string_count].text = errmsg;
+        cg->error_strings[cg->error_string_count].code_pos = str_pos;
+        cg->error_strings[cg->error_string_count].handler_pos = handler_pos;
+        cg->error_strings[cg->error_string_count].len = errmsg_len;
+        cg->error_string_count++;
     }
 
     /* lea rsi, [rip + offset_to_string] */

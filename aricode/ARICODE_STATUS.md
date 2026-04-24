@@ -118,6 +118,7 @@ Compiler-side AVX2 tensor builtins (`arr_f64_*`):
 | `arr_f64_fill`, `copy_at`, `copy_slice` |                           |
 | `arr_f64_adam_apply`                 |                              |
 | `arr_f64_conv2d_3x3_p1`              |                              |
+| `arr_f64_conv2d_3x3_p1_multi` (C_in>1) |                            |
 
 `arr_f64_conv2d_3x3_p1(padded_input, weights, bias, output, C_out)`
 is a direct-convolution AVX2 kernel hardcoded for MNIST-size CNNs
@@ -134,9 +135,25 @@ and im2col construction loops that used to dominate the CNN wall
 clock.  Each runs 4 f64 per vmovupd with a scalar tail.
 
 Pool and backward stay as pure-`.ari` helpers in
-`aricode-ml/conv2d.ari` (`conv2d_im2col`, `conv2d_backward_weights`,
-`maxpool_2x2_forward` / `_backward`).  `conv2d_forward` internally
-composes `conv2d_pad_28_to_30` + `arr_f64_conv2d_3x3_p1`.
+`aricode-ml/conv2d.ari`:
+
+  - `conv2d_forward` / `conv2d_forward_multi`: pad + call the AVX2
+    builtin, single-channel / multi-channel.
+  - `conv2d_im2col` / `conv2d_im2col_from_padded`: build 9 patch rows
+    from 28×28 input or from a channel of an already-padded tensor.
+  - `conv2d_backward_weights` / `conv2d_backward_weights_multi`: dW,
+    db via AVX2 sum_range / dot_range reductions.
+  - `conv2d_backward_input_multi`: transpose conv via kernel flip +
+    C_in/C_out axis swap on the existing forward builtin — no new
+    compiler work, just a few dozen lines of `.ari`.
+  - `maxpool_2x2_forward` / `_backward`: still scalar (AVX2 argmax
+    is low-ROI per earlier Plan agent analysis).
+
+With all three backward paths in place, a stacked LeNet-style CNN
+can be written end-to-end (conv → pool → conv → pool → FC) with
+gradients flowing through both conv layers.  MNIST demo using this
+is the next natural extension; current `mnist_cnn.ari` still uses
+the single-layer architecture at 98.66 %.
 
 ### MNIST demo — up to 98.66 % test accuracy
 

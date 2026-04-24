@@ -688,15 +688,66 @@ static int subtree_has_call(const ASTNode *n) {
 }
 
 /*
- * A handful of builtins compile down to straight-line code that only
- * touches xmm0/rax — they're safe for function-wide hot-var caching
- * because they can't clobber the xmm8..xmm15 slots we use as a cache.
+ * Builtins that compile to straight-line inline code whose register
+ * footprint is provably within the caller-saved set (xmm0-7, rax,
+ * rcx, rdx, rsi, rdi, r8-r11) plus a disciplined push/pop of rbx
+ * where needed.  They're safe to call from a function that pins f64
+ * locals in xmm8..xmm15 and i32 locals in r12..r15 for the whole
+ * body — "xmm-safe" — because no combination of inlining, helper
+ * call, or syscall in these builtins can touch the cache.
+ *
+ * The list was audited mechanically (grep for xmm8..15, ymm8..15,
+ * r12..15 inside each builtin's emit block); adding a new entry
+ * without re-running that check risks silent garbage in hot-var
+ * locals (historical canary: MNIST regressed to 8 % accuracy when
+ * the f64 return contract broke).  The UNSAFE builtins deliberately
+ * left off: arr_f64_softmax, matvec, outer_accum, adam_apply,
+ * conv2d_3x3_p1*, sigmoid, tanh, and the AVX2 log1p/exp/expm1
+ * variants — they use xmm8..xmm13 as vector accumulators.
  */
 static int call_is_xmm_safe(const char *fn) {
     if (!fn) return 0;
-    return strcmp(fn, "float_to_int") == 0
-        || strcmp(fn, "int_to_float") == 0
-        || strcmp(fn, "math_abs")     == 0;
+    /* Type-conversion / magnitude — the oldest three. */
+    if (strcmp(fn, "float_to_int") == 0) return 1;
+    if (strcmp(fn, "int_to_float") == 0) return 1;
+    if (strcmp(fn, "math_abs")     == 0) return 1;
+    /* Integer-slot array primitives — pure bounds-check + load/store. */
+    if (strcmp(fn, "arr_get")      == 0) return 1;
+    if (strcmp(fn, "arr_set")      == 0) return 1;
+    if (strcmp(fn, "arr_len")      == 0) return 1;
+    if (strcmp(fn, "arr_new")      == 0) return 1;
+    if (strcmp(fn, "byte_at")      == 0) return 1;
+    if (strcmp(fn, "mem_free")     == 0) return 1;
+    /* Scalar transcendentals — SSE2 polynomial approximations,
+     * xmm0..xmm7 only. */
+    if (strcmp(fn, "math_sqrt")    == 0) return 1;
+    if (strcmp(fn, "math_exp")     == 0) return 1;
+    if (strcmp(fn, "math_log")     == 0) return 1;
+    if (strcmp(fn, "math_sin")     == 0) return 1;
+    if (strcmp(fn, "math_cos")     == 0) return 1;
+    if (strcmp(fn, "math_expm1")   == 0) return 1;
+    if (strcmp(fn, "math_log1p")   == 0) return 1;
+    /* Scalar f64-slot array primitives — same shape as arr_get/set. */
+    if (strcmp(fn, "arr_f64_get")  == 0) return 1;
+    if (strcmp(fn, "arr_f64_set")  == 0) return 1;
+    if (strcmp(fn, "arr_f64_new")  == 0) return 1;
+    /* AVX2 reductions — ymm0 accumulator, xmm0 tail, rbx push/pop. */
+    if (strcmp(fn, "arr_f64_sum")         == 0) return 1;
+    if (strcmp(fn, "arr_f64_sum_range")   == 0) return 1;
+    if (strcmp(fn, "arr_f64_sum_kahan")   == 0) return 1;
+    if (strcmp(fn, "arr_f64_dot")         == 0) return 1;
+    if (strcmp(fn, "arr_f64_dot_range")   == 0) return 1;
+    /* AVX2 element-wise / bulk memory — same register discipline. */
+    if (strcmp(fn, "arr_f64_scale")       == 0) return 1;
+    if (strcmp(fn, "arr_f64_fill")        == 0) return 1;
+    if (strcmp(fn, "arr_f64_copy_at")     == 0) return 1;
+    if (strcmp(fn, "arr_f64_copy_slice")  == 0) return 1;
+    if (strcmp(fn, "arr_f64_add_scaled")  == 0) return 1;
+    if (strcmp(fn, "arr_f64_sub")         == 0) return 1;
+    if (strcmp(fn, "arr_f64_mul")         == 0) return 1;
+    if (strcmp(fn, "arr_f64_relu")        == 0) return 1;
+    if (strcmp(fn, "arr_f64_log")         == 0) return 1;
+    return 0;
 }
 
 /*

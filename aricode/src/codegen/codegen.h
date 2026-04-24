@@ -181,6 +181,7 @@ void emit_builtin_print_str(CodegenState *cg, const ASTNode *arg);
 void emit_builtin_print_int(CodegenState *cg, const ASTNode *arg);
 void emit_builtin_read_int(CodegenState *cg);
 LocalVar *add_local(CodegenState *cg, const char *name);
+LocalVar *find_local(CodegenState *cg, const char *name);
 
 /* ------------------------------------------------------------------ */
 /*  API                                                               */

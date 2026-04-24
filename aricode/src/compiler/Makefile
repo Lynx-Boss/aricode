@@ -30,6 +30,8 @@ SRCS = \
 	$(ERRORS_DIR)/podium.c \
 	$(CODEGEN_DIR)/codegen.c \
 	$(CODEGEN_DIR)/codegen_builtins.c \
+	$(CODEGEN_DIR)/hot_var.c \
+	$(CODEGEN_DIR)/peepholes.c \
 	$(CODEGEN_DIR)/optimizer.c \
 	$(CODEGEN_DIR)/elf.c \
 	$(DECIMAL_DIR)/decimal.c \

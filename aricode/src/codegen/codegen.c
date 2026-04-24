@@ -21,7 +21,9 @@
 
 #include "codegen.h"
 #include "codegen_builtins.h"
+#include "hot_var.h"
 #include "optimizer.h"
+#include "peepholes.h"
 #include "x86_64.h"
 #include "../parser/struct_registry.h"
 
@@ -209,7 +211,7 @@ void emit_runtime_error(CodegenState *cg, const char *errmsg, size_t errmsg_len)
 /*  Symbol lookup                                                     */
 /* ------------------------------------------------------------------ */
 
-static LocalVar *find_local(CodegenState *cg, const char *name) {
+LocalVar *find_local(CodegenState *cg, const char *name) {
     /* Search from the END to find the most recently declared variable.
      * This is critical for variables declared inside while loops --
      * each iteration creates a new stack slot, and we must always
@@ -564,42 +566,7 @@ static int emit_identifier(CodegenState *cg, const ASTNode *node) {
     return v->is_float;
 }
 
-/*
- * If `node` is a hot-GP-backed identifier, return its cached register
- * index (r12..r15).  Otherwise -1.
- *
- * Reading a hot-GP register has no side effect, so when both sides of
- * an integer binop are hot-GP identifiers we can skip the stack
- * stash entirely and go straight into `cmp r_left, r_right` style
- * emission.  The tightest inner-loop wins come from this —
- * `while (i < n)` with both `i` and `n` pinned to callee-saved GP
- * regs used to emit 7 insns (mov/push/mov/mov/pop/cmp/jcc); after
- * the fast path it's 2 (cmp/jcc).
- */
-static int node_hot_gp_reg(CodegenState *cg, const ASTNode *node) {
-    if (!node || node->type != NODE_IDENTIFIER || !node->string_val) return -1;
-    LocalVar *v = find_local(cg, node->string_val);
-    if (!v || v->hot_gp < 0) return -1;
-    return v->hot_gp;
-}
-
-/*
- * f64 counterpart of node_hot_gp_reg — if `node` is a hot-XMM-backed
- * f64 identifier, return its xmm index (xmm8..xmm15).  Else -1.
- *
- * The arithmetic instructions (addsd/subsd/mulsd/divsd) all accept
- * an extended xmm register as their right operand via REX.B, so we
- * can skip the classic "stash left / load right into xmm1 / unstash"
- * dance and emit the op directly against the hot register.  For
- * `sum + sign / denom` in the Leibniz hot loop that saves ~4 insns
- * per binop.
- */
-static int node_hot_xmm_reg(CodegenState *cg, const ASTNode *node) {
-    if (!node || node->type != NODE_IDENTIFIER || !node->string_val) return -1;
-    LocalVar *v = find_local(cg, node->string_val);
-    if (!v || v->hot_xmm < 0) return -1;
-    return v->hot_xmm;
-}
+/* node_hot_gp_reg / node_hot_xmm_reg moved to hot_var.c */
 
 /*
  * PEEPHOLE: Check if binary op right operand is an immediate constant.
@@ -687,167 +654,9 @@ static int subtree_has_call(const ASTNode *n) {
     return 0;
 }
 
-/*
- * Builtins that compile to straight-line inline code whose register
- * footprint is provably within the caller-saved set (xmm0-7, rax,
- * rcx, rdx, rsi, rdi, r8-r11) plus a disciplined push/pop of rbx
- * where needed.  They're safe to call from a function that pins f64
- * locals in xmm8..xmm15 and i32 locals in r12..r15 for the whole
- * body — "xmm-safe" — because no combination of inlining, helper
- * call, or syscall in these builtins can touch the cache.
- *
- * The list was audited mechanically (grep for xmm8..15, ymm8..15,
- * r12..15 inside each builtin's emit block); adding a new entry
- * without re-running that check risks silent garbage in hot-var
- * locals (historical canary: MNIST regressed to 8 % accuracy when
- * the f64 return contract broke).  The UNSAFE builtins deliberately
- * left off: arr_f64_softmax, matvec, outer_accum, adam_apply,
- * conv2d_3x3_p1*, sigmoid, tanh, and the AVX2 log1p/exp/expm1
- * variants — they use xmm8..xmm13 as vector accumulators.
- */
-static int call_is_xmm_safe(const char *fn) {
-    if (!fn) return 0;
-    /* Type-conversion / magnitude — the oldest three. */
-    if (strcmp(fn, "float_to_int") == 0) return 1;
-    if (strcmp(fn, "int_to_float") == 0) return 1;
-    if (strcmp(fn, "math_abs")     == 0) return 1;
-    /* Integer-slot array primitives — pure bounds-check + load/store. */
-    if (strcmp(fn, "arr_get")      == 0) return 1;
-    if (strcmp(fn, "arr_set")      == 0) return 1;
-    if (strcmp(fn, "arr_len")      == 0) return 1;
-    if (strcmp(fn, "arr_new")      == 0) return 1;
-    if (strcmp(fn, "byte_at")      == 0) return 1;
-    if (strcmp(fn, "mem_free")     == 0) return 1;
-    /* Scalar transcendentals — SSE2 polynomial approximations,
-     * xmm0..xmm7 only. */
-    if (strcmp(fn, "math_sqrt")    == 0) return 1;
-    if (strcmp(fn, "math_exp")     == 0) return 1;
-    if (strcmp(fn, "math_log")     == 0) return 1;
-    if (strcmp(fn, "math_sin")     == 0) return 1;
-    if (strcmp(fn, "math_cos")     == 0) return 1;
-    if (strcmp(fn, "math_expm1")   == 0) return 1;
-    if (strcmp(fn, "math_log1p")   == 0) return 1;
-    /* Scalar f64-slot array primitives — same shape as arr_get/set. */
-    if (strcmp(fn, "arr_f64_get")  == 0) return 1;
-    if (strcmp(fn, "arr_f64_set")  == 0) return 1;
-    if (strcmp(fn, "arr_f64_new")  == 0) return 1;
-    /* AVX2 reductions — ymm0 accumulator, xmm0 tail, rbx push/pop. */
-    if (strcmp(fn, "arr_f64_sum")         == 0) return 1;
-    if (strcmp(fn, "arr_f64_sum_range")   == 0) return 1;
-    if (strcmp(fn, "arr_f64_sum_kahan")   == 0) return 1;
-    if (strcmp(fn, "arr_f64_dot")         == 0) return 1;
-    if (strcmp(fn, "arr_f64_dot_range")   == 0) return 1;
-    /* AVX2 element-wise / bulk memory — same register discipline. */
-    if (strcmp(fn, "arr_f64_scale")       == 0) return 1;
-    if (strcmp(fn, "arr_f64_fill")        == 0) return 1;
-    if (strcmp(fn, "arr_f64_copy_at")     == 0) return 1;
-    if (strcmp(fn, "arr_f64_copy_slice")  == 0) return 1;
-    if (strcmp(fn, "arr_f64_add_scaled")  == 0) return 1;
-    if (strcmp(fn, "arr_f64_sub")         == 0) return 1;
-    if (strcmp(fn, "arr_f64_mul")         == 0) return 1;
-    if (strcmp(fn, "arr_f64_relu")        == 0) return 1;
-    if (strcmp(fn, "arr_f64_log")         == 0) return 1;
-    /* Dense-layer kernels — initially suspected unsafe based on push
-     * r12..r14 (ABI save/restore pattern) but empirically verified to
-     * touch only ymm0..ymm3, xmm7 inside the body.  Adding them to
-     * the safe list lets dense_forward and dense_backward enter
-     * hot-var mode — the primary MNIST inner-loop functions. */
-    if (strcmp(fn, "arr_f64_matvec")      == 0) return 1;
-    if (strcmp(fn, "arr_f64_matvec_T")    == 0) return 1;
-    if (strcmp(fn, "arr_f64_outer_accum") == 0) return 1;
-    return 0;
-}
+/* call_is_xmm_safe / subtree_has_xmm_clobbering_call moved to hot_var.c */
 
-/*
- * Does any call in this subtree go to something other than our
- * xmm-safe whitelist?  Used to enable hot-var mode: if the whole
- * function body is call-free (apart from whitelisted builtins) AND
- * doesn't use try/catch (which commandeers r12..r15 for error-unwind
- * state), we can pin f64 locals to xmm8..xmm15 and i32 locals to
- * r12..r15 for the entire body without worrying about clobbers.
- */
-static int subtree_has_xmm_clobbering_call(const ASTNode *n) {
-    if (!n) return 0;
-    if (n->type == NODE_CALL) {
-        const ASTNode *callee = n->child_count > 0 ? n->children[0] : NULL;
-        const char *name = callee ? callee->string_val : NULL;
-        if (!call_is_xmm_safe(name)) return 1;
-        /* Safe call itself, but check its args for nested calls. */
-        for (size_t i = 1; i < n->child_count; i++)
-            if (subtree_has_xmm_clobbering_call(n->children[i])) return 1;
-        return 0;
-    }
-    /* try/catch uses r12..r15 as the error-unwind register quartet,
-     * which collides with our i32 cache.  Treat as clobbering so the
-     * enclosing function opts out of hot-var mode. */
-    if (n->type == NODE_TRY_CATCH || n->type == NODE_ERROR_RAISE) return 1;
-    for (size_t i = 0; i < n->child_count; i++)
-        if (subtree_has_xmm_clobbering_call(n->children[i])) return 1;
-    return 0;
-}
-
-/*
- * Peephole: if the last 5 bytes of the code buffer are `movq rax, xmm0`
- * (66 48 0F 7E C0), strip them.  Used when the caller is about to do
- * something that only cares about xmm0 — typically a movsd store or a
- * movapd xmm1, xmm0 — and the preceding RAX round-trip is wasted.
- *
- * Returns 1 if the peephole fired, 0 otherwise.
- */
-static int peephole_drop_movq_rax_xmm0(CodegenState *cg) {
-    if (cg->code_size < 5) return 0;
-    const uint8_t *p = cg->code + cg->code_size - 5;
-    if (p[0] == 0x66 && p[1] == 0x48 && p[2] == 0x0F &&
-        p[3] == 0x7E && p[4] == 0xC0) {
-        cg->code_size -= 5;
-        return 1;
-    }
-    return 0;
-}
-
-/*
- * Emit the "skip if false" conditional jump for an `if`/`while`/`for`.
- * Returns the offset of the 6-byte conditional jump in the code buffer,
- * so the caller can patch its rel32 target once the skip destination
- * is known.
- *
- * Peephole: when the condition expression just materialised a boolean
- * via `setCC al; movzx rax, al` (7 bytes), the flags from the
- * originating cmp / ucomisd are still live — setCC reads flags and
- * movzx doesn't touch them.  We rewind those two instructions and
- * emit `jcc_inverse rel32` directly instead of the 11-byte
- * setCC + movzx + cmp rax, 0 + je sequence.  Saves 5 bytes and 3
- * pipeline slots per branching comparison.
- *
- * Fallback: the old `cmp rax, 0; je rel32` pattern for non-comparison
- * conditions (raw booleans, call results, arithmetic).
- */
-static size_t cg_emit_cond_jump_skip(CodegenState *cg) {
-    if (cg->code_size >= 7) {
-        const uint8_t *p = cg->code + cg->code_size - 7;
-        /* setCC al: 0F 9X C0    (X = condition code) */
-        /* movzx rax, al: 48 0F B6 C0 */
-        if (p[0] == 0x0F && (p[1] & 0xF0) == 0x90 && p[2] == 0xC0 &&
-            p[3] == 0x48 && p[4] == 0x0F && p[5] == 0xB6 && p[6] == 0xC0) {
-            uint8_t cc_true = p[1] & 0x0F;            /* the condition tested */
-            cg->code_size -= 7;                        /* rewind setCC + movzx */
-            /* JCC near with the INVERTED condition (skip when false).
-             * Low bit of the condition code is the negation, so XOR 1. */
-            uint8_t *b = BUF(cg);
-            b[0] = 0x0F;
-            b[1] = (uint8_t)(0x80 | (cc_true ^ 0x01));
-            memset(b + 2, 0, 4);                       /* rel32 placeholder */
-            size_t pos = cg->code_size;
-            EMIT(cg, 6);
-            return pos;
-        }
-    }
-    /* Cold path: plain `cmp rax, 0; je rel32`. */
-    int n = emit_cmp_reg_imm(BUF(cg), REG_RAX, 0); EMIT(cg, n);
-    size_t pos = cg->code_size;
-    n = emit_je(BUF(cg), 0); EMIT(cg, n);
-    return pos;
-}
+/* peephole_drop_movq_rax_xmm0 / cg_emit_cond_jump_skip moved to peepholes.c */
 
 static void emit_binary_op(CodegenState *cg, const ASTNode *node) {
     const char *op = node->op;

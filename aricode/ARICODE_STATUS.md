@@ -4,7 +4,7 @@ Honest, number-backed picture of what the compiler can do, what's
 fast, what's slow, and what's still on the backlog.  Updated after
 each performance or feature push.
 
-Last updated: 2026-04-25 (compute-dominated loops 2.5× faster; Leibniz 100M now 1.66× vs gcc -O2)
+Last updated: 2026-04-25 (xmm-safe whitelist widened; dot_loop 1.35×; Leibniz 1.66× vs gcc -O2)
 
 ---
 
@@ -81,6 +81,12 @@ Starting point was 4.2-4.8× slower; the chain of codegen
 optimisations listed in `project_instruction_scheduling` (memory)
 closed roughly 60-65 % of the gap.  Latest wins (2026-04-25):
 
+- **Widened xmm-safe builtin whitelist** — `call_is_xmm_safe` grew
+  from 3 names to 30 after a per-builtin audit for xmm8..15 /
+  r12..15 clobbers.  Scalar hot-loops that previously stayed on
+  the cold stack-based path because they called `arr_f64_get`,
+  `math_log` etc. now enter hot-var mode.  Microbench dot_loop
+  dropped 420 ms → 312 ms (1.35×); MNIST binary shrank 2.4 %.
 - **Hot-GP binop fast path** — when the right operand of an integer
   binop is a callee-saved hot-GP identifier (r12-r15), skip the
   stack stash and read it directly as the RCX source.  `while (i < n)`

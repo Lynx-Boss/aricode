@@ -3142,29 +3142,53 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             return 1;
         }
         if (strcmp(name, "arr_f64_sum") == 0 && argc == 1) {
-            /* SSE2 sum of f64 array: ADDSD accumulator loop */
+            /* AVX2 sum: vaddpd into a 256-bit accumulator (4 doubles
+             * per iter), horizontal reduce at the end, then a scalar
+             * tail for the n % 4 remainder. */
             emit_expression(cg, node->children[1]); /* base */
             int pn; uint8_t *b;
             pn = emit_mov_reg_reg(BUF(cg), REG_RDI, REG_RAX); EMIT(cg, pn);
             pn = emit_mov_reg_mem(BUF(cg), REG_RCX, REG_RAX, -8); EMIT(cg, pn);
-            /* xorpd xmm0, xmm0 (zero accumulator) */
-            b = BUF(cg); b[0]=0x66; b[1]=0x0F; b[2]=0x57; b[3]=0xC0; EMIT(cg, 4);
+
+            /* RDX = n & ~3 */
+            pn = emit_mov_reg_reg(BUF(cg), REG_RDX, REG_RCX); EMIT(cg, pn);
+            b = BUF(cg); b[0]=0x48; b[1]=0x83; b[2]=0xE2; b[3]=0xFC; EMIT(cg, 4);
+
+            /* vxorpd ymm0, ymm0, ymm0  (accumulator) */
+            b = BUF(cg); b[0]=0xC5; b[1]=0xFD; b[2]=0x57; b[3]=0xC0; EMIT(cg, 4);
+
             pn = emit_xor_reg_reg(BUF(cg), REG_RSI, REG_RSI); EMIT(cg, pn);
-            CgCountedLoop lp = cg_loop_begin(cg, REG_RSI, REG_RCX);
-            /* movsd xmm1, [rdi + rsi*8] */
+
+            /* Vec loop: ymm0 += [rdi + rsi*8] (4 f64 per iter). */
+            CgCountedLoop vec = cg_loop_begin(cg, REG_RSI, REG_RDX);
+            cg_vmovupd_ymm_base_idx(cg, 1, REG_RDI, REG_RSI, 0x10);
+            /* vaddpd ymm0, ymm0, ymm1  —  VEX.256.66.0F 58 /r */
+            b = BUF(cg); b[0]=0xC5; b[1]=0xFD; b[2]=0x58; b[3]=0xC1; EMIT(cg, 4);
+            cg_loop_end(cg, vec, 4);
+
+            /* Horizontal reduce: ymm0 → xmm0 (low lane). */
+            /* vextractf128 xmm1, ymm0, 1 */
+            b = BUF(cg); b[0]=0xC4; b[1]=0xE3; b[2]=0x7D; b[3]=0x19; b[4]=0xC1; b[5]=0x01; EMIT(cg, 6);
+            /* vaddpd xmm0, xmm0, xmm1 */
+            b = BUF(cg); b[0]=0xC5; b[1]=0xF9; b[2]=0x58; b[3]=0xC1; EMIT(cg, 4);
+            /* vhaddpd xmm0, xmm0, xmm0 */
+            b = BUF(cg); b[0]=0xC5; b[1]=0xF9; b[2]=0x7C; b[3]=0xC0; EMIT(cg, 4);
+
+            /* Scalar tail. */
+            CgCountedLoop tail = cg_loop_begin(cg, REG_RSI, REG_RCX);
             cg_movsd_xmm_base_idx(cg, 1, REG_RDI, REG_RSI, 0x10);
-            /* addsd xmm0, xmm1 */
             pn = emit_addsd(BUF(cg), 0, 1); EMIT(cg, pn);
-            cg_loop_end(cg, lp, 1);
-            /* movq rax, xmm0 (return f64 bits) */
+            cg_loop_end(cg, tail, 1);
+
+            /* vzeroupper + movq rax, xmm0 */
+            b = BUF(cg); b[0]=0xC5; b[1]=0xF8; b[2]=0x77; EMIT(cg, 3);
             b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x7E; b[4]=0xC0; EMIT(cg, 5);
             return 1;
         }
         if (strcmp(name, "arr_f64_sum_range") == 0 && argc == 3) {
-            /* Sum n consecutive f64 elements starting at buf[offset].
-             * Eliminates the scratch-copy step in the common "sum a
-             * row of a flat matrix" pattern — e.g., conv2d's per-
-             * channel bias gradient. */
+            /* AVX2 sum over buf[offset..offset+n-1].  Eliminates the
+             * scratch-copy step in per-row reductions of flat
+             * matrices. */
             emit_expression(cg, node->children[3]); /* n */
             int pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
             emit_expression(cg, node->children[2]); /* offset */
@@ -3180,23 +3204,41 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             b = BUF(cg); b[0]=0x48; b[1]=0x01; b[2]=0xF0; EMIT(cg, 3);
             pn = emit_mov_reg_reg(BUF(cg), REG_RDI, REG_RAX); EMIT(cg, pn);
 
-            /* xorpd xmm0, xmm0  (accumulator = 0) */
-            b = BUF(cg); b[0]=0x66; b[1]=0x0F; b[2]=0x57; b[3]=0xC0; EMIT(cg, 4);
+            /* RDX = n & ~3 */
+            pn = emit_mov_reg_reg(BUF(cg), REG_RDX, REG_RCX); EMIT(cg, pn);
+            b = BUF(cg); b[0]=0x48; b[1]=0x83; b[2]=0xE2; b[3]=0xFC; EMIT(cg, 4);
+
+            /* vxorpd ymm0, ymm0, ymm0 */
+            b = BUF(cg); b[0]=0xC5; b[1]=0xFD; b[2]=0x57; b[3]=0xC0; EMIT(cg, 4);
 
             pn = emit_xor_reg_reg(BUF(cg), REG_RSI, REG_RSI); EMIT(cg, pn);
-            CgCountedLoop lp = cg_loop_begin(cg, REG_RSI, REG_RCX);
+
+            CgCountedLoop vec = cg_loop_begin(cg, REG_RSI, REG_RDX);
+            cg_vmovupd_ymm_base_idx(cg, 1, REG_RDI, REG_RSI, 0x10);
+            /* vaddpd ymm0, ymm0, ymm1 */
+            b = BUF(cg); b[0]=0xC5; b[1]=0xFD; b[2]=0x58; b[3]=0xC1; EMIT(cg, 4);
+            cg_loop_end(cg, vec, 4);
+
+            /* Horizontal reduce. */
+            b = BUF(cg); b[0]=0xC4; b[1]=0xE3; b[2]=0x7D; b[3]=0x19; b[4]=0xC1; b[5]=0x01; EMIT(cg, 6);
+            b = BUF(cg); b[0]=0xC5; b[1]=0xF9; b[2]=0x58; b[3]=0xC1; EMIT(cg, 4);
+            b = BUF(cg); b[0]=0xC5; b[1]=0xF9; b[2]=0x7C; b[3]=0xC0; EMIT(cg, 4);
+
+            CgCountedLoop tail = cg_loop_begin(cg, REG_RSI, REG_RCX);
             cg_movsd_xmm_base_idx(cg, 1, REG_RDI, REG_RSI, 0x10);
             pn = emit_addsd(BUF(cg), 0, 1); EMIT(cg, pn);
-            cg_loop_end(cg, lp, 1);
+            cg_loop_end(cg, tail, 1);
 
-            /* movq rax, xmm0  (f64 return contract) */
+            /* vzeroupper + movq rax, xmm0 */
+            b = BUF(cg); b[0]=0xC5; b[1]=0xF8; b[2]=0x77; EMIT(cg, 3);
             b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x7E; b[4]=0xC0; EMIT(cg, 5);
             return 1;
         }
         if (strcmp(name, "arr_f64_dot_range") == 0 && argc == 5) {
-            /* Dot product of n elements:  Σ a[off_a+i] · b[off_b+i].
-             * Lets callers avoid copying slices of a flat matrix into
-             * a scratch buffer before feeding arr_f64_dot. */
+            /* AVX2 dot product over two slices:
+             *   Σ a[off_a + i] · b[off_b + i]   for i in [0, n).
+             * Four vfmadd231pd per iter into a ymm accumulator, scalar
+             * tail for the n % 4 remainder. */
             emit_expression(cg, node->children[5]); /* n */
             int pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
             emit_expression(cg, node->children[4]); /* off_b */
@@ -3217,23 +3259,42 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             /* R8 = b + off_b*8 */
             b = BUF(cg); b[0]=0x4C; b[1]=0x8B; b[2]=0x44; b[3]=0x24; b[4]=0x08; EMIT(cg, 5); /* mov r8, [rsp+8] */
             b = BUF(cg); b[0]=0x48; b[1]=0x8B; b[2]=0x54; b[3]=0x24; b[4]=0x10; EMIT(cg, 5); /* mov rdx, [rsp+16] */
-            b = BUF(cg); b[0]=0x49; b[1]=0x8D; b[2]=0x04; b[3]=0xD0; EMIT(cg, 4);          /* lea rax, [r8 + rdx*8]  (REX.WB for r8 base) */
+            b = BUF(cg); b[0]=0x49; b[1]=0x8D; b[2]=0x04; b[3]=0xD0; EMIT(cg, 4);          /* lea rax, [r8 + rdx*8] */
             pn = emit_mov_reg_reg(BUF(cg), 8 /* R8 */, REG_RAX); EMIT(cg, pn);              /* r8 = start of b */
             /* RCX = n */
             b = BUF(cg); b[0]=0x48; b[1]=0x8B; b[2]=0x4C; b[3]=0x24; b[4]=0x18; EMIT(cg, 5);
 
-            /* xorpd xmm0, xmm0 */
-            b = BUF(cg); b[0]=0x66; b[1]=0x0F; b[2]=0x57; b[3]=0xC0; EMIT(cg, 4);
+            /* RDX = n & ~3  (vec length) */
+            pn = emit_mov_reg_reg(BUF(cg), REG_RDX, REG_RCX); EMIT(cg, pn);
+            b = BUF(cg); b[0]=0x48; b[1]=0x83; b[2]=0xE2; b[3]=0xFC; EMIT(cg, 4);
+
+            /* vxorpd ymm0, ymm0, ymm0 */
+            b = BUF(cg); b[0]=0xC5; b[1]=0xFD; b[2]=0x57; b[3]=0xC0; EMIT(cg, 4);
 
             pn = emit_xor_reg_reg(BUF(cg), REG_RSI, REG_RSI); EMIT(cg, pn);
-            CgCountedLoop lp = cg_loop_begin(cg, REG_RSI, REG_RCX);
+
+            CgCountedLoop vec = cg_loop_begin(cg, REG_RSI, REG_RDX);
+            cg_vmovupd_ymm_base_idx(cg, 1, REG_RDI, REG_RSI, 0x10);
+            cg_vmovupd_ymm_base_idx(cg, 2, 8 /* R8 */, REG_RSI, 0x10);
+            /* vfmadd231pd ymm0, ymm1, ymm2 : C4 E2 F5 B8 C2 */
+            b = BUF(cg); b[0]=0xC4; b[1]=0xE2; b[2]=0xF5; b[3]=0xB8; b[4]=0xC2; EMIT(cg, 5);
+            cg_loop_end(cg, vec, 4);
+
+            /* Horizontal reduce ymm0 → xmm0 low. */
+            b = BUF(cg); b[0]=0xC4; b[1]=0xE3; b[2]=0x7D; b[3]=0x19; b[4]=0xC1; b[5]=0x01; EMIT(cg, 6);
+            b = BUF(cg); b[0]=0xC5; b[1]=0xF9; b[2]=0x58; b[3]=0xC1; EMIT(cg, 4);
+            b = BUF(cg); b[0]=0xC5; b[1]=0xF9; b[2]=0x7C; b[3]=0xC0; EMIT(cg, 4);
+
+            /* Scalar tail: xmm0 += [rdi+rsi*8] · [r8+rsi*8] */
+            CgCountedLoop tail = cg_loop_begin(cg, REG_RSI, REG_RCX);
             cg_movsd_xmm_base_idx(cg, 1, REG_RDI, REG_RSI, 0x10);
             cg_movsd_xmm_base_idx(cg, 2, 8 /* R8 */, REG_RSI, 0x10);
             pn = emit_mulsd(BUF(cg), 1, 2); EMIT(cg, pn);
             pn = emit_addsd(BUF(cg), 0, 1); EMIT(cg, pn);
-            cg_loop_end(cg, lp, 1);
+            cg_loop_end(cg, tail, 1);
 
-            /* Drop 4 pushed args + movq rax, xmm0. */
+            /* vzeroupper + drop args + movq rax, xmm0. */
+            b = BUF(cg); b[0]=0xC5; b[1]=0xF8; b[2]=0x77; EMIT(cg, 3);
             b = BUF(cg); b[0]=0x48; b[1]=0x83; b[2]=0xC4; b[3]=0x20; EMIT(cg, 4);
             b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x7E; b[4]=0xC0; EMIT(cg, 5);
             return 1;

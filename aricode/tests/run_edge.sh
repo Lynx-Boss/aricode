@@ -364,6 +364,44 @@ run_test "arr_f64_fill_spot" /tmp/edge_fill.ari "3.1400
 3.1400
 0.0000" "broadcast-fill including the n % 4 scalar tail"
 
+# #7j  arr_f64_conv2d_3x3_p1_multi — C_in > 1 case via a known impulse.
+# 2 input channels, both with a 1.0 impulse at the centre (15, 15) of
+# the padded plane (= output position (14, 14)).  With identity kernel
+# on channel 0 going to output channel 0 and zero on all others, we
+# expect output[0, 14, 14] = 2.0 (both inputs sum into channel 0).
+cat > /tmp/edge_conv2d_multi.ari << 'EOF'
+fn main() -> i32 {
+    let C_IN:  i32 = 2;
+    let C_OUT: i32 = 1;
+
+    let padded: i32 = arr_f64_new(C_IN * 900);
+    let i: i32 = 0;
+    while (i < C_IN * 900) { arr_f64_set(padded, i, 0.0); i += 1; }
+    arr_f64_set(padded, 0 * 900 + 15 * 30 + 15, 1.0);
+    arr_f64_set(padded, 1 * 900 + 15 * 30 + 15, 1.0);
+
+    // weights[0, 0, :, :] = identity (centre 1, rest 0)
+    // weights[0, 1, :, :] = identity too  → sum of two channels.
+    let weights: i32 = arr_f64_new(C_OUT * C_IN * 9);
+    i = 0;
+    while (i < C_OUT * C_IN * 9) { arr_f64_set(weights, i, 0.0); i += 1; }
+    arr_f64_set(weights,  4, 1.0);   // w[0, 0, 1, 1] = 1
+    arr_f64_set(weights, 13, 1.0);   // w[0, 1, 1, 1] = 1
+
+    let bias: i32 = arr_f64_new(C_OUT);
+    arr_f64_set(bias, 0, 0.0);
+
+    let output: i32 = arr_f64_new(C_OUT * 784);
+    arr_f64_conv2d_3x3_p1_multi(padded, C_IN, weights, bias, output, C_OUT);
+
+    print_f64(arr_f64_get(output, 14 * 28 + 14), 4);  // 2.0000
+    print_f64(arr_f64_get(output, 0), 4);             // 0.0000 (corner, no impulse)
+    return 0;
+}
+EOF
+run_test "conv2d_3x3_multi_impulse" /tmp/edge_conv2d_multi.ari "2.0000
+0.0000" "2 input channels sum at the centre, zero elsewhere"
+
 # #7d  arr_f64_conv2d_3x3_p1 — spot-check two known-output cases.
 # Input is pre-padded (30×30).  Caller owns padding; this builtin is
 # the straight-line AVX2 convolution.

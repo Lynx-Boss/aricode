@@ -4242,6 +4242,391 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             return 1;
         }
 
+        if (strcmp(name, "arr_f64_conv2d_3x3_p1_multi") == 0 && argc == 6) {
+            /* Multi-channel direct convolution:
+             *   Input    : C_in channels of 28×28, pre-padded to 30×30 each.
+             *              Layout: [C_in, 30, 30] flat  (900 · C_in f64).
+             *   Kernel   : 3×3, stride 1, pad 1.
+             *   Weights  : [C_out, C_in, 3, 3] flat  (9 · C_in · C_out f64).
+             *   Bias     : [C_out]
+             *   Output   : [C_out, 28, 28] flat       (784 · C_out f64).
+             *
+             * Algorithm: for each c_out, fill the output plane with
+             * bias[c_out], then accumulate 9-tap convolution
+             * contributions from every input channel.  Per (c_out, c_in),
+             * broadcast the 9 weights once and sweep over the 28 × 7
+             * output chunks, load-modify-store the accumulator.
+             *
+             * Register plan after prolog:
+             *   RDI = padded base           R8  = weights base
+             *   RBX = bias base (pushed)    R9  = output base
+             *   R10 = C_in                  R15 = C_out (pushed)
+             *   RAX = c_out counter         RCX = c_in counter
+             *   RDX = y counter / x_bytes   RSI = output_c_base (c_out)
+             *   R11 = transient (weights_cc_base, padded_c_in_base,
+             *         output_row_base — reused across scopes)
+             *   R12/R13/R14 = padded row 0/1/2 (pushed)
+             *
+             *   ymm0..ymm8 = 9 broadcast weights for current (c_out, c_in)
+             *   ymm9       = bias broadcast (fill step only)
+             *   ymm10      = acc / load-store chunk
+             *   ymm11      = input-chunk load
+             *
+             * Callee-saved pushes: rbx, r12, r13, r14, r15 (5 total).
+             * Args pushed on stack: C_out, output, bias, weights, C_in (5).
+             * Stack layout after all pushes:
+             *   [rsp+0]  = r15   [rsp+8]  = r14   [rsp+16] = r13
+             *   [rsp+24] = r12   [rsp+32] = rbx
+             *   [rsp+40] = C_in  [rsp+48] = weights
+             *   [rsp+56] = bias  [rsp+64] = output
+             *   [rsp+72] = C_out
+             */
+            emit_expression(cg, node->children[6]); /* C_out */
+            int pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
+            emit_expression(cg, node->children[5]); /* output */
+            pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
+            emit_expression(cg, node->children[4]); /* bias */
+            pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
+            emit_expression(cg, node->children[3]); /* weights */
+            pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
+            emit_expression(cg, node->children[2]); /* C_in */
+            pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
+            emit_expression(cg, node->children[1]); /* padded → RAX */
+            uint8_t *b;
+
+            /* Callee-saved pushes. */
+            pn = emit_push(BUF(cg), REG_RBX); EMIT(cg, pn);
+            b = BUF(cg); b[0]=0x41; b[1]=0x54; EMIT(cg, 2); /* push r12 */
+            b = BUF(cg); b[0]=0x41; b[1]=0x55; EMIT(cg, 2); /* push r13 */
+            b = BUF(cg); b[0]=0x41; b[1]=0x56; EMIT(cg, 2); /* push r14 */
+            b = BUF(cg); b[0]=0x41; b[1]=0x57; EMIT(cg, 2); /* push r15 */
+
+            /* mov rdi, rax — padded base */
+            pn = emit_mov_reg_reg(BUF(cg), REG_RDI, REG_RAX); EMIT(cg, pn);
+
+            /* Load args from stack. */
+            /* mov r10, [rsp+40]  — C_in */
+            b = BUF(cg); b[0]=0x4C; b[1]=0x8B; b[2]=0x54; b[3]=0x24; b[4]=0x28; EMIT(cg, 5);
+            /* mov r8,  [rsp+48]  — weights */
+            b = BUF(cg); b[0]=0x4C; b[1]=0x8B; b[2]=0x44; b[3]=0x24; b[4]=0x30; EMIT(cg, 5);
+            /* mov rbx, [rsp+56]  — bias */
+            b = BUF(cg); b[0]=0x48; b[1]=0x8B; b[2]=0x5C; b[3]=0x24; b[4]=0x38; EMIT(cg, 5);
+            /* mov r9,  [rsp+64]  — output */
+            b = BUF(cg); b[0]=0x4C; b[1]=0x8B; b[2]=0x4C; b[3]=0x24; b[4]=0x40; EMIT(cg, 5);
+            /* mov r15, [rsp+72]  — C_out */
+            b = BUF(cg); b[0]=0x4C; b[1]=0x8B; b[2]=0x7C; b[3]=0x24; b[4]=0x48; EMIT(cg, 5);
+
+            /* xor eax, eax — c_out = 0 */
+            pn = emit_xor_reg_reg(BUF(cg), REG_RAX, REG_RAX); EMIT(cg, pn);
+
+            /* ═══ C_out loop ═══════════════════════════════════════════ */
+            size_t cout_loop_start = cg->code_size;
+            /* cmp rax, r15 */
+            b = BUF(cg); b[0]=0x4C; b[1]=0x39; b[2]=0xF8; EMIT(cg, 3);
+            /* jge .done (rel32 placeholder) */
+            size_t jge_done_pos = cg->code_size;
+            b = BUF(cg); b[0]=0x0F; b[1]=0x8D; b[2]=0; b[3]=0; b[4]=0; b[5]=0; EMIT(cg, 6);
+
+            /* output_c_base: rsi = r9 + c_out * 6272
+             *   mov rsi, rax       : 48 89 C6
+             *   imul rsi, rsi, 6272: 48 69 F6 <imm32>
+             *   add rsi, r9        : 4C 01 CE */
+            b = BUF(cg); b[0]=0x48; b[1]=0x89; b[2]=0xC6; EMIT(cg, 3);
+            b = BUF(cg); b[0]=0x48; b[1]=0x69; b[2]=0xF6;
+            int32_t k6272 = 6272; memcpy(b+3, &k6272, 4); EMIT(cg, 7);
+            b = BUF(cg); b[0]=0x4C; b[1]=0x01; b[2]=0xCE; EMIT(cg, 3);
+
+            /* Broadcast bias[c_out] to ymm9:
+             *   vbroadcastsd ymm9, [rbx + rax*8]
+             *   VEX.256.66.0F38.W0 19 /r with SIB, rbx base, rax index, scale 3.
+             *   R_bar=0 (ymm9>=8), X_bar=1, B_bar=1, mmmmm=2 → byte1=0x62
+             *   byte2=0x7D.  opcode 0x19.  modrm: mod=00, reg=1, r/m=100
+             *   (SIB) → 0x0C.  SIB: scale=3, index=rax, base=rbx → 0xC3. */
+            b = BUF(cg); b[0]=0xC4; b[1]=0x62; b[2]=0x7D; b[3]=0x19;
+            b[4]=0x0C; b[5]=0xC3; EMIT(cg, 6);
+
+            /* Fill output[c_out*784..+784] with bias:
+             *   xor edx, edx
+             * .fill:
+             *   cmp rdx, 6272
+             *   jge .fill_done
+             *   vmovupd [rsi + rdx*1], ymm9   (store form, disp 0)
+             *   add rdx, 32
+             *   jmp .fill
+             * .fill_done:
+             */
+            pn = emit_xor_reg_reg(BUF(cg), REG_RDX, REG_RDX); EMIT(cg, pn);
+            size_t fill_loop_start = cg->code_size;
+            /* cmp rdx, 6272 (imm32) */
+            b = BUF(cg); b[0]=0x48; b[1]=0x81; b[2]=0xFA;
+            int32_t fill_end = 6272; memcpy(b+3, &fill_end, 4); EMIT(cg, 7);
+            size_t jge_fill_done_pos = cg->code_size;
+            b = BUF(cg); b[0]=0x0F; b[1]=0x8D; b[2]=0; b[3]=0; b[4]=0; b[5]=0; EMIT(cg, 6);
+
+            /* vmovupd [rsi + rdx*1], ymm9  — store form.
+             *   VEX.256.66.0F 11 /r with SIB.
+             *   R_bar=0 (ymm9), X_bar=1, B_bar=1, mmmmm=1 → byte1=0x61
+             *   byte2=0x7D.  opcode 0x11.  modrm: mod=00, reg=1 (ymm9&7),
+             *   r/m=100 (SIB) → 0x0C.  SIB: scale=0, index=rdx, base=rsi
+             *   → (0<<6)|(2<<3)|6 = 0x16.
+             * For rsi base with mod=00 (no disp), SIB base=110 = rsi. Good.
+             */
+            b = BUF(cg); b[0]=0xC4; b[1]=0x61; b[2]=0x7D; b[3]=0x11;
+            b[4]=0x0C; b[5]=0x16; EMIT(cg, 6);
+
+            /* add rdx, 32 : 48 83 C2 20 */
+            b = BUF(cg); b[0]=0x48; b[1]=0x83; b[2]=0xC2; b[3]=0x20; EMIT(cg, 4);
+            /* jmp .fill (rel32) */
+            {
+                int32_t back = (int32_t)((int64_t)fill_loop_start - (int64_t)(cg->code_size + 5));
+                b = BUF(cg); b[0]=0xE9;
+                memcpy(b+1, &back, 4);
+                EMIT(cg, 5);
+            }
+
+            /* Patch jge .fill_done */
+            {
+                int32_t off = (int32_t)((int64_t)cg->code_size - (int64_t)(jge_fill_done_pos + 6));
+                memcpy(cg->code + jge_fill_done_pos + 2, &off, 4);
+            }
+
+            /* xor ecx, ecx — c_in = 0 */
+            pn = emit_xor_reg_reg(BUF(cg), REG_RCX, REG_RCX); EMIT(cg, pn);
+
+            /* ═══ C_in loop ═══════════════════════════════════════════ */
+            size_t cin_loop_start = cg->code_size;
+            /* cmp rcx, r10 : 4C 39 D1 */
+            b = BUF(cg); b[0]=0x4C; b[1]=0x39; b[2]=0xD1; EMIT(cg, 3);
+            /* jge .next_cout */
+            size_t jge_next_cout_pos = cg->code_size;
+            b = BUF(cg); b[0]=0x0F; b[1]=0x8D; b[2]=0; b[3]=0; b[4]=0; b[5]=0; EMIT(cg, 6);
+
+            /* r11 = r8 + (c_out * C_in + c_in) * 72     (weights base
+             * for (c_out, c_in)).  Uses rdx as scratch. */
+            /* mov rdx, rax : 48 89 C2 */
+            b = BUF(cg); b[0]=0x48; b[1]=0x89; b[2]=0xC2; EMIT(cg, 3);
+            /* imul rdx, r10 : 49 0F AF D2  (2-operand imul, rdx *= r10) */
+            b = BUF(cg); b[0]=0x49; b[1]=0x0F; b[2]=0xAF; b[3]=0xD2; EMIT(cg, 4);
+            /* add rdx, rcx : 48 01 CA */
+            b = BUF(cg); b[0]=0x48; b[1]=0x01; b[2]=0xCA; EMIT(cg, 3);
+            /* imul rdx, rdx, 72 : 48 6B D2 48  (imm8 form fits) */
+            b = BUF(cg); b[0]=0x48; b[1]=0x6B; b[2]=0xD2; b[3]=72; EMIT(cg, 4);
+            /* mov r11, r8 : 4D 89 C3 */
+            b = BUF(cg); b[0]=0x4D; b[1]=0x89; b[2]=0xC3; EMIT(cg, 3);
+            /* add r11, rdx : 49 01 D3 */
+            b = BUF(cg); b[0]=0x49; b[1]=0x01; b[2]=0xD3; EMIT(cg, 3);
+
+            /* Broadcast 9 weights from [r11..r11+64] into ymm0..ymm8. */
+            for (int k = 0; k < 9; k++) {
+                int dst_ymm = k;
+                int R_bar = (dst_ymm < 8) ? 1 : 0;
+                uint8_t byte1 = (R_bar << 7) | (1 << 6) | (0 << 5) | 2;
+                b = BUF(cg);
+                b[0] = 0xC4;
+                b[1] = byte1;
+                b[2] = 0x7D;
+                b[3] = 0x19;
+                b[4] = 0x40 | ((dst_ymm & 7) << 3) | 3;   /* [r11 + disp8] */
+                b[5] = (uint8_t)(k * 8);
+                EMIT(cg, 6);
+            }
+
+            /* r11 = rdi + c_in * 7200     (padded_c_in_base). */
+            /* mov r11, rcx : 49 89 CB */
+            b = BUF(cg); b[0]=0x49; b[1]=0x89; b[2]=0xCB; EMIT(cg, 3);
+            /* imul r11, r11, 7200 (imm32) : 4D 69 DB <imm32> */
+            b = BUF(cg); b[0]=0x4D; b[1]=0x69; b[2]=0xDB;
+            int32_t k7200 = 7200; memcpy(b+3, &k7200, 4); EMIT(cg, 7);
+            /* add r11, rdi : 49 01 FB */
+            b = BUF(cg); b[0]=0x49; b[1]=0x01; b[2]=0xFB; EMIT(cg, 3);
+
+            /* xor edx, edx — y = 0 */
+            pn = emit_xor_reg_reg(BUF(cg), REG_RDX, REG_RDX); EMIT(cg, pn);
+
+            /* ═══ Y loop ═══════════════════════════════════════════ */
+            size_t y_loop_start = cg->code_size;
+            /* cmp rdx, 28 : 48 83 FA 1C */
+            b = BUF(cg); b[0]=0x48; b[1]=0x83; b[2]=0xFA; b[3]=28; EMIT(cg, 4);
+            /* jge .next_cin */
+            size_t jge_next_cin_pos = cg->code_size;
+            b = BUF(cg); b[0]=0x0F; b[1]=0x8D; b[2]=0; b[3]=0; b[4]=0; b[5]=0; EMIT(cg, 6);
+
+            /* Recompute padded_c_in_base into r11 every y iter — we
+             * clobber r11 further down to hold output_row_base, so the
+             * top-of-c_in setup value doesn't survive across y iters.
+             *   mov r11, rcx       : 49 89 CB
+             *   imul r11, r11, 7200: 4D 69 DB <imm32>
+             *   add r11, rdi       : 49 01 FB */
+            b = BUF(cg); b[0]=0x49; b[1]=0x89; b[2]=0xCB; EMIT(cg, 3);
+            b = BUF(cg); b[0]=0x4D; b[1]=0x69; b[2]=0xDB;
+            int32_t k7200_yentry = 7200; memcpy(b+3, &k7200_yentry, 4); EMIT(cg, 7);
+            b = BUF(cg); b[0]=0x49; b[1]=0x01; b[2]=0xFB; EMIT(cg, 3);
+
+            /* r12 = r11 + y*240  (padded row 0 for current c_in, y)
+             *   mov r12, rdx
+             *   imul r12, r12, 240 (imm32)
+             *   add r12, r11 */
+            b = BUF(cg); b[0]=0x49; b[1]=0x89; b[2]=0xD4; EMIT(cg, 3);           /* mov r12, rdx */
+            b = BUF(cg); b[0]=0x4D; b[1]=0x69; b[2]=0xE4;
+            int32_t k240 = 240; memcpy(b+3, &k240, 4); EMIT(cg, 7);
+            b = BUF(cg); b[0]=0x4D; b[1]=0x01; b[2]=0xDC; EMIT(cg, 3);           /* add r12, r11 */
+
+            /* lea r13, [r12 + 240] : 4D 8D AC 24 <disp32> */
+            b = BUF(cg); b[0]=0x4D; b[1]=0x8D; b[2]=0xAC; b[3]=0x24;
+            memcpy(b+4, &k240, 4); EMIT(cg, 8);
+            /* lea r14, [r12 + 480] : 4D 8D B4 24 <disp32> */
+            b = BUF(cg); b[0]=0x4D; b[1]=0x8D; b[2]=0xB4; b[3]=0x24;
+            int32_t k480 = 480; memcpy(b+4, &k480, 4); EMIT(cg, 8);
+
+            /* Push y (rdx) to free it for the x loop.
+             *   push rdx : 52 */
+            b = BUF(cg); b[0]=0x52; EMIT(cg, 1);
+
+            /* r11 = rsi + y*224 — output_row_base (c_out, y).
+             * Recompute from saved y via rdx (still live before push, now
+             * popped at end of x loop).  We already pushed rdx, so reload
+             * it via the stack slot. */
+            /* mov rdx, [rsp+0]  — reload y (it's on top of stack now) */
+            b = BUF(cg); b[0]=0x48; b[1]=0x8B; b[2]=0x14; b[3]=0x24; EMIT(cg, 4);
+            /* imul rdx, rdx, 224 (imm32) */
+            b = BUF(cg); b[0]=0x48; b[1]=0x69; b[2]=0xD2;
+            int32_t k224 = 224; memcpy(b+3, &k224, 4); EMIT(cg, 7);
+            /* mov r11, rsi : 49 89 F3 */
+            b = BUF(cg); b[0]=0x49; b[1]=0x89; b[2]=0xF3; EMIT(cg, 3);
+            /* add r11, rdx : 49 01 D3 */
+            b = BUF(cg); b[0]=0x49; b[1]=0x01; b[2]=0xD3; EMIT(cg, 3);
+
+            /* xor edx, edx — x_start_bytes = 0 */
+            pn = emit_xor_reg_reg(BUF(cg), REG_RDX, REG_RDX); EMIT(cg, pn);
+
+            /* ═══ X chunk loop ═══════════════════════════════════════ */
+            size_t x_loop_start = cg->code_size;
+            /* cmp rdx, 224 (imm32 — doesn't fit imm8) */
+            b = BUF(cg); b[0]=0x48; b[1]=0x81; b[2]=0xFA;
+            memcpy(b+3, &k224, 4); EMIT(cg, 7);
+            /* jge .next_y */
+            size_t jge_next_y_pos = cg->code_size;
+            b = BUF(cg); b[0]=0x0F; b[1]=0x8D; b[2]=0; b[3]=0; b[4]=0; b[5]=0; EMIT(cg, 6);
+
+            /* Load current output chunk: vmovupd ymm10, [r11 + rdx*1]
+             *   R_bar=0 (ymm10), X_bar=1, B_bar=0 (r11), mmmmm=1
+             *   byte1 = (0<<7)|(1<<6)|(0<<5)|1 = 0x41
+             *   byte2 = 0x7D.  opcode 0x10.  modrm: mod=00, reg=2 (ymm10&7),
+             *   r/m=100 (SIB).  SIB: scale=0, index=rdx, base=r11(011) → 0x13. */
+            b = BUF(cg); b[0]=0xC4; b[1]=0x41; b[2]=0x7D; b[3]=0x10;
+            b[4]=0x14; b[5]=0x13; EMIT(cg, 6);
+
+            /* 9 FMA chain reading from r12/r13/r14 with disp8 in {0,8,16} */
+            #define EMIT_FMA_TRIPLET(base_lo, w_base) do {                  \
+                b = BUF(cg);                                                \
+                b[0]=0xC4; b[1]=0x41; b[2]=0x7D; b[3]=0x10;                 \
+                b[4]=0x5C; b[5]=0x10 | (base_lo); b[6]=0x00; EMIT(cg, 7);   \
+                cg_vfmadd231pd(cg, 10, 11, (w_base) + 0);                   \
+                b = BUF(cg);                                                \
+                b[0]=0xC4; b[1]=0x41; b[2]=0x7D; b[3]=0x10;                 \
+                b[4]=0x5C; b[5]=0x10 | (base_lo); b[6]=0x08; EMIT(cg, 7);   \
+                cg_vfmadd231pd(cg, 10, 11, (w_base) + 1);                   \
+                b = BUF(cg);                                                \
+                b[0]=0xC4; b[1]=0x41; b[2]=0x7D; b[3]=0x10;                 \
+                b[4]=0x5C; b[5]=0x10 | (base_lo); b[6]=0x10; EMIT(cg, 7);   \
+                cg_vfmadd231pd(cg, 10, 11, (w_base) + 2);                   \
+            } while (0)
+
+            EMIT_FMA_TRIPLET(4, 0);   /* r12, ymm0..2 */
+            EMIT_FMA_TRIPLET(5, 3);   /* r13, ymm3..5 */
+            EMIT_FMA_TRIPLET(6, 6);   /* r14, ymm6..8 */
+
+            #undef EMIT_FMA_TRIPLET
+
+            /* Store back: vmovupd [r11 + rdx*1], ymm10
+             *   store form opcode 0x11, same SIB as load.
+             *   modrm: mod=00, reg=2 (ymm10&7), r/m=100 → 0x14
+             *   SIB: 0x13 */
+            b = BUF(cg); b[0]=0xC4; b[1]=0x41; b[2]=0x7D; b[3]=0x11;
+            b[4]=0x14; b[5]=0x13; EMIT(cg, 6);
+
+            /* add rdx, 32 : 48 83 C2 20 */
+            b = BUF(cg); b[0]=0x48; b[1]=0x83; b[2]=0xC2; b[3]=0x20; EMIT(cg, 4);
+            /* jmp .x_loop (rel32) */
+            {
+                int32_t back = (int32_t)((int64_t)x_loop_start - (int64_t)(cg->code_size + 5));
+                b = BUF(cg); b[0]=0xE9;
+                memcpy(b+1, &back, 4);
+                EMIT(cg, 5);
+            }
+
+            /* Patch jge .next_y */
+            {
+                int32_t off = (int32_t)((int64_t)cg->code_size - (int64_t)(jge_next_y_pos + 6));
+                memcpy(cg->code + jge_next_y_pos + 2, &off, 4);
+            }
+
+            /* pop rdx — restore y */
+            b = BUF(cg); b[0]=0x5A; EMIT(cg, 1);
+            /* inc rdx : 48 FF C2 */
+            b = BUF(cg); b[0]=0x48; b[1]=0xFF; b[2]=0xC2; EMIT(cg, 3);
+            /* jmp .y_loop (rel32) */
+            {
+                int32_t back = (int32_t)((int64_t)y_loop_start - (int64_t)(cg->code_size + 5));
+                b = BUF(cg); b[0]=0xE9;
+                memcpy(b+1, &back, 4);
+                EMIT(cg, 5);
+            }
+
+            /* Patch jge .next_cin */
+            {
+                int32_t off = (int32_t)((int64_t)cg->code_size - (int64_t)(jge_next_cin_pos + 6));
+                memcpy(cg->code + jge_next_cin_pos + 2, &off, 4);
+            }
+
+            /* inc rcx : 48 FF C1 */
+            b = BUF(cg); b[0]=0x48; b[1]=0xFF; b[2]=0xC1; EMIT(cg, 3);
+            /* jmp .cin_loop */
+            {
+                int32_t back = (int32_t)((int64_t)cin_loop_start - (int64_t)(cg->code_size + 5));
+                b = BUF(cg); b[0]=0xE9;
+                memcpy(b+1, &back, 4);
+                EMIT(cg, 5);
+            }
+
+            /* Patch jge .next_cout */
+            {
+                int32_t off = (int32_t)((int64_t)cg->code_size - (int64_t)(jge_next_cout_pos + 6));
+                memcpy(cg->code + jge_next_cout_pos + 2, &off, 4);
+            }
+
+            /* inc rax : 48 FF C0 */
+            b = BUF(cg); b[0]=0x48; b[1]=0xFF; b[2]=0xC0; EMIT(cg, 3);
+            /* jmp .cout_loop */
+            {
+                int32_t back = (int32_t)((int64_t)cout_loop_start - (int64_t)(cg->code_size + 5));
+                b = BUF(cg); b[0]=0xE9;
+                memcpy(b+1, &back, 4);
+                EMIT(cg, 5);
+            }
+
+            /* Patch jge .done */
+            {
+                int32_t off = (int32_t)((int64_t)cg->code_size - (int64_t)(jge_done_pos + 6));
+                memcpy(cg->code + jge_done_pos + 2, &off, 4);
+            }
+
+            /* ═══ Epilog ═══════════════════════════════════════════ */
+            /* vzeroupper */
+            b = BUF(cg); b[0]=0xC5; b[1]=0xF8; b[2]=0x77; EMIT(cg, 3);
+            /* pop r15, r14, r13, r12, rbx */
+            b = BUF(cg); b[0]=0x41; b[1]=0x5F; EMIT(cg, 2);
+            b = BUF(cg); b[0]=0x41; b[1]=0x5E; EMIT(cg, 2);
+            b = BUF(cg); b[0]=0x41; b[1]=0x5D; EMIT(cg, 2);
+            b = BUF(cg); b[0]=0x41; b[1]=0x5C; EMIT(cg, 2);
+            pn = emit_pop(BUF(cg), REG_RBX); EMIT(cg, pn);
+            /* add rsp, 40 — drop 5 pushed args */
+            b = BUF(cg); b[0]=0x48; b[1]=0x83; b[2]=0xC4; b[3]=40; EMIT(cg, 4);
+            /* xor eax, eax — return 0 */
+            pn = emit_xor_reg_reg(BUF(cg), REG_RAX, REG_RAX); EMIT(cg, pn);
+            return 1;
+        }
+
         if (strcmp(name, "arr_f64_adam_apply") == 0 && argc == 5) {
             /* Adam's per-element weight update, vectorised:
              *

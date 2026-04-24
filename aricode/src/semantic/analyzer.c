@@ -302,6 +302,7 @@ static AriType *builtin_return_type(const char *name) {
         {"arr_f64_relu",    TYPE_I32},
         {"arr_f64_adam_apply", TYPE_I32},
         {"arr_f64_conv2d_3x3_p1", TYPE_I32},
+        {"arr_f64_conv2d_3x3_p1_multi", TYPE_I32},
         {"arr_f64_log",     TYPE_I32},
         {"arr_f64_log1p",   TYPE_I32},
         {"arr_f64_exp",     TYPE_I32},

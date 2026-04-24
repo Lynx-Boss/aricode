@@ -4,7 +4,7 @@ Honest, number-backed picture of what the compiler can do, what's
 fast, what's slow, and what's still on the backlog.  Updated after
 each performance or feature push.
 
-Last updated: 2026-04-25 (xmm-safe whitelist widened; dot_loop 1.35×; Leibniz 1.66× vs gcc -O2)
+Last updated: 2026-04-25 (codegen.c split → peepholes.c + hot_var.c with contracts; dense_* now hot)
 
 ---
 

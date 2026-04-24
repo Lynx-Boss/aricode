@@ -747,6 +747,14 @@ static int call_is_xmm_safe(const char *fn) {
     if (strcmp(fn, "arr_f64_mul")         == 0) return 1;
     if (strcmp(fn, "arr_f64_relu")        == 0) return 1;
     if (strcmp(fn, "arr_f64_log")         == 0) return 1;
+    /* Dense-layer kernels — initially suspected unsafe based on push
+     * r12..r14 (ABI save/restore pattern) but empirically verified to
+     * touch only ymm0..ymm3, xmm7 inside the body.  Adding them to
+     * the safe list lets dense_forward and dense_backward enter
+     * hot-var mode — the primary MNIST inner-loop functions. */
+    if (strcmp(fn, "arr_f64_matvec")      == 0) return 1;
+    if (strcmp(fn, "arr_f64_matvec_T")    == 0) return 1;
+    if (strcmp(fn, "arr_f64_outer_accum") == 0) return 1;
     return 0;
 }
 

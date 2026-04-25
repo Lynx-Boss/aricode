@@ -4,7 +4,7 @@ Honest, number-backed picture of what the compiler can do, what's
 fast, what's slow, and what's still on the backlog.  Updated after
 each performance or feature push.
 
-Last updated: 2026-04-25 (codegen.c split → peepholes.c + hot_var.c with contracts; dense_* now hot)
+Last updated: 2026-04-25 (ymm8-15 save/restore wrapper → softmax/conv2d/adam_apply callable from hot-var)
 
 ---
 
@@ -81,6 +81,16 @@ Starting point was 4.2-4.8× slower; the chain of codegen
 optimisations listed in `project_instruction_scheduling` (memory)
 closed roughly 60-65 % of the gap.  Latest wins (2026-04-25):
 
+- **ymm8-15 save/restore wrapper for unsafe builtins** — nine
+  builtins (softmax, sigmoid, tanh, adam_apply, conv2d_3x3_p1 and
+  variants, log1p/exp/expm1) genuinely clobber ymm8..ymm13.  Instead
+  of refactoring each, emit_call_expr now wraps inline emissions with
+  a save/restore of the LIVE subset of ymm8..ymm15 around each call
+  when the caller is xmm-safe.  Count is trimmed to
+  `next_hot_xmm - 8` so a function with 2 f64 locals pays just 2
+  vmovupd per side.  The xmm-safe whitelist was extended to accept
+  these builtins; 8-hot-XMM probe sums 1..8 to 36.00 bit-exact across
+  a softmax call, MNIST binary grew 46 B total, accuracy 98.65 %.
 - **Widened xmm-safe builtin whitelist** — `call_is_xmm_safe` grew
   from 3 names to 30 after a per-builtin audit for xmm8..15 /
   r12..15 clobbers.  Scalar hot-loops that previously stayed on

@@ -1098,6 +1098,25 @@ fn main() -> i32 {
 EOF
 run_test "f32_dense_kernels" /tmp/edge_f32_dense.ari "DENSE_OK" "matvec / matvec_T / outer_accum agree with f64 within 1e-2"
 
+# #31  Latent typing bug: expr_is_float didn't list arr_f32_get / sum
+# / dot, so `arr_f32_get(a,i) - arr_f32_get(b,i)` wrongly fell to the
+# integer subtract path and corrupted MNIST f32 backward (xent_backward
+# returned 0 instead of y - t).  Test pins the float-binop classifier
+# against f32-array-read operands.
+cat > /tmp/edge_f32_typing.ari << 'EOF'
+fn main() -> i32 {
+    let a: i32 = arr_f32_new(4); let b: i32 = arr_f32_new(4);
+    arr_f32_set(a, 0, 0.7); arr_f32_set(b, 0, 0.2);
+    let v: f64 = arr_f32_get(a, 0) - arr_f32_get(b, 0);
+    let w: f64 = arr_f32_get(a, 0) * arr_f32_get(b, 0);
+    print_f64(v, 4);   // 0.5 (within f32 precision)
+    print_f64(w, 4);   // 0.14
+    return 0;
+}
+EOF
+run_test "f32_get_float_binop" /tmp/edge_f32_typing.ari "0.4999
+0.1400" "arr_f32_get appears in expr_is_float so float binops use SSE"
+
 # ────────────────────────────────────────────────────────────────────
 
 echo ""

@@ -621,7 +621,15 @@ static int expr_is_float(CodegenState *cg, const ASTNode *node) {
                 strcmp(fn, "arr_f64_sum_kahan") == 0 ||
                 strcmp(fn, "int_to_float") == 0 || strcmp(fn, "read_float") == 0 ||
                 strcmp(fn, "arr_f64_get") == 0 || strcmp(fn, "arr_f64_sum") == 0 ||
-                strcmp(fn, "arr_f64_dot") == 0)
+                strcmp(fn, "arr_f64_dot") == 0 ||
+                /* f32 array reads — same f64 return contract via cvtss2sd
+                 * boundary, so an arithmetic expression mixing them with
+                 * float locals stays on the SSE path instead of falling
+                 * back to integer subtract on the bit pattern.  Missing
+                 * this list silently corrupts every `arr_f32_get(a,i) -
+                 * arr_f32_get(b,i)`-style backward kernel. */
+                strcmp(fn, "arr_f32_get") == 0 || strcmp(fn, "arr_f32_sum") == 0 ||
+                strcmp(fn, "arr_f32_dot") == 0)
                 return 1;
             /* User-defined functions: check if the function was compiled
              * with a f64 return type by looking at any float arguments

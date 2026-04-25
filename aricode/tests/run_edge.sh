@@ -965,6 +965,64 @@ EOF
 run_test "atomic_add_f64_contention" /tmp/edge_atomic_f64.ari "40000.00" "cmpxchg loop keeps f64 sum exact under race"
 
 # ────────────────────────────────────────────────────────────────────
+echo -e "\n${BOLD}--- f32 primitives ---${RESET}"
+
+# #27  arr_f32_new + get + set round-trip — boundary uses cvtss2sd /
+# cvtsd2ss, the storage backs onto an mmap-allocated buffer with the
+# same length-prefix layout as arr_f64_new.  Catches the "stored bits
+# survive read-back at f32 precision" invariant.
+cat > /tmp/edge_f32_basic.ari << 'EOF'
+fn main() -> i32 {
+    let a: i32 = arr_f32_new(8);
+    arr_f32_set(a, 0, 1.5);
+    arr_f32_set(a, 1, 2.25);
+    arr_f32_set(a, 2, 0.0 - 3.125);
+    arr_f32_set(a, 7, 100.5);
+    print_f64(arr_f32_get(a, 0), 4);
+    print_f64(arr_f32_get(a, 1), 4);
+    print_f64(arr_f32_get(a, 2), 4);
+    print_f64(arr_f32_get(a, 7), 4);
+    print_int(arr_len(a));
+    return 0;
+}
+EOF
+run_test "f32_basic_roundtrip" /tmp/edge_f32_basic.ari "1.5000
+2.2500
+-3.1250
+100.5000
+8" "f32 round-trip preserves the values that fit"
+
+# #28  arr_f32_dot (AVX2 8-lane vfmadd231ps) vs the same data through
+# arr_f64_dot.  Tolerance: ~1e-5 over 1024 elements (f32 mantissa is
+# 23 bits ≈ 7 decimal digits; the dot accumulator drops a few bits to
+# rounding per lane).
+cat > /tmp/edge_f32_dot.ari << 'EOF'
+fn main() -> i32 {
+    let n: i32 = 1024;
+    let af: i32 = arr_f32_new(n);
+    let bf: i32 = arr_f32_new(n);
+    let ad: i32 = arr_f64_new(n);
+    let bd: i32 = arr_f64_new(n);
+    let i: i32 = 0;
+    while (i < n) {
+        let v: f64 = int_to_float(i % 17) / 17.0;
+        let w: f64 = int_to_float(i % 31) / 31.0;
+        arr_f32_set(af, i, v);
+        arr_f32_set(bf, i, w);
+        arr_f64_set(ad, i, v);
+        arr_f64_set(bd, i, w);
+        i = i + 1;
+    }
+    let r32: f64 = arr_f32_dot(af, bf);
+    let r64: f64 = arr_f64_dot(ad, bd);
+    let diff: f64 = math_abs(r32 - r64);
+    if (diff < 0.001) { print_str("DOT_OK"); }
+    return 0;
+}
+EOF
+run_test "f32_dot_vs_f64" /tmp/edge_f32_dot.ari "DOT_OK" "f32 8-lane dot agrees with f64 within 1e-3"
+
+# ────────────────────────────────────────────────────────────────────
 
 echo ""
 echo -e "${BOLD}${CYAN}============================================================${RESET}"

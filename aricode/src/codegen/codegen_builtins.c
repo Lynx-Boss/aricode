@@ -3124,6 +3124,100 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             EMIT(cg, 5);
             return 1;
         }
+        if (strcmp(name, "arr_f32_new") == 0 && argc == 1) {
+            /* arr_f32_new(n)  —  allocate n f32 elements (4 bytes each).
+             *
+             * Memory layout mirrors arr_f64_new but with 4-byte slots:
+             *   [base-8] = n  (i64 length, so arr_len works unchanged)
+             *   [base+0..base+4n) = the f32 data
+             *
+             * mmap rounds to a page anyway, so we don't bother packing
+             * the length; we just allocate (n*4 + 8) bytes via the same
+             * MAP_PRIVATE|ANON syscall arr_f64_new uses. */
+            emit_expression(cg, node->children[1]); /* n → RAX */
+            int pn; uint8_t *b;
+            pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);          /* save n */
+            /* Compute byte length: rsi = n*4 + 8.  shl rax, 2 then add 8. */
+            pn = emit_shl_reg_imm(BUF(cg), REG_RAX, 2); EMIT(cg, pn);
+            pn = emit_add_reg_imm(BUF(cg), REG_RAX, 8); EMIT(cg, pn);
+            pn = emit_mov_reg_reg(BUF(cg), REG_RSI, REG_RAX); EMIT(cg, pn);
+            pn = emit_xor_reg_reg(BUF(cg), REG_RDI, REG_RDI); EMIT(cg, pn);
+            pn = emit_mov_reg_imm32(BUF(cg), REG_RDX, 3); EMIT(cg, pn);
+            b = BUF(cg); b[0]=0x49; b[1]=0xC7; b[2]=0xC2;
+            int32_t v=0x22; memcpy(b+3,&v,4); EMIT(cg,7);
+            b = BUF(cg); b[0]=0x49; b[1]=0xC7; b[2]=0xC0;
+            v=-1; memcpy(b+3,&v,4); EMIT(cg,7);
+            b = BUF(cg); b[0]=0x4D; b[1]=0x31; b[2]=0xC9; EMIT(cg,3);
+            pn = emit_mov_reg_imm32(BUF(cg), REG_RAX, 9); EMIT(cg, pn);
+            pn = emit_syscall(BUF(cg)); EMIT(cg, pn);
+            /* Store length at [rax]: pop rcx ; mov [rax], rcx. */
+            pn = emit_pop(BUF(cg), REG_RCX); EMIT(cg, pn);
+            b = BUF(cg);
+            b[0] = rex(1, reg_ext(REG_RCX), 0, reg_ext(REG_RAX));
+            b[1] = 0x89; b[2] = modrm(0, REG_RCX, REG_RAX);
+            EMIT(cg, 3);
+            /* Skip past the 8-byte length prefix → return base+8. */
+            pn = emit_add_reg_imm(BUF(cg), REG_RAX, 8); EMIT(cg, pn);
+            return 1;
+        }
+        if (strcmp(name, "arr_f32_get") == 0 && argc == 2) {
+            /* Load f32 from [base + idx*4], promote to f64 via cvtss2sd,
+             * leave the result in BOTH xmm0 and rax to honour the
+             * f64 return contract. */
+            emit_expression(cg, node->children[2]); /* idx → RAX */
+            int pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
+            emit_expression(cg, node->children[1]); /* base → RAX */
+            pn = emit_pop(BUF(cg), REG_RCX); EMIT(cg, pn);          /* RCX = idx */
+            uint8_t *b = BUF(cg);
+            /* movss xmm0, [rax + rcx*4]  —  F3 0F 10 /r with SIB scale=2. */
+            b[0]=0xF3; b[1]=0x0F; b[2]=0x10;
+            b[3] = (uint8_t)((0 << 6) | ((0 & 7) << 3) | 4);          /* mod=00 reg=xmm0 r/m=SIB */
+            b[4] = (uint8_t)((2 << 6) | ((REG_RCX & 7) << 3) | (REG_RAX & 7));
+            EMIT(cg, 5);
+            /* cvtss2sd xmm0, xmm0  —  F3 0F 5A C0 (promote to f64). */
+            b = BUF(cg);
+            b[0]=0xF3; b[1]=0x0F; b[2]=0x5A; b[3]=0xC0;
+            EMIT(cg, 4);
+            /* Sync rax with xmm0 for the dual-domain return contract. */
+            b = BUF(cg);
+            b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x7E; b[4]=0xC0;
+            EMIT(cg, 5);
+            return 1;
+        }
+        if (strcmp(name, "arr_f32_set") == 0 && argc == 3) {
+            /* Store f64 value as f32 at [base + idx*4].
+             * val is in rax (and xmm0) per emit_expression's contract;
+             * we use xmm0 → cvtsd2ss → movss to memory. */
+            emit_expression(cg, node->children[3]); /* val (xmm0+rax) */
+            int pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
+            /* Stash xmm0 onto stack so subsequent arg evals don't clobber it. */
+            uint8_t *b = BUF(cg);
+            /* sub rsp, 8 ; movsd [rsp], xmm0 */
+            b[0]=0x48; b[1]=0x83; b[2]=0xEC; b[3]=0x08; EMIT(cg, 4);
+            b = BUF(cg);
+            b[0]=0xF2; b[1]=0x0F; b[2]=0x11; b[3]=0x04; b[4]=0x24; EMIT(cg, 5);
+            emit_expression(cg, node->children[2]); /* idx */
+            pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
+            emit_expression(cg, node->children[1]); /* base */
+            pn = emit_pop(BUF(cg), REG_RCX); EMIT(cg, pn);          /* RCX = idx */
+            /* Reload val into xmm0: movsd xmm0, [rsp+8] ; add rsp, 16 (val + idx pushed). */
+            b = BUF(cg);
+            b[0]=0xF2; b[1]=0x0F; b[2]=0x10; b[3]=0x44; b[4]=0x24; b[5]=0x08;
+            EMIT(cg, 6);
+            b = BUF(cg);
+            b[0]=0x48; b[1]=0x83; b[2]=0xC4; b[3]=0x10; EMIT(cg, 4); /* add rsp, 16 */
+            /* cvtsd2ss xmm0, xmm0 */
+            b = BUF(cg);
+            b[0]=0xF2; b[1]=0x0F; b[2]=0x5A; b[3]=0xC0; EMIT(cg, 4);
+            /* movss [rax + rcx*4], xmm0  —  F3 0F 11 /r */
+            b = BUF(cg);
+            b[0]=0xF3; b[1]=0x0F; b[2]=0x11;
+            b[3] = (uint8_t)((0 << 6) | ((0 & 7) << 3) | 4);
+            b[4] = (uint8_t)((2 << 6) | ((REG_RCX & 7) << 3) | (REG_RAX & 7));
+            EMIT(cg, 5);
+            pn = emit_xor_reg_reg(BUF(cg), REG_RAX, REG_RAX); EMIT(cg, pn);
+            return 1;
+        }
         if (strcmp(name, "arr_f64_set") == 0 && argc == 3) {
             /* Store f64 at [base + idx*8] */
             emit_expression(cg, node->children[3]); /* val (f64 bits in RAX) */
@@ -3296,6 +3390,90 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             /* vzeroupper + drop args + movq rax, xmm0. */
             b = BUF(cg); b[0]=0xC5; b[1]=0xF8; b[2]=0x77; EMIT(cg, 3);
             b = BUF(cg); b[0]=0x48; b[1]=0x83; b[2]=0xC4; b[3]=0x20; EMIT(cg, 4);
+            b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x7E; b[4]=0xC0; EMIT(cg, 5);
+            return 1;
+        }
+        if (strcmp(name, "arr_f32_dot") == 0 && argc == 2) {
+            /* arr_f32_dot(a, b) -> f64
+             *
+             * Σ a[i] · b[i] over a length-n f32 array, returning the
+             * sum promoted to f64 so callers don't need a separate
+             * conversion step.
+             *
+             * Vector loop: vfmadd231ps with 8-lane ymm accumulator —
+             * the AVX2 single-precision FMA fires at 0.5 c throughput
+             * on Zen 3, so peak ~16 FMAs/cycle.  Scalar tail mops up
+             * the n mod 8 remainder.
+             *
+             * Register plan (matches arr_f64_dot's layout):
+             *   RDI = a base, R8 = b base, RCX = n, RDX = n & ~7,
+             *   RSI = i, ymm0 = packed accumulator, xmm0 = scalar at end.
+             *   RBX is pushed before reuse, popped at exit. */
+            emit_expression(cg, node->children[2]); /* b */
+            int pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
+            emit_expression(cg, node->children[1]); /* a */
+            pn = emit_pop(BUF(cg), REG_RDX); EMIT(cg, pn);
+            uint8_t *b;
+            pn = emit_push(BUF(cg), REG_RBX); EMIT(cg, pn);
+            pn = emit_mov_reg_reg(BUF(cg), REG_RDI, REG_RAX); EMIT(cg, pn);
+            pn = emit_mov_reg_reg(BUF(cg), REG_RBX, REG_RDX); EMIT(cg, pn);
+            pn = emit_mov_reg_mem(BUF(cg), REG_RCX, REG_RAX, -8); EMIT(cg, pn);
+
+            /* RDX = n & ~7  (vec chunk length, 8 lanes/iter). */
+            pn = emit_mov_reg_reg(BUF(cg), REG_RDX, REG_RCX); EMIT(cg, pn);
+            b = BUF(cg); b[0]=0x48; b[1]=0x83; b[2]=0xE2; b[3]=0xF8; EMIT(cg, 4); /* and rdx, -8 */
+
+            /* vxorps ymm0, ymm0, ymm0  —  C5 FC 57 C0 */
+            b = BUF(cg); b[0]=0xC5; b[1]=0xFC; b[2]=0x57; b[3]=0xC0; EMIT(cg, 4);
+
+            pn = emit_xor_reg_reg(BUF(cg), REG_RSI, REG_RSI); EMIT(cg, pn);
+
+            /* ── Vector loop: while RSI < RDX, step 8 ─────────────── */
+            CgCountedLoop vec = cg_loop_begin(cg, REG_RSI, REG_RDX);
+
+            /* vmovups ymm1, [rdi + rsi*4]   — C5 FD 10 0C B7
+             *   modrm 0x0C = 00.001.100 (mod=0, reg=ymm1, r/m=SIB)
+             *   SIB    0xB7 = 10.110.111 (scale=4, idx=rsi, base=rdi) */
+            b = BUF(cg); b[0]=0xC5; b[1]=0xFD; b[2]=0x10; b[3]=0x0C; b[4]=0xB7; EMIT(cg, 5);
+            /* vmovups ymm2, [rbx + rsi*4]   — same shape, base=rbx (3) */
+            b = BUF(cg); b[0]=0xC5; b[1]=0xFD; b[2]=0x10; b[3]=0x14; b[4]=0xB3; EMIT(cg, 5);
+            /* vfmadd231ps ymm0, ymm1, ymm2 — C4 E2 75 B8 C2
+             *   (W=0 ⇒ ps; pd version is W=1 = byte3 0xF5) */
+            b = BUF(cg); b[0]=0xC4; b[1]=0xE2; b[2]=0x75; b[3]=0xB8; b[4]=0xC2; EMIT(cg, 5);
+
+            cg_loop_end(cg, vec, 8);
+
+            /* Horizontal reduce ymm0 (8 ps lanes) → xmm0 low scalar.
+             *   vextractf128 xmm1, ymm0, 1   high 4 → xmm1
+             *   vaddps       xmm0, xmm0, xmm1    pairwise sum (4 lanes)
+             *   vhaddps      xmm0, xmm0, xmm0    4 → 2
+             *   vhaddps      xmm0, xmm0, xmm0    2 → 1 in lane 0  */
+            b = BUF(cg); b[0]=0xC4; b[1]=0xE3; b[2]=0x7D; b[3]=0x19; b[4]=0xC1; b[5]=0x01; EMIT(cg, 6);
+            b = BUF(cg); b[0]=0xC5; b[1]=0xF8; b[2]=0x58; b[3]=0xC1; EMIT(cg, 4);
+            b = BUF(cg); b[0]=0xC5; b[1]=0xFB; b[2]=0x7C; b[3]=0xC0; EMIT(cg, 4);
+            b = BUF(cg); b[0]=0xC5; b[1]=0xFB; b[2]=0x7C; b[3]=0xC0; EMIT(cg, 4);
+
+            /* ── Scalar tail: while RSI < RCX, step 1 ─────────────── */
+            CgCountedLoop tail = cg_loop_begin(cg, REG_RSI, REG_RCX);
+
+            /* movss xmm1, [rdi + rsi*4]  — F3 0F 10 0C B7 */
+            b = BUF(cg); b[0]=0xF3; b[1]=0x0F; b[2]=0x10; b[3]=0x0C; b[4]=0xB7; EMIT(cg, 5);
+            /* movss xmm2, [rbx + rsi*4] */
+            b = BUF(cg); b[0]=0xF3; b[1]=0x0F; b[2]=0x10; b[3]=0x14; b[4]=0xB3; EMIT(cg, 5);
+            /* mulss xmm1, xmm2  — F3 0F 59 CA */
+            b = BUF(cg); b[0]=0xF3; b[1]=0x0F; b[2]=0x59; b[3]=0xCA; EMIT(cg, 4);
+            /* addss xmm0, xmm1  — F3 0F 58 C1 */
+            b = BUF(cg); b[0]=0xF3; b[1]=0x0F; b[2]=0x58; b[3]=0xC1; EMIT(cg, 4);
+
+            cg_loop_end(cg, tail, 1);
+
+            /* Promote to f64 (cvtss2sd xmm0, xmm0) and sync rax. */
+            b = BUF(cg); b[0]=0xF3; b[1]=0x0F; b[2]=0x5A; b[3]=0xC0; EMIT(cg, 4);
+            /* vzeroupper */
+            b = BUF(cg); b[0]=0xC5; b[1]=0xF8; b[2]=0x77; EMIT(cg, 3);
+            /* pop rbx */
+            pn = emit_pop(BUF(cg), REG_RBX); EMIT(cg, pn);
+            /* movq rax, xmm0 */
             b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x7E; b[4]=0xC0; EMIT(cg, 5);
             return 1;
         }

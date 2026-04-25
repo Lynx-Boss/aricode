@@ -78,6 +78,9 @@ int call_is_xmm_safe(const char *fn) {
     if (strcmp(fn, "arr_f32_matvec")     == 0) return 1;
     if (strcmp(fn, "arr_f32_matvec_T")   == 0) return 1;
     if (strcmp(fn, "arr_f32_outer_accum")== 0) return 1;
+    if (strcmp(fn, "arr_f32_copy_at")    == 0) return 1;
+    if (strcmp(fn, "arr_f32_copy_slice") == 0) return 1;
+    if (strcmp(fn, "arr_f32_adam_apply") == 0) return 1;
     /* Builtins that clobber ymm8..ymm15 are also callable from
      * xmm-safe bodies — the caller (emit_call_expr) wraps them with
      * a vmovupd save/restore of the cache registers when it notices

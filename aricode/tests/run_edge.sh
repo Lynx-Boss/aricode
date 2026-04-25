@@ -1117,6 +1117,56 @@ EOF
 run_test "f32_get_float_binop" /tmp/edge_f32_typing.ari "0.4999
 0.1400" "arr_f32_get appears in expr_is_float so float binops use SSE"
 
+# #32  arr_f32_copy_at / copy_slice — f32 mirrors of the f64 bulk-mem
+# kernels at scale=4.  copy_at fills dst from src[offset..]; copy_slice
+# places src[src_off..src_off+n) into dst[dst_off..dst_off+n).
+cat > /tmp/edge_f32_copy.ari << 'EOF'
+fn main() -> i32 {
+    let src: i32 = arr_f32_new(20);
+    let dst: i32 = arr_f32_new(10);
+    let i: i32 = 0;
+    while (i < 20) { arr_f32_set(src, i, int_to_float(i) * 0.5); i = i + 1; }
+    arr_f32_copy_at(src, 5, dst);
+    if (math_abs(arr_f32_sum(dst) - 47.5) < 0.001) { print_str("AT_OK"); }
+    arr_f32_copy_slice(src, 3, dst, 2, 5);
+    if (math_abs(arr_f32_get(dst, 2) - 1.5) < 0.001) {
+        if (math_abs(arr_f32_get(dst, 6) - 3.5) < 0.001) {
+            if (math_abs(arr_f32_get(dst, 0) - 2.5) < 0.001) { print_str("SLICE_OK"); }
+        }
+    }
+    return 0;
+}
+EOF
+run_test "f32_copy_kernels" /tmp/edge_f32_copy.ari "AT_OK
+SLICE_OK" "f32 copy_at + copy_slice match expected element-wise behaviour"
+
+# #33  arr_f32_adam_apply: one Adam step on a 100-element parameter
+# tensor.  f32 result must match f64 within ~1e-3 (single-precision
+# error from sqrt/div/cvt rounding compounded over 100 elements).
+cat > /tmp/edge_f32_adam.ari << 'EOF'
+fn main() -> i32 {
+    let n: i32 = 100;
+    let Wf: i32 = arr_f32_new(n); let Wd: i32 = arr_f64_new(n);
+    let mf: i32 = arr_f32_new(n); let md: i32 = arr_f64_new(n);
+    let vf: i32 = arr_f32_new(n); let vd: i32 = arr_f64_new(n);
+    let i: i32 = 0;
+    while (i < n) {
+        let w: f64 = int_to_float(i % 17) / 17.0;
+        let mm: f64 = int_to_float((i*3) % 11) / 11.0 - 0.5;
+        let vv: f64 = int_to_float((i*7) % 13) / 13.0 + 0.01;
+        arr_f32_set(Wf, i, w); arr_f64_set(Wd, i, w);
+        arr_f32_set(mf, i, mm); arr_f64_set(md, i, mm);
+        arr_f32_set(vf, i, vv); arr_f64_set(vd, i, vv);
+        i = i + 1;
+    }
+    arr_f32_adam_apply(Wf, mf, vf, 0.001, 0.00000001);
+    arr_f64_adam_apply(Wd, md, vd, 0.001, 0.00000001);
+    if (math_abs(arr_f32_sum(Wf) - arr_f64_sum(Wd)) < 0.01) { print_str("ADAM_OK"); }
+    return 0;
+}
+EOF
+run_test "f32_adam_apply" /tmp/edge_f32_adam.ari "ADAM_OK" "f32 adam_apply matches f64 within 1e-2 over 100 elements"
+
 # ────────────────────────────────────────────────────────────────────
 
 echo ""

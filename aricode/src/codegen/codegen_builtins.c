@@ -4931,6 +4931,133 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             pn = emit_xor_reg_reg(BUF(cg), REG_RAX, REG_RAX); EMIT(cg, pn);
             return 1;
         }
+        if (strcmp(name, "arr_f32_adam_apply") == 0 && argc == 5) {
+            /* f32 mirror of arr_f64_adam_apply.  Per-element:
+             *     w[i] -= lr · m[i] / (sqrt(v[i]) + eps)
+             *
+             * 8-lane vsqrtps / vdivps / vmulps / vsubps inner loop.
+             * lr & eps come in as f64 from aricode and get demoted via
+             * cvtsd2ss before broadcasting.  Constants live in ymm5/6
+             * (instead of the f64 version's ymm13/14) so the builtin
+             * stays inside xmm0..xmm7 and qualifies for the xmm-safe
+             * whitelist directly — no save/restore wrap needed.
+             *
+             * Stack after 4 arg pushes + push rbx:
+             *   [rsp+0]  = rbx_saved
+             *   [rsp+8]  = m
+             *   [rsp+16] = v
+             *   [rsp+24] = lr  (f64 bits)
+             *   [rsp+32] = eps (f64 bits)
+             */
+            emit_expression(cg, node->children[5]); /* eps */
+            int pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
+            emit_expression(cg, node->children[4]); /* lr */
+            pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
+            emit_expression(cg, node->children[3]); /* v */
+            pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
+            emit_expression(cg, node->children[2]); /* m */
+            pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
+            emit_expression(cg, node->children[1]); /* w → RAX */
+            uint8_t *b;
+
+            pn = emit_push(BUF(cg), REG_RBX); EMIT(cg, pn);
+            pn = emit_mov_reg_reg(BUF(cg), REG_RDI, REG_RAX); EMIT(cg, pn);
+
+            b = BUF(cg); b[0]=0x4C; b[1]=0x8B; b[2]=0x44; b[3]=0x24; b[4]=0x08; EMIT(cg, 5); /* mov r8, [rsp+8]  m */
+            b = BUF(cg); b[0]=0x48; b[1]=0x8B; b[2]=0x5C; b[3]=0x24; b[4]=0x10; EMIT(cg, 5); /* mov rbx, [rsp+16] v */
+            /* mov rcx, [rsp+24]  — lr bits */
+            b = BUF(cg); b[0]=0x48; b[1]=0x8B; b[2]=0x4C; b[3]=0x24; b[4]=0x18; EMIT(cg, 5);
+            /* movq xmm5, rcx ; cvtsd2ss xmm5, xmm5 ; vbroadcastss ymm5, xmm5 */
+            b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xE9; EMIT(cg, 5);
+            b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x5A; b[3]=0xED; EMIT(cg, 4);
+            b = BUF(cg); b[0]=0xC4; b[1]=0xE2; b[2]=0x7D; b[3]=0x18; b[4]=0xED; EMIT(cg, 5);
+
+            /* mov rcx, [rsp+32]  — eps bits */
+            b = BUF(cg); b[0]=0x48; b[1]=0x8B; b[2]=0x4C; b[3]=0x24; b[4]=0x20; EMIT(cg, 5);
+            /* movq xmm6, rcx ; cvtsd2ss ; broadcast ymm6 */
+            b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xF1; EMIT(cg, 5);
+            b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x5A; b[3]=0xF6; EMIT(cg, 4);
+            b = BUF(cg); b[0]=0xC4; b[1]=0xE2; b[2]=0x7D; b[3]=0x18; b[4]=0xF6; EMIT(cg, 5);
+
+            /* RCX = n = w[-8] ; RDX = n & ~7 */
+            pn = emit_mov_reg_mem(BUF(cg), REG_RCX, REG_RDI, -8); EMIT(cg, pn);
+            pn = emit_mov_reg_reg(BUF(cg), REG_RDX, REG_RCX); EMIT(cg, pn);
+            b = BUF(cg); b[0]=0x48; b[1]=0x83; b[2]=0xE2; b[3]=0xF8; EMIT(cg, 4);
+            pn = emit_xor_reg_reg(BUF(cg), REG_RSI, REG_RSI); EMIT(cg, pn);
+
+            CgCountedLoop vec = cg_loop_begin(cg, REG_RSI, REG_RDX);
+            /* ymm2 = m chunk: vmovups ymm2, [r8 + rsi*4]  C4 81 7C 10 14 B0 */
+            b = BUF(cg); b[0]=0xC4; b[1]=0x81; b[2]=0x7C; b[3]=0x10;
+            b[4]=(uint8_t)((0<<6) | ((2 & 7)<<3) | 4);
+            b[5]=(uint8_t)((2<<6) | ((REG_RSI & 7)<<3) | (8 & 7));
+            EMIT(cg, 6);
+            /* ymm3 = v chunk: vmovups ymm3, [rbx + rsi*4]  C5 FD 10 1C B3 */
+            b = BUF(cg); b[0]=0xC5; b[1]=0xFD; b[2]=0x10;
+            b[3]=(uint8_t)((0<<6) | ((3 & 7)<<3) | 4);
+            b[4]=(uint8_t)((2<<6) | ((REG_RSI & 7)<<3) | (REG_RBX & 7));
+            EMIT(cg, 5);
+            /* vsqrtps ymm3, ymm3   C5 FC 51 DB */
+            b = BUF(cg); b[0]=0xC5; b[1]=0xFC; b[2]=0x51; b[3]=0xDB; EMIT(cg, 4);
+            /* vaddps ymm3, ymm3, ymm6   C5 E4 58 DE */
+            b = BUF(cg); b[0]=0xC5; b[1]=0xE4; b[2]=0x58; b[3]=0xDE; EMIT(cg, 4);
+            /* vdivps ymm2, ymm2, ymm3   C5 EC 5E D3 */
+            b = BUF(cg); b[0]=0xC5; b[1]=0xEC; b[2]=0x5E; b[3]=0xD3; EMIT(cg, 4);
+            /* vmulps ymm2, ymm2, ymm5   C5 EC 59 D5 */
+            b = BUF(cg); b[0]=0xC5; b[1]=0xEC; b[2]=0x59; b[3]=0xD5; EMIT(cg, 4);
+            /* ymm4 = w chunk: vmovups ymm4, [rdi + rsi*4]  C5 FD 10 24 B7 */
+            b = BUF(cg); b[0]=0xC5; b[1]=0xFD; b[2]=0x10;
+            b[3]=(uint8_t)((0<<6) | ((4 & 7)<<3) | 4);
+            b[4]=(uint8_t)((2<<6) | ((REG_RSI & 7)<<3) | (REG_RDI & 7));
+            EMIT(cg, 5);
+            /* vsubps ymm4, ymm4, ymm2   C5 DC 5C E2 */
+            b = BUF(cg); b[0]=0xC5; b[1]=0xDC; b[2]=0x5C; b[3]=0xE2; EMIT(cg, 4);
+            /* store: vmovups [rdi + rsi*4], ymm4 */
+            b = BUF(cg); b[0]=0xC5; b[1]=0xFD; b[2]=0x11;
+            b[3]=(uint8_t)((0<<6) | ((4 & 7)<<3) | 4);
+            b[4]=(uint8_t)((2<<6) | ((REG_RSI & 7)<<3) | (REG_RDI & 7));
+            EMIT(cg, 5);
+            cg_loop_end(cg, vec, 8);
+
+            /* Scalar tail */
+            CgCountedLoop tail = cg_loop_begin(cg, REG_RSI, REG_RCX);
+            /* movss xmm0, [r8 + rsi*4]  F3 41 0F 10 04 B0 */
+            b = BUF(cg); b[0]=0xF3; b[1]=0x41; b[2]=0x0F; b[3]=0x10;
+            b[4]=(uint8_t)((0<<6) | ((0 & 7)<<3) | 4);
+            b[5]=(uint8_t)((2<<6) | ((REG_RSI & 7)<<3) | (8 & 7));
+            EMIT(cg, 6);
+            /* movss xmm1, [rbx + rsi*4]  F3 0F 10 0C B3 */
+            b = BUF(cg); b[0]=0xF3; b[1]=0x0F; b[2]=0x10;
+            b[3]=(uint8_t)((0<<6) | ((1 & 7)<<3) | 4);
+            b[4]=(uint8_t)((2<<6) | ((REG_RSI & 7)<<3) | (REG_RBX & 7));
+            EMIT(cg, 5);
+            /* sqrtss xmm1, xmm1  F3 0F 51 C9 */
+            b = BUF(cg); b[0]=0xF3; b[1]=0x0F; b[2]=0x51; b[3]=0xC9; EMIT(cg, 4);
+            /* addss xmm1, xmm6  F3 0F 58 CE */
+            b = BUF(cg); b[0]=0xF3; b[1]=0x0F; b[2]=0x58; b[3]=0xCE; EMIT(cg, 4);
+            /* divss xmm0, xmm1  F3 0F 5E C1 */
+            b = BUF(cg); b[0]=0xF3; b[1]=0x0F; b[2]=0x5E; b[3]=0xC1; EMIT(cg, 4);
+            /* mulss xmm0, xmm5  F3 0F 59 C5 */
+            b = BUF(cg); b[0]=0xF3; b[1]=0x0F; b[2]=0x59; b[3]=0xC5; EMIT(cg, 4);
+            /* movss xmm2, [rdi + rsi*4]  F3 0F 10 14 B7 */
+            b = BUF(cg); b[0]=0xF3; b[1]=0x0F; b[2]=0x10;
+            b[3]=(uint8_t)((0<<6) | ((2 & 7)<<3) | 4);
+            b[4]=(uint8_t)((2<<6) | ((REG_RSI & 7)<<3) | (REG_RDI & 7));
+            EMIT(cg, 5);
+            /* subss xmm2, xmm0  F3 0F 5C D0 */
+            b = BUF(cg); b[0]=0xF3; b[1]=0x0F; b[2]=0x5C; b[3]=0xD0; EMIT(cg, 4);
+            /* movss [rdi + rsi*4], xmm2  F3 0F 11 14 B7 */
+            b = BUF(cg); b[0]=0xF3; b[1]=0x0F; b[2]=0x11;
+            b[3]=(uint8_t)((0<<6) | ((2 & 7)<<3) | 4);
+            b[4]=(uint8_t)((2<<6) | ((REG_RSI & 7)<<3) | (REG_RDI & 7));
+            EMIT(cg, 5);
+            cg_loop_end(cg, tail, 1);
+
+            b = BUF(cg); b[0]=0xC5; b[1]=0xF8; b[2]=0x77; EMIT(cg, 3);
+            pn = emit_pop(BUF(cg), REG_RBX); EMIT(cg, pn);
+            b = BUF(cg); b[0]=0x48; b[1]=0x83; b[2]=0xC4; b[3]=32; EMIT(cg, 4);
+            pn = emit_xor_reg_reg(BUF(cg), REG_RAX, REG_RAX); EMIT(cg, pn);
+            return 1;
+        }
         if (strcmp(name, "arr_f64_log") == 0 && argc == 1) {
             /* In-place log(buf): AVX2-packed natural log.  Algorithm
              * matches scalar math_log (atanh series).  Assumes all
@@ -6209,6 +6336,96 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             cg_loop_end(cg, tail, 1);
 
             /* vzeroupper + return 0 */
+            b = BUF(cg); b[0]=0xC5; b[1]=0xF8; b[2]=0x77; EMIT(cg, 3);
+            pn = emit_xor_reg_reg(BUF(cg), REG_RAX, REG_RAX); EMIT(cg, pn);
+            return 1;
+        }
+        if (strcmp(name, "arr_f32_copy_slice") == 0 && argc == 5) {
+            /* Copy n f32 elements from src[src_offset..] into
+             * dst[dst_offset..].  f32 mirror of arr_f64_copy_slice:
+             * scale=4 indexing, vmovups (8 lanes) inner, movss tail. */
+            emit_expression(cg, node->children[5]); /* n */
+            int pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
+            emit_expression(cg, node->children[4]); /* dst_offset */
+            pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
+            emit_expression(cg, node->children[3]); /* dst */
+            pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
+            emit_expression(cg, node->children[2]); /* src_offset */
+            pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
+            emit_expression(cg, node->children[1]); /* src → RAX */
+            uint8_t *b;
+
+            /* Stack [rsp+0]=src_off [rsp+8]=dst [rsp+16]=dst_off [rsp+24]=n */
+            b = BUF(cg); b[0]=0x48; b[1]=0x8B; b[2]=0x34; b[3]=0x24; EMIT(cg, 4);     /* mov rsi, [rsp] */
+            /* lea rsi, [rax + rsi*4]   — SIB scale=4: 0xB0 = 10.110.000 */
+            b = BUF(cg); b[0]=0x48; b[1]=0x8D; b[2]=0x34; b[3]=0xB0; EMIT(cg, 4);
+            b = BUF(cg); b[0]=0x48; b[1]=0x8B; b[2]=0x7C; b[3]=0x24; b[4]=0x08; EMIT(cg, 5); /* mov rdi, [rsp+8] */
+            b = BUF(cg); b[0]=0x48; b[1]=0x8B; b[2]=0x54; b[3]=0x24; b[4]=0x10; EMIT(cg, 5); /* mov rdx, [rsp+16] */
+            /* lea rdi, [rdi + rdx*4]   — SIB scale=4: 0x97 = 10.010.111 */
+            b = BUF(cg); b[0]=0x48; b[1]=0x8D; b[2]=0x3C; b[3]=0x97; EMIT(cg, 4);
+            b = BUF(cg); b[0]=0x48; b[1]=0x8B; b[2]=0x4C; b[3]=0x24; b[4]=0x18; EMIT(cg, 5); /* mov rcx, [rsp+24] = n */
+
+            /* rdx = n & ~7 */
+            pn = emit_mov_reg_reg(BUF(cg), REG_RDX, REG_RCX); EMIT(cg, pn);
+            b = BUF(cg); b[0]=0x48; b[1]=0x83; b[2]=0xE2; b[3]=0xF8; EMIT(cg, 4);
+
+            pn = emit_xor_reg_reg(BUF(cg), REG_RAX, REG_RAX); EMIT(cg, pn);
+
+            CgCountedLoop vec = cg_loop_begin(cg, REG_RAX, REG_RDX);
+            /* vmovups ymm0, [rsi + rax*4] — C5 FD 10 04 86 (mod=00 reg=0 r/m=SIB; SIB scale=4 idx=rax base=rsi → 0x86) */
+            b = BUF(cg); b[0]=0xC5; b[1]=0xFD; b[2]=0x10; b[3]=0x04; b[4]=0x86; EMIT(cg, 5);
+            /* vmovups [rdi + rax*4], ymm0 */
+            b = BUF(cg); b[0]=0xC5; b[1]=0xFD; b[2]=0x11; b[3]=0x04; b[4]=0x87; EMIT(cg, 5);
+            cg_loop_end(cg, vec, 8);
+
+            CgCountedLoop tail = cg_loop_begin(cg, REG_RAX, REG_RCX);
+            /* movss xmm0, [rsi + rax*4] — F3 0F 10 04 86 */
+            b = BUF(cg); b[0]=0xF3; b[1]=0x0F; b[2]=0x10; b[3]=0x04; b[4]=0x86; EMIT(cg, 5);
+            /* movss [rdi + rax*4], xmm0 */
+            b = BUF(cg); b[0]=0xF3; b[1]=0x0F; b[2]=0x11; b[3]=0x04; b[4]=0x87; EMIT(cg, 5);
+            cg_loop_end(cg, tail, 1);
+
+            b = BUF(cg); b[0]=0xC5; b[1]=0xF8; b[2]=0x77; EMIT(cg, 3);
+            b = BUF(cg); b[0]=0x48; b[1]=0x83; b[2]=0xC4; b[3]=0x20; EMIT(cg, 4);    /* drop 4 args */
+            pn = emit_xor_reg_reg(BUF(cg), REG_RAX, REG_RAX); EMIT(cg, pn);
+            return 1;
+        }
+        if (strcmp(name, "arr_f32_copy_at") == 0 && argc == 3) {
+            /* Copy dst.length f32 elements from src[src_offset..] into
+             * dst[0..len].  f32 mirror of arr_f64_copy_at. */
+            emit_expression(cg, node->children[3]); /* dst */
+            int pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
+            emit_expression(cg, node->children[2]); /* src_offset */
+            pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
+            emit_expression(cg, node->children[1]); /* src → RAX */
+            uint8_t *b;
+
+            pn = emit_pop(BUF(cg), REG_RSI); EMIT(cg, pn);   /* src_offset */
+            pn = emit_pop(BUF(cg), REG_RDI); EMIT(cg, pn);   /* dst */
+
+            /* RSI = src + src_offset*4
+             *   shl rsi, 2 ; add rax, rsi ; mov rsi, rax */
+            b = BUF(cg); b[0]=0x48; b[1]=0xC1; b[2]=0xE6; b[3]=0x02; EMIT(cg, 4);
+            b = BUF(cg); b[0]=0x48; b[1]=0x01; b[2]=0xF0; EMIT(cg, 3);
+            pn = emit_mov_reg_reg(BUF(cg), REG_RSI, REG_RAX); EMIT(cg, pn);
+
+            /* n = dst[-8], n_vec = n & ~7 */
+            pn = emit_mov_reg_mem(BUF(cg), REG_RCX, REG_RDI, -8); EMIT(cg, pn);
+            pn = emit_mov_reg_reg(BUF(cg), REG_RDX, REG_RCX); EMIT(cg, pn);
+            b = BUF(cg); b[0]=0x48; b[1]=0x83; b[2]=0xE2; b[3]=0xF8; EMIT(cg, 4);
+
+            pn = emit_xor_reg_reg(BUF(cg), REG_RAX, REG_RAX); EMIT(cg, pn);
+
+            CgCountedLoop vec = cg_loop_begin(cg, REG_RAX, REG_RDX);
+            b = BUF(cg); b[0]=0xC5; b[1]=0xFD; b[2]=0x10; b[3]=0x04; b[4]=0x86; EMIT(cg, 5);
+            b = BUF(cg); b[0]=0xC5; b[1]=0xFD; b[2]=0x11; b[3]=0x04; b[4]=0x87; EMIT(cg, 5);
+            cg_loop_end(cg, vec, 8);
+
+            CgCountedLoop tail = cg_loop_begin(cg, REG_RAX, REG_RCX);
+            b = BUF(cg); b[0]=0xF3; b[1]=0x0F; b[2]=0x10; b[3]=0x04; b[4]=0x86; EMIT(cg, 5);
+            b = BUF(cg); b[0]=0xF3; b[1]=0x0F; b[2]=0x11; b[3]=0x04; b[4]=0x87; EMIT(cg, 5);
+            cg_loop_end(cg, tail, 1);
+
             b = BUF(cg); b[0]=0xC5; b[1]=0xF8; b[2]=0x77; EMIT(cg, 3);
             pn = emit_xor_reg_reg(BUF(cg), REG_RAX, REG_RAX); EMIT(cg, pn);
             return 1;

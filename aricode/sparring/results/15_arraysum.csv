@@ -1,13 +1,13 @@
 label,binary_name,binary_size,text_size,instructions,exec_time_ns,startup_time_ns
-Python3,python3,93,N/A,N/A,7747075,7718532
-aricode,arraysum_aricode,453,333,111,287160,294353
-NASM asm,arraysum_asm,408,68,22,280480,284139
-C (clang -O2),arraysum_clang_O2,762584,649315,120107,391010,394380
-C (clang -O2 dyn),arraysum_clang_O2_dyn,15872,1546,148,521113,526728
-C (gcc -O0),arraysum_gcc_O0,754232,640439,120076,388650,402895
-C (gcc -O2),arraysum_gcc_O2,754232,640567,120104,391855,406093
-C (gcc -O2 dyn),arraysum_gcc_O2_dyn,15832,1469,137,528497,539661
-C (gcc -O3),arraysum_gcc_O3,754232,640567,120104,392077,402886
-C (gcc -Os),arraysum_gcc_Os,754232,640367,120061,393393,402440
-Go,arraysum_go,1873307,1171378,142394,957620,960638
-Rust,arraysum_rust,11382368,362199,71822,712451,735161
+Python3,python3,93,N/A,N/A,12206444,11042549
+aricode,arraysum_aricode,907,787,262,491993,531868
+NASM asm,arraysum_asm,408,68,22,455436,469529
+C (clang -O2),arraysum_clang_O2,762584,649315,120107,612779,629310
+C (clang -O2 dyn),arraysum_clang_O2_dyn,15872,1546,148,813361,813309
+C (gcc -O0),arraysum_gcc_O0,754232,640439,120076,582974,596167
+C (gcc -O2),arraysum_gcc_O2,754232,640567,120104,616751,624997
+C (gcc -O2 dyn),arraysum_gcc_O2_dyn,15832,1469,137,791588,799341
+C (gcc -O3),arraysum_gcc_O3,754232,640567,120104,642609,534837
+C (gcc -Os),arraysum_gcc_Os,754232,640367,120061,651410,482808
+Go,arraysum_go,1873307,1171378,142394,1584418,1486762
+Rust,arraysum_rust,11382368,362199,71822,1119302,1137862

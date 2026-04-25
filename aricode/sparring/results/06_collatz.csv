@@ -1,13 +1,13 @@
 label,binary_name,binary_size,text_size,instructions,exec_time_ns,startup_time_ns
-Python3,python3,404,N/A,N/A,7867759,7709100
-aricode,collatz_aricode,330,210,70,285413,296642
-NASM asm,collatz_asm,408,71,24,286888,288239
-C (clang -O2),collatz_clang_O2,762624,649075,120063,402108,401103
-C (clang -O2 dyn),collatz_clang_O2_dyn,15912,1302,103,539459,551018
-C (gcc -O0),collatz_gcc_O0,754272,640407,120069,399126,396857
-C (gcc -O2),collatz_gcc_O2,754272,640383,120062,400408,402506
-C (gcc -O2 dyn),collatz_gcc_O2_dyn,15872,1318,106,531763,540987
-C (gcc -O3),collatz_gcc_O3,754272,640511,120098,401760,403775
-C (gcc -Os),collatz_gcc_Os,754272,640319,120048,401886,404972
-Go,collatz_go,1874261,1171602,142436,972105,975092
-Rust,collatz_rust,11382368,361559,71716,714964,719087
+Python3,python3,404,N/A,N/A,7789731,7601446
+aricode,collatz_aricode,413,293,97,279433,290641
+NASM asm,collatz_asm,408,71,24,278498,290339
+C (clang -O2),collatz_clang_O2,762624,649075,120063,387916,399593
+C (clang -O2 dyn),collatz_clang_O2_dyn,15912,1302,103,533753,549319
+C (gcc -O0),collatz_gcc_O0,754272,640407,120069,392393,397328
+C (gcc -O2),collatz_gcc_O2,754272,640383,120062,392545,402436
+C (gcc -O2 dyn),collatz_gcc_O2_dyn,15872,1318,106,534633,560048
+C (gcc -O3),collatz_gcc_O3,754272,640511,120098,401631,413044
+C (gcc -Os),collatz_gcc_Os,754272,640319,120048,401280,412699
+Go,collatz_go,1874261,1171602,142436,1160790,1394210
+Rust,collatz_rust,11382368,361559,71716,982276,1036851

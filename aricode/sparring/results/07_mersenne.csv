@@ -1,13 +1,13 @@
 label,binary_name,binary_size,text_size,instructions,exec_time_ns,startup_time_ns
-Python3,python3,478,N/A,N/A,9041853,7594689
-aricode,mersenne_aricode,374,254,84,364979,362966
-NASM asm,mersenne_asm,400,58,19,319401,323082
-C (clang -O2),mersenne_clang_O2,762624,649139,120087,464284,470618
-C (clang -O2 dyn),mersenne_clang_O2_dyn,15912,1329,118,606003,612628
-C (gcc -O0),mersenne_gcc_O0,754272,640407,120068,914958,918843
-C (gcc -O2),mersenne_gcc_O2,754272,640447,120084,427338,435389
-C (gcc -O2 dyn),mersenne_gcc_O2_dyn,15872,1380,128,566961,559604
-C (gcc -O3),mersenne_gcc_O3,754272,640447,120084,428755,430928
-C (gcc -Os),mersenne_gcc_Os,754272,640319,120046,429621,434585
-Go,mersenne_go,1873547,1171771,142464,1828232,1831014
-Rust,mersenne_rust,11382368,361695,71718,750952,764925
+Python3,python3,478,N/A,N/A,14392204,11767521
+aricode,mersenne_aricode,495,375,125,492318,499583
+NASM asm,mersenne_asm,400,58,19,449988,459750
+C (clang -O2),mersenne_clang_O2,762624,649139,120087,643853,647325
+C (clang -O2 dyn),mersenne_clang_O2_dyn,15912,1329,118,835769,824491
+C (gcc -O0),mersenne_gcc_O0,754272,640407,120068,1283565,1347848
+C (gcc -O2),mersenne_gcc_O2,754272,640447,120084,627703,676088
+C (gcc -O2 dyn),mersenne_gcc_O2_dyn,15872,1380,128,839446,797820
+C (gcc -O3),mersenne_gcc_O3,754272,640447,120084,608971,644091
+C (gcc -Os),mersenne_gcc_Os,754272,640319,120046,631412,704223
+Go,mersenne_go,1873547,1171771,142464,3347950,3366669
+Rust,mersenne_rust,11382368,361695,71718,1064297,1037010

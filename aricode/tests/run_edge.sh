@@ -1048,6 +1048,56 @@ run_test "f32_kernels_chain" /tmp/edge_f32_kernels.ari "S_OK
 2.0000
 5.0000" "fill/sum/scale/relu/add_scaled all preserve algebraic identities"
 
+# #30  arr_f32_matvec / matvec_T / outer_accum vs the f64 reference,
+# all three feed into a dense layer's forward + backward update.  Same
+# data → same algebraic output (within ~1e-2 over a 32×64 layer with
+# ±0.5 weight range — the f32 mantissa drops a few ULPs per FMA).
+cat > /tmp/edge_f32_dense.ari << 'EOF'
+fn main() -> i32 {
+    let m: i32 = 32; let n: i32 = 64;
+    let Wf: i32 = arr_f32_new(m * n); let Wd: i32 = arr_f64_new(m * n);
+    let xf: i32 = arr_f32_new(n);     let xd: i32 = arr_f64_new(n);
+    let bf: i32 = arr_f32_new(m);     let bd: i32 = arr_f64_new(m);
+    let yf: i32 = arr_f32_new(m);     let yd: i32 = arr_f64_new(m);
+    let dyf: i32 = arr_f32_new(m);    let dyd: i32 = arr_f64_new(m);
+    let dxf: i32 = arr_f32_new(n);    let dxd: i32 = arr_f64_new(n);
+    let i: i32 = 0;
+    while (i < m * n) {
+        let v: f64 = int_to_float((i * 7 + 13) % 97) / 97.0 - 0.5;
+        arr_f32_set(Wf, i, v); arr_f64_set(Wd, i, v); i = i + 1;
+    }
+    i = 0;
+    while (i < n) {
+        let v: f64 = int_to_float(i % 11) / 11.0;
+        arr_f32_set(xf, i, v); arr_f64_set(xd, i, v); i = i + 1;
+    }
+    i = 0;
+    while (i < m) {
+        arr_f32_set(bf, i, 0.0); arr_f64_set(bd, i, 0.0);
+        let dyv: f64 = int_to_float((i * 3) % 5) / 5.0 - 0.4;
+        arr_f32_set(dyf, i, dyv); arr_f64_set(dyd, i, dyv);
+        i = i + 1;
+    }
+    arr_f32_matvec(Wf, xf, bf, yf, m, n);
+    arr_f64_matvec(Wd, xd, bd, yd, m, n);
+    arr_f32_matvec_T(Wf, dyf, dxf, m, n);
+    arr_f64_matvec_T(Wd, dyd, dxd, m, n);
+    let Wf0: f64 = arr_f32_sum(Wf);
+    let Wd0: f64 = arr_f64_sum(Wd);
+    arr_f32_outer_accum(Wf, dyf, xf, m, n);
+    arr_f64_outer_accum(Wd, dyd, xd, m, n);
+    let dWf: f64 = arr_f32_sum(Wf) - Wf0;
+    let dWd: f64 = arr_f64_sum(Wd) - Wd0;
+    if (math_abs(arr_f32_sum(yf) - arr_f64_sum(yd)) < 0.01) {
+        if (math_abs(arr_f32_sum(dxf) - arr_f64_sum(dxd)) < 0.01) {
+            if (math_abs(dWf - dWd) < 0.01) { print_str("DENSE_OK"); }
+        }
+    }
+    return 0;
+}
+EOF
+run_test "f32_dense_kernels" /tmp/edge_f32_dense.ari "DENSE_OK" "matvec / matvec_T / outer_accum agree with f64 within 1e-2"
+
 # ────────────────────────────────────────────────────────────────────
 
 echo ""

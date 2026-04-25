@@ -6,8 +6,10 @@
 
 #include "hot_var.h"
 #include "codegen.h"
+#include "x86_64.h"
 
 #include <stddef.h>
+#include <stdint.h>
 #include <string.h>
 
 /* Declared in codegen.c; we reach into the local table by name. */
@@ -60,6 +62,12 @@ int call_is_xmm_safe(const char *fn) {
     if (strcmp(fn, "arr_f64_matvec")      == 0) return 1;
     if (strcmp(fn, "arr_f64_matvec_T")    == 0) return 1;
     if (strcmp(fn, "arr_f64_outer_accum") == 0) return 1;
+    /* Builtins that clobber ymm8..ymm15 are also callable from
+     * xmm-safe bodies — the caller (emit_call_expr) wraps them with
+     * a vmovupd save/restore of the cache registers when it notices
+     * they're on `call_needs_ymm_save`'s list.  The classification
+     * must accept them so the enclosing function stays hot. */
+    if (call_needs_ymm_save(fn))          return 1;
     return 0;
 }
 
@@ -95,4 +103,91 @@ int node_hot_xmm_reg(CodegenState *cg, const ASTNode *node) {
     LocalVar *v = find_local(cg, node->string_val);
     if (!v || v->hot_xmm < 0) return -1;
     return v->hot_xmm;
+}
+
+int call_needs_ymm_save(const char *fn) {
+    if (!fn) return 0;
+    /* Builtins that write ymm8..ymm13 as live vector accumulators,
+     * verified by disassembly probe.  Each one makes the calling
+     * function drop out of hot-var mode unless wrapped in a
+     * save/restore of the ymm8..ymm15 cache registers. */
+    if (strcmp(fn, "arr_f64_softmax")            == 0) return 1;
+    if (strcmp(fn, "arr_f64_sigmoid")            == 0) return 1;
+    if (strcmp(fn, "arr_f64_tanh")               == 0) return 1;
+    if (strcmp(fn, "arr_f64_adam_apply")         == 0) return 1;
+    if (strcmp(fn, "arr_f64_conv2d_3x3_p1")      == 0) return 1;
+    if (strcmp(fn, "arr_f64_conv2d_3x3_p1_multi")== 0) return 1;
+    if (strcmp(fn, "arr_f64_log1p")              == 0) return 1;
+    if (strcmp(fn, "arr_f64_exp")                == 0) return 1;
+    if (strcmp(fn, "arr_f64_expm1")              == 0) return 1;
+    return 0;
+}
+
+/*
+ * Emit `vmovupd [rsp+disp8], ymmN`  —  VEX-encoded AVX1 store of a
+ * 256-bit ymm register to an rsp-relative slot.  Used only by the
+ * save/restore wrappers below, so keeping the helper local.
+ *
+ * Encoding layout (3-byte VEX so we can address ymm0..ymm15 uniformly):
+ *   C4  [R~ X~ B~ 0 0 0 0 1]    R~=0 for ymm8..15, B~=1 (rsp base)
+ *   [0 1111 1 01]               W=0, vvvv=1111, L=1 (256-bit), pp=01
+ *   11                          opcode (vmovupd m, r)
+ *   mod=01 reg=ymm&7 r/m=100    SIB follows, disp8
+ *   24                          SIB: scale=0 index=100(none) base=100(rsp)
+ *   disp8
+ */
+static void emit_vmovupd_rsp_disp_ymm(CodegenState *cg, int32_t disp, int ymm, int is_load) {
+    uint8_t *b = BUF(cg);
+    int R_high = (ymm >= 8);
+    b[0] = 0xC4;
+    b[1] = (uint8_t)((R_high ? 0x00 : 0x80) | 0x40 | 0x20 | 0x01);
+    b[2] = 0x7D;
+    b[3] = (uint8_t)(is_load ? 0x10 : 0x11);
+    if (disp >= -128 && disp <= 127) {
+        b[4] = (uint8_t)(0x40 | ((ymm & 7) << 3) | 0x04);   /* mod=01 disp8 */
+        b[5] = 0x24;                                         /* SIB: [rsp] */
+        b[6] = (uint8_t)(int8_t)disp;
+        EMIT(cg, 7);
+    } else {
+        b[4] = (uint8_t)(0x80 | ((ymm & 7) << 3) | 0x04);   /* mod=10 disp32 */
+        b[5] = 0x24;                                         /* SIB: [rsp] */
+        memcpy(b + 6, &disp, 4);
+        EMIT(cg, 10);
+    }
+}
+
+/*
+ * Save only the ymm slots actually in use by the hot-var allocator
+ * at this call site.  `next_hot_xmm` advances from 8 to 16 as f64
+ * locals are declared; at the point we're emitting a call, the
+ * allocated slots are xmm8..(next_hot_xmm-1).  Any f64 locals
+ * declared AFTER this call haven't been assigned yet, so their
+ * ymm state is not live here.
+ *
+ * Practical impact: a function with 2 f64 locals saves 2 × 32 B
+ * instead of 8 × 32 B — 4 vmovupd around each unsafe call instead
+ * of 16.  On small builtins like softmax (~N=10), the full 16-op
+ * wrap was enough to make hot-var mode a net loss; the trimmed
+ * form turns it back into a net win.
+ *
+ * If next_hot_xmm == 8 (no f64 hot locals), emit nothing at all.
+ */
+void emit_ymm8_15_save(CodegenState *cg) {
+    int count = cg->next_hot_xmm - 8;
+    if (count <= 0) return;
+    if (count > 8) count = 8;
+    int n = emit_sub_reg_imm(BUF(cg), REG_RSP, count * 32); EMIT(cg, n);
+    for (int i = 0; i < count; i++) {
+        emit_vmovupd_rsp_disp_ymm(cg, i * 32, 8 + i, 0 /*store*/);
+    }
+}
+
+void emit_ymm8_15_restore(CodegenState *cg) {
+    int count = cg->next_hot_xmm - 8;
+    if (count <= 0) return;
+    if (count > 8) count = 8;
+    for (int i = 0; i < count; i++) {
+        emit_vmovupd_rsp_disp_ymm(cg, i * 32, 8 + i, 1 /*load*/);
+    }
+    int n = emit_add_reg_imm(BUF(cg), REG_RSP, count * 32); EMIT(cg, n);
 }

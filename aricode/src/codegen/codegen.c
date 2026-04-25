@@ -1533,10 +1533,28 @@ static void emit_call_expr(CodegenState *cg, const ASTNode *node) {
     const ASTNode *callee = node->children[0];
     size_t argc = node->child_count - 1;
 
-    /* Dispatch to builtin handler — returns 1 if handled */
+    /* Dispatch to builtin handler — returns 1 if handled.  If the
+     * enclosing function is in xmm-safe mode AND the builtin is known
+     * to clobber ymm8..ymm15 (call_needs_ymm_save), wrap the inline
+     * emission with a save/restore of the ymm cache registers so the
+     * caller's hot-var state survives the builtin. */
     if (callee->type == NODE_IDENTIFIER && callee->string_val) {
-        if (emit_builtin(cg, node, callee->string_val, argc))
+        const char *name = callee->string_val;
+        int wrap = cg->in_xmm_safe_fn && call_needs_ymm_save(name);
+        if (wrap) emit_ymm8_15_save(cg);
+        if (emit_builtin(cg, node, name, argc)) {
+            if (wrap) emit_ymm8_15_restore(cg);
             return;
+        }
+        /* emit_builtin returned 0 — not a builtin after all (or an
+         * unknown name).  The `wrap` prologue has now been orphaned,
+         * so flag the inconsistency rather than silently leaking
+         * 256 B of stack. */
+        if (wrap) {
+            cg_error(cg, "xmm save/restore unbalance for '%s' at %d:%d",
+                     name, node->line, node->col);
+            return;
+        }
     }
     if (argc > SYS_V_ARG_COUNT) {
         cg_error(cg, "too many arguments (max %d) at %d:%d",

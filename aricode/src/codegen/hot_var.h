@@ -77,4 +77,35 @@ int node_hot_gp_reg(CodegenState *cg, const ASTNode *node);
  */
 int node_hot_xmm_reg(CodegenState *cg, const ASTNode *node);
 
+/*
+ * Does calling `fn` clobber ymm8..ymm15 as live state (not push/pop
+ * paired)?  Such builtins CAN still be called from xmm-safe functions
+ * IF the caller wraps the call with a save/restore of ymm8..ymm15
+ * (see emit_ymm8_15_save / _restore below).
+ *
+ * `call_is_xmm_safe` returns 1 for these too; the wrap is what keeps
+ * the caller's hot-var cache intact across the call.  A builtin on
+ * neither list is truly unsafe — any function containing it falls
+ * out of hot-var mode entirely.
+ *
+ * Today's "needs save" set: softmax, sigmoid, tanh, adam_apply,
+ * conv2d_3x3_p1, conv2d_3x3_p1_multi, and the AVX2 exp/log1p/expm1
+ * variants.  Each was verified empirically (disassembly probe) to
+ * write ymm8..ymm13 as live accumulators.
+ */
+int call_needs_ymm_save(const char *fn);
+
+/*
+ * Emit the "save ymm8..ymm15 on the stack" prologue / epilogue around
+ * a call to a builtin in `call_needs_ymm_save`.  Allocates 256 bytes
+ * of stack (8 ymm × 32 B), writes via vmovupd, reverses on restore.
+ *
+ * Only safe to emit inside an xmm-safe function body that's genuinely
+ * using ymm8..ymm15 as a hot-var cache — there's no point paying the
+ * 16×vmovupd overhead otherwise.  Caller guards with
+ * `cg->in_xmm_safe_fn`.
+ */
+void emit_ymm8_15_save(CodegenState *cg);
+void emit_ymm8_15_restore(CodegenState *cg);
+
 #endif /* ARICODE_HOT_VAR_H */

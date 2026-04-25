@@ -4,7 +4,7 @@ Honest, number-backed picture of what the compiler can do, what's
 fast, what's slow, and what's still on the backlog.  Updated after
 each performance or feature push.
 
-Last updated: 2026-04-25 (f32 AVX2 foundation: 9 builtins, dot 1.96× over f64, all xmm-safe)
+Last updated: 2026-04-25 (f32 AVX2 dense kernels — 12 builtins total, MLP forward 1.57×, all xmm-safe)
 
 ---
 
@@ -81,17 +81,26 @@ Starting point was 4.2-4.8× slower; the chain of codegen
 optimisations listed in `project_instruction_scheduling` (memory)
 closed roughly 60-65 % of the gap.  Latest wins (2026-04-25):
 
-- **f32 AVX2 primitives** — nine new builtins exploit the doubled
-  SIMD throughput of single precision: arr_f32_new / get / set / dot
-  / sum / relu / scale / fill / add_scaled.  Inner loops use 8-lane
-  vfmadd231ps / vaddps / vmaxps / vmulps; the boundary
-  (get/set/scalar args) goes through cvtss2sd / cvtsd2ss so the
-  aricode language stays f64-only at the user level.  Microbench
-  (10 000 × 100 k dot): f64 269 ms, f32 137 ms — **1.96× speedup**,
-  near-ideal lane-count win.  All nine empirically xmm-safe (zero
-  ymm8..15 references in the disassembly probe) so they joined
-  `call_is_xmm_safe`.  Foundation for Phase A.3: matvec, softmax,
-  adam_apply, conv2d_3x3_p1, copy_at/slice → end-to-end f32 MNIST.
+- **f32 AVX2 dense kernels** (Phase A.3) — three more builtins close
+  the dense-layer side of the f32 stack: arr_f32_matvec /
+  matvec_T / outer_accum.  8-lane vfmadd231ps inner, vbroadcastss
+  for the row scalar, scale=4 indexing throughout.  Microbench
+  (200 × forward through 1024 → 512 → 128 MLP): f64 36 ms vs f32
+  23 ms — **1.57×** speedup (below the pure-dot 1.96× because the
+  workload is memory-bandwidth-bound at W1 size).  Output agrees
+  with f64 to 5 significant digits.
+
+- **f32 AVX2 foundation + element-wise** (Phase A.1 + A.2) — nine
+  earlier builtins exploit the doubled SIMD throughput of single
+  precision: arr_f32_new / get / set / dot / sum / relu / scale /
+  fill / add_scaled.  Inner loops use 8-lane vfmadd231ps / vaddps /
+  vmaxps / vmulps; the boundary (get/set/scalar args) goes through
+  cvtss2sd / cvtsd2ss so the aricode language stays f64-only at the
+  user level.  Microbench (10 000 × 100 k dot): f64 269 ms, f32
+  137 ms — **1.96×** speedup.  All twelve f32 builtins empirically
+  xmm-safe (zero ymm8..15 references in the disassembly probe).
+  Remaining for end-to-end f32 MNIST: softmax, adam_apply,
+  conv2d_3x3_p1, copy_at/slice — Phase A.4.
 - **ymm8-15 save/restore wrapper for unsafe builtins** — nine
   builtins (softmax, sigmoid, tanh, adam_apply, conv2d_3x3_p1 and
   variants, log1p/exp/expm1) genuinely clobber ymm8..ymm13.  Instead

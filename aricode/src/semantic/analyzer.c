@@ -292,6 +292,12 @@ static AriType *builtin_return_type(const char *name) {
         /* f64 — f32 read returns promoted f64 (callers stay f64 throughout) */
         {"arr_f32_get",     TYPE_F64},
         {"arr_f32_dot",     TYPE_F64},
+        {"arr_f32_sum",     TYPE_F64},
+        /* i32 — f32 in-place mutators */
+        {"arr_f32_relu",       TYPE_I32},
+        {"arr_f32_scale",      TYPE_I32},
+        {"arr_f32_fill",       TYPE_I32},
+        {"arr_f32_add_scaled", TYPE_I32},
         /* f64 — f64 array ops that return f64 */
         {"arr_f64_get",     TYPE_F64},
         {"arr_f64_sum",     TYPE_F64},

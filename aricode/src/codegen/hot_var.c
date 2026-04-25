@@ -62,6 +62,19 @@ int call_is_xmm_safe(const char *fn) {
     if (strcmp(fn, "arr_f64_matvec")      == 0) return 1;
     if (strcmp(fn, "arr_f64_matvec_T")    == 0) return 1;
     if (strcmp(fn, "arr_f64_outer_accum") == 0) return 1;
+    /* f32 primitives — empirically use only ymm0..ymm3 (verified by
+     * disassembly probe).  Same shape as the f64 reductions but with
+     * 8-lane vfmadd231ps / vaddps / vmaxps instead of the 4-lane pd
+     * forms. */
+    if (strcmp(fn, "arr_f32_new")        == 0) return 1;
+    if (strcmp(fn, "arr_f32_get")        == 0) return 1;
+    if (strcmp(fn, "arr_f32_set")        == 0) return 1;
+    if (strcmp(fn, "arr_f32_dot")        == 0) return 1;
+    if (strcmp(fn, "arr_f32_sum")        == 0) return 1;
+    if (strcmp(fn, "arr_f32_relu")       == 0) return 1;
+    if (strcmp(fn, "arr_f32_scale")      == 0) return 1;
+    if (strcmp(fn, "arr_f32_fill")       == 0) return 1;
+    if (strcmp(fn, "arr_f32_add_scaled") == 0) return 1;
     /* Builtins that clobber ymm8..ymm15 are also callable from
      * xmm-safe bodies — the caller (emit_call_expr) wraps them with
      * a vmovupd save/restore of the cache registers when it notices

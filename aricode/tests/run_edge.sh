@@ -1022,6 +1022,32 @@ fn main() -> i32 {
 EOF
 run_test "f32_dot_vs_f64" /tmp/edge_f32_dot.ari "DOT_OK" "f32 8-lane dot agrees with f64 within 1e-3"
 
+# #29  arr_f32_fill / sum / scale / relu / add_scaled — element-wise
+# AVX2 kernels with 8-lane vector body + scalar ss tail.  Each
+# verified against expected algebraic identity.
+cat > /tmp/edge_f32_kernels.ari << 'EOF'
+fn main() -> i32 {
+    let a: i32 = arr_f32_new(100);
+    let b: i32 = arr_f32_new(100);
+    arr_f32_fill(a, 1.5);
+    arr_f32_fill(b, 4.0);
+    let s1: f64 = arr_f32_sum(a);          // 150.0
+    arr_f32_scale(a, 2.0);                  // a = 3.0
+    arr_f32_set(a, 0, 0.0 - 5.0);
+    arr_f32_relu(a);                        // a[0] now 0
+    arr_f32_add_scaled(a, b, 0.5);          // a[i] += 0.5*4 = 2.0
+    let r0: f64 = arr_f32_get(a, 0);        // 0 + 2 = 2.0
+    let r1: f64 = arr_f32_get(a, 1);        // 3 + 2 = 5.0
+    if (s1 > 149.99) { if (s1 < 150.01) { print_str("S_OK"); } }
+    print_f64(r0, 4);
+    print_f64(r1, 4);
+    return 0;
+}
+EOF
+run_test "f32_kernels_chain" /tmp/edge_f32_kernels.ari "S_OK
+2.0000
+5.0000" "fill/sum/scale/relu/add_scaled all preserve algebraic identities"
+
 # ────────────────────────────────────────────────────────────────────
 
 echo ""

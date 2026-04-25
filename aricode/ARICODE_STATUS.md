@@ -4,7 +4,7 @@ Honest, number-backed picture of what the compiler can do, what's
 fast, what's slow, and what's still on the backlog.  Updated after
 each performance or feature push.
 
-Last updated: 2026-04-25 (ymm8-15 save/restore wrapper → softmax/conv2d/adam_apply callable from hot-var)
+Last updated: 2026-04-25 (f32 AVX2 foundation: 9 builtins, dot 1.96× over f64, all xmm-safe)
 
 ---
 
@@ -81,6 +81,17 @@ Starting point was 4.2-4.8× slower; the chain of codegen
 optimisations listed in `project_instruction_scheduling` (memory)
 closed roughly 60-65 % of the gap.  Latest wins (2026-04-25):
 
+- **f32 AVX2 primitives** — nine new builtins exploit the doubled
+  SIMD throughput of single precision: arr_f32_new / get / set / dot
+  / sum / relu / scale / fill / add_scaled.  Inner loops use 8-lane
+  vfmadd231ps / vaddps / vmaxps / vmulps; the boundary
+  (get/set/scalar args) goes through cvtss2sd / cvtsd2ss so the
+  aricode language stays f64-only at the user level.  Microbench
+  (10 000 × 100 k dot): f64 269 ms, f32 137 ms — **1.96× speedup**,
+  near-ideal lane-count win.  All nine empirically xmm-safe (zero
+  ymm8..15 references in the disassembly probe) so they joined
+  `call_is_xmm_safe`.  Foundation for Phase A.3: matvec, softmax,
+  adam_apply, conv2d_3x3_p1, copy_at/slice → end-to-end f32 MNIST.
 - **ymm8-15 save/restore wrapper for unsafe builtins** — nine
   builtins (softmax, sigmoid, tanh, adam_apply, conv2d_3x3_p1 and
   variants, log1p/exp/expm1) genuinely clobber ymm8..ymm13.  Instead

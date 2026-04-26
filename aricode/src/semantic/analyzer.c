@@ -304,6 +304,7 @@ static AriType *builtin_return_type(const char *name) {
         {"arr_f32_copy_at",    TYPE_I32},
         {"arr_f32_copy_slice", TYPE_I32},
         {"arr_f32_adam_apply", TYPE_I32},
+        {"arr_f32_conv2d_3x3_p1", TYPE_I32},
         /* f64 — f64 array ops that return f64 */
         {"arr_f64_get",     TYPE_F64},
         {"arr_f64_sum",     TYPE_F64},

@@ -1167,6 +1167,45 @@ fn main() -> i32 {
 EOF
 run_test "f32_adam_apply" /tmp/edge_f32_adam.ari "ADAM_OK" "f32 adam_apply matches f64 within 1e-2 over 100 elements"
 
+# #34  arr_f32_conv2d_3x3_p1: 8-lane vec body (3 chunks) + 4-lane xmm
+# tail (1 chunk) for the 28-wide row.  Catches the tail-disp32 double-
+# offset bug seen in bring-up where rdx already carried 96 at tail
+# entry and the macro added 96 again.
+cat > /tmp/edge_f32_conv2d.ari << 'EOF'
+fn main() -> i32 {
+    let pf: i32 = arr_f32_new(900); let pd: i32 = arr_f64_new(900);
+    let Wf: i32 = arr_f32_new(8 * 9); let Wd: i32 = arr_f64_new(8 * 9);
+    let bf: i32 = arr_f32_new(8); let bd: i32 = arr_f64_new(8);
+    let yf: i32 = arr_f32_new(8 * 784); let yd: i32 = arr_f64_new(8 * 784);
+    let i: i32 = 0;
+    while (i < 900) {
+        let v: f64 = math_sin(int_to_float(i) * 0.13) * 0.5;
+        let row: i32 = i / 30;
+        let col: i32 = i - row * 30;
+        if (row == 0 || row == 29 || col == 0 || col == 29) { v = 0.0; }
+        arr_f32_set(pf, i, v); arr_f64_set(pd, i, v);
+        i = i + 1;
+    }
+    i = 0;
+    while (i < 8 * 9) {
+        let v: f64 = math_cos(int_to_float(i) * 0.21) * 0.3;
+        arr_f32_set(Wf, i, v); arr_f64_set(Wd, i, v);
+        i = i + 1;
+    }
+    i = 0;
+    while (i < 8) {
+        let v: f64 = int_to_float(i) * 0.01;
+        arr_f32_set(bf, i, v); arr_f64_set(bd, i, v);
+        i = i + 1;
+    }
+    arr_f32_conv2d_3x3_p1(pf, Wf, bf, yf, 8);
+    arr_f64_conv2d_3x3_p1(pd, Wd, bd, yd, 8);
+    if (math_abs(arr_f32_sum(yf) - arr_f64_sum(yd)) < 1.0) { print_str("CONV_OK"); }
+    return 0;
+}
+EOF
+run_test "f32_conv2d_3x3" /tmp/edge_f32_conv2d.ari "CONV_OK" "f32 3x3 conv (vec body + xmm tail) matches f64 within 1.0 over 6272 outputs"
+
 # ────────────────────────────────────────────────────────────────────
 
 echo ""

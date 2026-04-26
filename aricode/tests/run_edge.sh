@@ -1206,6 +1206,36 @@ fn main() -> i32 {
 EOF
 run_test "f32_conv2d_3x3" /tmp/edge_f32_conv2d.ari "CONV_OK" "f32 3x3 conv (vec body + xmm tail) matches f64 within 1.0 over 6272 outputs"
 
+# #35  arr_f32_mul length contract: dst MAY be larger than src1 (a)
+# without the kernel reading past `a` — `n` is taken from `arr_len(a)`,
+# not from `arr_len(dst)`.  Catches the OOB-via-oversized-dst bug
+# that a shared `tmp_g2` Adam scratch buffer was shaped to expose.
+cat > /tmp/edge_f32_mul_oversized.ari << 'EOF'
+fn main() -> i32 {
+    let a: i32 = arr_f32_new(8);          // small src
+    let b: i32 = arr_f32_new(8);
+    let dst: i32 = arr_f32_new(1024);     // large dst (Adam-style scratch)
+    arr_f32_fill(dst, 999.0);             // sentinel; should remain past i=7
+    let i: i32 = 0;
+    while (i < 8) {
+        arr_f32_set(a, i, int_to_float(i + 1));
+        arr_f32_set(b, i, 2.0);
+        i = i + 1;
+    }
+    arr_f32_mul(dst, a, b);
+    // First 8 dst slots: 1*2, 2*2, 3*2, ..., 8*2 = 2, 4, 6, ..., 16 → sum 72.
+    // Slots 8..1023 must stay 999.0 — kernel must NOT touch them.
+    let head: f64 = 0.0;
+    i = 0;
+    while (i < 8) { head = head + arr_f32_get(dst, i); i = i + 1; }
+    let tail: f64 = arr_f32_get(dst, 100) + arr_f32_get(dst, 500) + arr_f32_get(dst, 1023);
+    if (head > 71.99) { if (head < 72.01) {
+        if (tail > 2996.99) { if (tail < 2997.01) { print_str("MUL_OK"); } } } }
+    return 0;
+}
+EOF
+run_test "f32_mul_oversized_dst" /tmp/edge_f32_mul_oversized.ari "MUL_OK" "arr_f32_mul reads n from src1, not dst — large dst stays untouched past arr_len(a)"
+
 # ────────────────────────────────────────────────────────────────────
 
 echo ""

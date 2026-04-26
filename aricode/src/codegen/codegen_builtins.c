@@ -3707,7 +3707,15 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
         }
         if (strcmp(name, "arr_f32_mul") == 0 && argc == 3) {
             /* dst[i] = a[i] · b[i]  — f32 element-wise multiply.
-             * 8-lane vmulps inner, scalar mulss tail. */
+             * 8-lane vmulps inner, scalar mulss tail.
+             *
+             * Length is read from `a` (src1), NOT from dst — `dst` may
+             * be a scratch buffer larger than the operands (e.g.,
+             * shared `tmp_g2` sized for the largest gradient tensor in
+             * an Adam optimizer step).  Using dst's length would over-
+             * read past `a` / `b`, returning garbage and corrupting
+             * downstream Adam moments.  Caller's contract: `dst` must
+             * have at least `arr_len(a)` elements. */
             emit_expression(cg, node->children[3]);
             int pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
             emit_expression(cg, node->children[2]);
@@ -3719,7 +3727,8 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             b = BUF(cg); b[0]=0x48; b[1]=0x8B; b[2]=0x5C; b[3]=0x24; b[4]=0x08; EMIT(cg, 5);    /* mov rbx, [rsp+8] a */
             b = BUF(cg); b[0]=0x48; b[1]=0x8B; b[2]=0x54; b[3]=0x24; b[4]=0x10; EMIT(cg, 5);    /* mov rdx, [rsp+16] b */
 
-            pn = emit_mov_reg_mem(BUF(cg), REG_RCX, REG_RDI, -8); EMIT(cg, pn);
+            /* RCX = n  read from a (src1), via [rbx-8]. */
+            pn = emit_mov_reg_mem(BUF(cg), REG_RCX, REG_RBX, -8); EMIT(cg, pn);
             b = BUF(cg); b[0]=0x49; b[1]=0x89; b[2]=0xC8; EMIT(cg, 3);                          /* mov r8, rcx */
             b = BUF(cg); b[0]=0x49; b[1]=0x83; b[2]=0xE0; b[3]=0xF8; EMIT(cg, 4);                /* and r8, -8 */
             pn = emit_xor_reg_reg(BUF(cg), REG_RSI, REG_RSI); EMIT(cg, pn);

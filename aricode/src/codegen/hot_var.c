@@ -70,6 +70,7 @@ int call_is_xmm_safe(const char *fn) {
     if (strcmp(fn, "arr_f32_get")        == 0) return 1;
     if (strcmp(fn, "arr_f32_set")        == 0) return 1;
     if (strcmp(fn, "arr_f32_dot")        == 0) return 1;
+    if (strcmp(fn, "arr_f32_dot_range")  == 0) return 1;
     if (strcmp(fn, "arr_f32_sum")        == 0) return 1;
     if (strcmp(fn, "arr_f32_relu")       == 0) return 1;
     if (strcmp(fn, "arr_f32_scale")      == 0) return 1;

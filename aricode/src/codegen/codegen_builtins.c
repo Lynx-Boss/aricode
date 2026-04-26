@@ -3495,6 +3495,84 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x7E; b[4]=0xC0; EMIT(cg, 5);
             return 1;
         }
+        if (strcmp(name, "arr_f32_dot_range") == 0 && argc == 5) {
+            /* arr_f32_dot_range(a, off_a, b, off_b, n) -> f64
+             *
+             * f32 mirror of arr_f64_dot_range.  Σ a[off_a + i] · b[off_b + i]
+             * with 8-lane vfmadd231ps + scalar ss tail.  Returns the sum
+             * promoted to f64 (cvtss2sd at exit) so the caller doesn't
+             * need a separate conversion.
+             *
+             * Scale factor is 4 (vs f64's 8); n & ~7 vec mask covers
+             * 8 single-precision lanes per ymm chunk. */
+            emit_expression(cg, node->children[5]); /* n */
+            int pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
+            emit_expression(cg, node->children[4]); /* off_b */
+            pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
+            emit_expression(cg, node->children[3]); /* b */
+            pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
+            emit_expression(cg, node->children[2]); /* off_a */
+            pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
+            emit_expression(cg, node->children[1]); /* a → RAX */
+            uint8_t *b;
+
+            /* Stack [rsp+0]=off_a [rsp+8]=b [rsp+16]=off_b [rsp+24]=n */
+            /* RDI = a + off_a*4   — SIB scale=4: 0xB0 = 10.110.000 */
+            b = BUF(cg); b[0]=0x48; b[1]=0x8B; b[2]=0x34; b[3]=0x24; EMIT(cg, 4);          /* mov rsi, [rsp+0] */
+            b = BUF(cg); b[0]=0x48; b[1]=0x8D; b[2]=0x3C; b[3]=0xB0; EMIT(cg, 4);          /* lea rdi, [rax + rsi*4] */
+            /* R8 = b + off_b*4 */
+            b = BUF(cg); b[0]=0x4C; b[1]=0x8B; b[2]=0x44; b[3]=0x24; b[4]=0x08; EMIT(cg, 5); /* mov r8, [rsp+8] */
+            b = BUF(cg); b[0]=0x48; b[1]=0x8B; b[2]=0x54; b[3]=0x24; b[4]=0x10; EMIT(cg, 5); /* mov rdx, [rsp+16] */
+            /* lea rax, [r8 + rdx*4]  — SIB scale=4 idx=rdx base=r8: 0x90 = 10.010.000 */
+            b = BUF(cg); b[0]=0x49; b[1]=0x8D; b[2]=0x04; b[3]=0x90; EMIT(cg, 4);
+            pn = emit_mov_reg_reg(BUF(cg), 8 /* R8 */, REG_RAX); EMIT(cg, pn);
+            /* RCX = n */
+            b = BUF(cg); b[0]=0x48; b[1]=0x8B; b[2]=0x4C; b[3]=0x24; b[4]=0x18; EMIT(cg, 5);
+
+            /* RDX = n & ~7 */
+            pn = emit_mov_reg_reg(BUF(cg), REG_RDX, REG_RCX); EMIT(cg, pn);
+            b = BUF(cg); b[0]=0x48; b[1]=0x83; b[2]=0xE2; b[3]=0xF8; EMIT(cg, 4);
+
+            /* vxorps ymm0, ymm0, ymm0   C5 FC 57 C0 */
+            b = BUF(cg); b[0]=0xC5; b[1]=0xFC; b[2]=0x57; b[3]=0xC0; EMIT(cg, 4);
+
+            pn = emit_xor_reg_reg(BUF(cg), REG_RSI, REG_RSI); EMIT(cg, pn);
+
+            CgCountedLoop vec = cg_loop_begin(cg, REG_RSI, REG_RDX);
+            /* vmovups ymm1, [rdi + rsi*4]  C5 FD 10 0C B7 */
+            b = BUF(cg); b[0]=0xC5; b[1]=0xFD; b[2]=0x10; b[3]=0x0C; b[4]=0xB7; EMIT(cg, 5);
+            /* vmovups ymm2, [r8 + rsi*4]   C4 C1 7D 10 14 B0 (B~=0 for r8 high) */
+            b = BUF(cg); b[0]=0xC4; b[1]=0xC1; b[2]=0x7D; b[3]=0x10;
+            b[4]=0x14; b[5]=0xB0; EMIT(cg, 6);
+            /* vfmadd231ps ymm0, ymm1, ymm2  C4 E2 75 B8 C2 */
+            b = BUF(cg); b[0]=0xC4; b[1]=0xE2; b[2]=0x75; b[3]=0xB8; b[4]=0xC2; EMIT(cg, 5);
+            cg_loop_end(cg, vec, 8);
+
+            /* Horizontal reduce ymm0 (8 ps lanes) → xmm0 low. */
+            b = BUF(cg); b[0]=0xC4; b[1]=0xE3; b[2]=0x7D; b[3]=0x19; b[4]=0xC1; b[5]=0x01; EMIT(cg, 6);
+            b = BUF(cg); b[0]=0xC5; b[1]=0xF8; b[2]=0x58; b[3]=0xC1; EMIT(cg, 4);
+            b = BUF(cg); b[0]=0xC5; b[1]=0xFB; b[2]=0x7C; b[3]=0xC0; EMIT(cg, 4);
+            b = BUF(cg); b[0]=0xC5; b[1]=0xFB; b[2]=0x7C; b[3]=0xC0; EMIT(cg, 4);
+
+            /* Scalar tail */
+            CgCountedLoop tail = cg_loop_begin(cg, REG_RSI, REG_RCX);
+            /* movss xmm1, [rdi + rsi*4]   F3 0F 10 0C B7 */
+            b = BUF(cg); b[0]=0xF3; b[1]=0x0F; b[2]=0x10; b[3]=0x0C; b[4]=0xB7; EMIT(cg, 5);
+            /* movss xmm2, [r8 + rsi*4]    F3 41 0F 10 14 B0 */
+            b = BUF(cg); b[0]=0xF3; b[1]=0x41; b[2]=0x0F; b[3]=0x10; b[4]=0x14; b[5]=0xB0; EMIT(cg, 6);
+            /* mulss xmm1, xmm2  F3 0F 59 CA */
+            b = BUF(cg); b[0]=0xF3; b[1]=0x0F; b[2]=0x59; b[3]=0xCA; EMIT(cg, 4);
+            /* addss xmm0, xmm1  F3 0F 58 C1 */
+            b = BUF(cg); b[0]=0xF3; b[1]=0x0F; b[2]=0x58; b[3]=0xC1; EMIT(cg, 4);
+            cg_loop_end(cg, tail, 1);
+
+            /* cvtss2sd → vzeroupper → drop 4 args → movq rax, xmm0 */
+            b = BUF(cg); b[0]=0xF3; b[1]=0x0F; b[2]=0x5A; b[3]=0xC0; EMIT(cg, 4);
+            b = BUF(cg); b[0]=0xC5; b[1]=0xF8; b[2]=0x77; EMIT(cg, 3);
+            b = BUF(cg); b[0]=0x48; b[1]=0x83; b[2]=0xC4; b[3]=0x20; EMIT(cg, 4);
+            b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x7E; b[4]=0xC0; EMIT(cg, 5);
+            return 1;
+        }
         if (strcmp(name, "arr_f64_sum_kahan") == 0 && argc == 1) {
             /* Kahan compensated summation — recovers bits lost to rounding.
              *

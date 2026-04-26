@@ -1236,6 +1236,30 @@ fn main() -> i32 {
 EOF
 run_test "f32_mul_oversized_dst" /tmp/edge_f32_mul_oversized.ari "MUL_OK" "arr_f32_mul reads n from src1, not dst — large dst stays untouched past arr_len(a)"
 
+# #36  arr_f32_dot_range: AVX2 dot product over a slice of two f32
+# arrays.  Same shape as arr_f64_dot_range but 8-lane vfmadd231ps.
+# Catches scale=4 SIB miscoding regressions and the cvtss2sd return.
+cat > /tmp/edge_f32_dr.ari << 'EOF'
+fn main() -> i32 {
+    let n: i32 = 100;
+    let af: i32 = arr_f32_new(n); let bf: i32 = arr_f32_new(n);
+    let ad: i32 = arr_f64_new(n); let bd: i32 = arr_f64_new(n);
+    let i: i32 = 0;
+    while (i < n) {
+        let v: f64 = int_to_float(i % 17) / 17.0;
+        let w: f64 = int_to_float(i % 31) / 31.0;
+        arr_f32_set(af, i, v); arr_f32_set(bf, i, w);
+        arr_f64_set(ad, i, v); arr_f64_set(bd, i, w);
+        i = i + 1;
+    }
+    let rf: f64 = arr_f32_dot_range(af, 10, bf, 5, 30);
+    let rd: f64 = arr_f64_dot_range(ad, 10, bd, 5, 30);
+    if (math_abs(rf - rd) < 0.001) { print_str("DR_OK"); }
+    return 0;
+}
+EOF
+run_test "f32_dot_range" /tmp/edge_f32_dr.ari "DR_OK" "f32 dot_range over slice [10..40)·[5..35) matches f64 within 1e-3"
+
 # ────────────────────────────────────────────────────────────────────
 
 echo ""

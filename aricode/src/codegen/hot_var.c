@@ -137,6 +137,7 @@ int call_needs_ymm_save(const char *fn) {
     if (strcmp(fn, "arr_f64_conv2d_3x3_p1")      == 0) return 1;
     if (strcmp(fn, "arr_f64_conv2d_3x3_p1_multi")== 0) return 1;
     if (strcmp(fn, "arr_f32_conv2d_3x3_p1")      == 0) return 1;
+    if (strcmp(fn, "arr_f32_mul")        == 0) return 1;
     if (strcmp(fn, "arr_f64_log1p")              == 0) return 1;
     if (strcmp(fn, "arr_f64_exp")                == 0) return 1;
     if (strcmp(fn, "arr_f64_expm1")              == 0) return 1;

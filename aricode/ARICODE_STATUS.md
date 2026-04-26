@@ -4,7 +4,7 @@ Honest, number-backed picture of what the compiler can do, what's
 fast, what's slow, and what's still on the backlog.  Updated after
 each performance or feature push.
 
-Last updated: 2026-04-25 (f32 SGD MLP 19 s / 97.16% — 42 % faster than f64 baseline; 15 of 16 f32 builtins shipped)
+Last updated: 2026-04-26 (16/16 f32 builtins shipped — arr_f32_conv2d_3x3_p1 closes the CNN front)
 
 ---
 

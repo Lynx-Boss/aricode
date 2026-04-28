@@ -1286,6 +1286,57 @@ fn main() -> i32 {
 EOF
 run_test "f32_adam_sparse" /tmp/edge_f32_adam_sparse.ari "ADAM_SPARSE_OK" "f32 adam_apply advances RSI through every 8-lane chunk (sparse m,v at lane 17 must update W[17])"
 
+# #38  arr_f32_exp: promote-to-f64 + vec_exp_body + narrow.  Compare
+# against scalar math_exp at three representative points to catch
+# both the cvtps2pd/cvtpd2ps wrappers and the polynomial precision.
+cat > /tmp/edge_f32_exp.ari << 'EOF'
+fn main() -> i32 {
+    let n: i32 = 4;
+    let buf: i32 = arr_f32_new(n);
+    arr_f32_set(buf, 0, 0.0);
+    arr_f32_set(buf, 1, 1.0);
+    arr_f32_set(buf, 2, 2.0);
+    arr_f32_set(buf, 3, -3.0);
+    arr_f32_exp(buf);
+    let ok: i32 = 1;
+    if (math_abs(arr_f32_get(buf, 0) - 1.0)        > 0.0001) { ok = 0; }
+    if (math_abs(arr_f32_get(buf, 1) - 2.718281)   > 0.0001) { ok = 0; }
+    if (math_abs(arr_f32_get(buf, 2) - 7.389056)   > 0.001 ) { ok = 0; }
+    if (math_abs(arr_f32_get(buf, 3) - 0.049787)   > 0.0001) { ok = 0; }
+    if (ok == 1) { print_str("EXP_OK"); }
+    return 0;
+}
+EOF
+run_test "f32_exp" /tmp/edge_f32_exp.ari "EXP_OK" "f32 exp matches scalar math_exp at 0/1/2/-3 within 1e-3"
+
+# #39  arr_f32_softmax: stable in-place softmax, must produce a valid
+# probability distribution (positives summing to 1) regardless of the
+# input shift level.  Test with a moderately large positive shift to
+# stress the (-max) broadcast path.
+cat > /tmp/edge_f32_softmax.ari << 'EOF'
+fn main() -> i32 {
+    let n: i32 = 8;
+    let buf: i32 = arr_f32_new(n);
+    arr_f32_set(buf, 0, 100.0);  arr_f32_set(buf, 1, 101.0);
+    arr_f32_set(buf, 2, 102.0);  arr_f32_set(buf, 3, 103.0);
+    arr_f32_set(buf, 4, 100.0);  arr_f32_set(buf, 5, 101.0);
+    arr_f32_set(buf, 6, 102.0);  arr_f32_set(buf, 7, 103.0);
+    arr_f32_softmax(buf);
+    let total: f64 = 0.0;
+    let any_neg: i32 = 0;
+    let i: i32 = 0;
+    while (i < n) {
+        let v: f64 = arr_f32_get(buf, i);
+        if (v < 0.0) { any_neg = 1; }
+        total = total + v;
+        i += 1;
+    }
+    if (any_neg == 0 && math_abs(total - 1.0) < 0.0001) { print_str("SOFTMAX_OK"); }
+    return 0;
+}
+EOF
+run_test "f32_softmax" /tmp/edge_f32_softmax.ari "SOFTMAX_OK" "f32 softmax stable under +100 shift; produces valid distribution summing to 1.0 ± 1e-4"
+
 # ────────────────────────────────────────────────────────────────────
 
 echo ""

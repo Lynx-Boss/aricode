@@ -141,6 +141,10 @@ int call_needs_ymm_save(const char *fn) {
     if (strcmp(fn, "arr_f64_log1p")              == 0) return 1;
     if (strcmp(fn, "arr_f64_exp")                == 0) return 1;
     if (strcmp(fn, "arr_f64_expm1")              == 0) return 1;
+    /* arr_f32_exp / arr_f32_softmax wrap the same vec_exp_body that
+     * clobbers ymm8..ymm10 (broadcasts of log2e/ln2/1.0). */
+    if (strcmp(fn, "arr_f32_exp")                == 0) return 1;
+    if (strcmp(fn, "arr_f32_softmax")            == 0) return 1;
     return 0;
 }
 

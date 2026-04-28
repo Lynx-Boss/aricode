@@ -4221,6 +4221,190 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             pn = emit_xor_reg_reg(BUF(cg), REG_RAX, REG_RAX); EMIT(cg, pn);
             return 1;
         }
+        if (strcmp(name, "arr_f32_exp") == 0 && argc == 1) {
+            /* In-place exp(buf) for an f32 array.  Lifts to f64 via
+             * vcvtps2pd, runs the existing 4-lane f64 exp body, then
+             * narrows back via vcvtpd2ps.  Trades a true 8-lane f32
+             * Estrin polynomial for ~50 lines of code reuse — same
+             * 4-element-per-iter throughput as arr_f64_exp, but the
+             * caller's buffer is half the bytes so memory pressure
+             * drops accordingly.  Caller pads n to a multiple of 4. */
+            emit_expression(cg, node->children[1]); /* buf */
+            int pn; uint8_t *b;
+            pn = emit_mov_reg_reg(BUF(cg), REG_RDI, REG_RAX); EMIT(cg, pn);
+            pn = emit_mov_reg_mem(BUF(cg), REG_RCX, REG_RAX, -8); EMIT(cg, pn);
+
+            /* RDX = n & ~3 */
+            pn = emit_mov_reg_reg(BUF(cg), REG_RDX, REG_RCX); EMIT(cg, pn);
+            b = BUF(cg); b[0]=0x48; b[1]=0x83; b[2]=0xE2; b[3]=0xFC; EMIT(cg, 4);
+
+            /* Loop-invariants for vec_exp_body. */
+            cg_broadcast_f64(cg, 8,  0x3FF71547652B82FEULL, 0);
+            cg_broadcast_f64(cg, 9,  0x3FE62E42FEFA39EFULL, 0);
+            cg_broadcast_f64(cg, 10, 0x3FF0000000000000ULL, 0);
+            emit_exp_coeff_stack_setup(cg);
+
+            pn = emit_xor_reg_reg(BUF(cg), REG_RSI, REG_RSI); EMIT(cg, pn);
+
+            CgCountedLoop vec = cg_loop_begin(cg, REG_RSI, REG_RDX);
+
+            /* Load 4 f32 (16 B) into xmm0: vmovups xmm0, [rdi + rsi*4]
+             *   C5 F8 10 04 B7 */
+            b = BUF(cg); b[0]=0xC5; b[1]=0xF8; b[2]=0x10; b[3]=0x04; b[4]=0xB7; EMIT(cg, 5);
+            /* Promote to 4 f64 in ymm0: vcvtps2pd ymm0, xmm0
+             *   C5 FC 5A C0 (VEX.256 0F 5A /r) */
+            b = BUF(cg); b[0]=0xC5; b[1]=0xFC; b[2]=0x5A; b[3]=0xC0; EMIT(cg, 4);
+
+            emit_vec_exp_body_avx2(cg);
+
+            /* Narrow back to 4 f32 in xmm0: vcvtpd2ps xmm0, ymm0
+             *   C5 FD 5A C0 (VEX.256.66.0F 5A /r) */
+            b = BUF(cg); b[0]=0xC5; b[1]=0xFD; b[2]=0x5A; b[3]=0xC0; EMIT(cg, 4);
+            /* Store 4 f32 back: vmovups [rdi + rsi*4], xmm0
+             *   C5 F8 11 04 B7 */
+            b = BUF(cg); b[0]=0xC5; b[1]=0xF8; b[2]=0x11; b[3]=0x04; b[4]=0xB7; EMIT(cg, 5);
+
+            cg_loop_end(cg, vec, 4);
+
+            emit_exp_coeff_stack_teardown(cg);
+
+            b = BUF(cg); b[0]=0xC5; b[1]=0xF8; b[2]=0x77; EMIT(cg, 3);
+            pn = emit_xor_reg_reg(BUF(cg), REG_RAX, REG_RAX); EMIT(cg, pn);
+            return 1;
+        }
+        if (strcmp(name, "arr_f32_softmax") == 0 && argc == 1) {
+            /* Stable in-place softmax for an f32 buffer.  Three passes:
+             *   1. scalar max (n is small for typical NN heads — 10-1000)
+             *   2. vec exp(x - max) into the buffer + scalar sum
+             *   3. vec scale by 1/sum
+             *
+             * Pass 1 + sum stay scalar in single precision (sumss); the
+             * exp pass reuses arr_f32_exp's promote/narrow pattern so we
+             * only spill the polynomial coefficients once.  Caller is
+             * responsible for n being a multiple of 4 (consistent with
+             * arr_f64_softmax / arr_f32_exp). */
+            emit_expression(cg, node->children[1]); /* buf */
+            int pn; uint8_t *b;
+            pn = emit_push(BUF(cg), REG_RBX); EMIT(cg, pn);
+            pn = emit_mov_reg_reg(BUF(cg), REG_RDI, REG_RAX); EMIT(cg, pn);
+            /* RBX = n (callee-saved across vec_exp_body's RCX clobber). */
+            pn = emit_mov_reg_mem(BUF(cg), REG_RBX, REG_RAX, -8); EMIT(cg, pn);
+
+            /* ── Pass 1: xmm11 = max over the buffer (scalar f32). ──
+             * vmaxss xmm11, xmm11, [rdi + rsi*4]  in a tight loop. */
+            /* xmm11 = -inf  (movss from imm via stack)  */
+            /* Seed xmm11 with buf[0]: movss xmm11, [rdi]
+             *   F3 44 0F 10 1F */
+            b = BUF(cg); b[0]=0xF3; b[1]=0x44; b[2]=0x0F; b[3]=0x10; b[4]=0x1F; EMIT(cg, 5);
+            /* RSI = 1; loop while RSI < RBX. */
+            pn = emit_mov_reg_imm32(BUF(cg), REG_RSI, 1); EMIT(cg, pn);
+            CgCountedLoop mx = cg_loop_begin(cg, REG_RSI, REG_RBX);
+            /* maxss xmm11, [rdi + rsi*4]
+             *   F3 44 0F 5F 1C B7  (REX.R for xmm11) */
+            b = BUF(cg); b[0]=0xF3; b[1]=0x44; b[2]=0x0F; b[3]=0x5F;
+            b[4]=0x1C; b[5]=0xB7; EMIT(cg, 6);
+            cg_loop_end(cg, mx, 1);
+
+            /* ── Broadcast (-max) into ymm15 for the subtract step. ──
+             * Negate xmm11 by xor with 0x80000000 in xmm14, then broadcast.
+             * Build sign mask: mov eax, 0x80000000 ; movd xmm14, eax. */
+            b = BUF(cg); b[0]=0xB8; uint32_t neg_mask=0x80000000u;
+            memcpy(b+1, &neg_mask, 4); EMIT(cg, 5);
+            /* movd xmm14, eax  —  66 44 0F 6E F0 */
+            b = BUF(cg); b[0]=0x66; b[1]=0x44; b[2]=0x0F; b[3]=0x6E; b[4]=0xF0; EMIT(cg, 5);
+            /* xorps xmm11, xmm14  —  44 0F 57 DE  (legacy SSE: xmm11 ^ xmm14) */
+            b = BUF(cg); b[0]=0x45; b[1]=0x0F; b[2]=0x57; b[3]=0xDE; EMIT(cg, 4);
+            /* vbroadcastss ymm15, xmm11  —  C4 42 7D 18 FB */
+            b = BUF(cg); b[0]=0xC4; b[1]=0x42; b[2]=0x7D; b[3]=0x18; b[4]=0xFB; EMIT(cg, 5);
+
+            /* ── Pass 2: buf[i] = exp(buf[i] + (-max)); accumulate sum. ──
+             * Use the f32-promote/exp/narrow pattern, plus an addss into
+             * xmm12 for the running sum. */
+            /* RDX = n & ~3 (vec end). */
+            pn = emit_mov_reg_reg(BUF(cg), REG_RDX, REG_RBX); EMIT(cg, pn);
+            b = BUF(cg); b[0]=0x48; b[1]=0x83; b[2]=0xE2; b[3]=0xFC; EMIT(cg, 4);
+
+            /* Loop-invariants for vec_exp_body. */
+            cg_broadcast_f64(cg, 8,  0x3FF71547652B82FEULL, 0);
+            cg_broadcast_f64(cg, 9,  0x3FE62E42FEFA39EFULL, 0);
+            cg_broadcast_f64(cg, 10, 0x3FF0000000000000ULL, 0);
+            emit_exp_coeff_stack_setup(cg);
+
+            /* xmm12 = 0.0 (running sum). */
+            b = BUF(cg); b[0]=0x44; b[1]=0x0F; b[2]=0x57; b[3]=0xE4; EMIT(cg, 4); /* xorps xmm12, xmm12 */
+
+            pn = emit_xor_reg_reg(BUF(cg), REG_RSI, REG_RSI); EMIT(cg, pn);
+            CgCountedLoop ex = cg_loop_begin(cg, REG_RSI, REG_RDX);
+
+            /* xmm0 = buf chunk (4 f32). */
+            b = BUF(cg); b[0]=0xC5; b[1]=0xF8; b[2]=0x10; b[3]=0x04; b[4]=0xB7; EMIT(cg, 5);
+            /* Add the broadcast (-max) lane-wise: vaddps xmm0, xmm0, xmm15.
+             *   C4 C1 78 58 C7 (3-byte VEX: B~=0 so xmm15 reachable). */
+            b = BUF(cg); b[0]=0xC4; b[1]=0xC1; b[2]=0x78; b[3]=0x58; b[4]=0xC7; EMIT(cg, 5);
+            /* Promote to 4 f64. */
+            b = BUF(cg); b[0]=0xC5; b[1]=0xFC; b[2]=0x5A; b[3]=0xC0; EMIT(cg, 4);
+
+            emit_vec_exp_body_avx2(cg);
+
+            /* Narrow back to 4 f32 in xmm0. */
+            b = BUF(cg); b[0]=0xC5; b[1]=0xFD; b[2]=0x5A; b[3]=0xC0; EMIT(cg, 4);
+            /* Store. */
+            b = BUF(cg); b[0]=0xC5; b[1]=0xF8; b[2]=0x11; b[3]=0x04; b[4]=0xB7; EMIT(cg, 5);
+
+            /* Horizontal-sum xmm0 into xmm12: two haddps + addss.
+             *   vhaddps xmm0, xmm0, xmm0  —  C5 FB 7C C0
+             *   vhaddps xmm0, xmm0, xmm0  —  C5 FB 7C C0
+             *   addss xmm12, xmm0         —  F3 44 0F 58 E0 */
+            b = BUF(cg); b[0]=0xC5; b[1]=0xFB; b[2]=0x7C; b[3]=0xC0; EMIT(cg, 4);
+            b = BUF(cg); b[0]=0xC5; b[1]=0xFB; b[2]=0x7C; b[3]=0xC0; EMIT(cg, 4);
+            b = BUF(cg); b[0]=0xF3; b[1]=0x44; b[2]=0x0F; b[3]=0x58; b[4]=0xE0; EMIT(cg, 5);
+
+            cg_loop_end(cg, ex, 4);
+
+            emit_exp_coeff_stack_teardown(cg);
+
+            /* ── Pass 3: scale by 1/sum.  xmm12 holds sum. ──
+             * Compute reciprocal: divss xmm0, xmm12 (xmm0 = 1.0/xmm12). */
+            /* mov eax, 0x3F800000 ; movd xmm0, eax  — load 1.0f */
+            b = BUF(cg); b[0]=0xB8; uint32_t one_bits=0x3F800000u;
+            memcpy(b+1, &one_bits, 4); EMIT(cg, 5);
+            b = BUF(cg); b[0]=0x66; b[1]=0x0F; b[2]=0x6E; b[3]=0xC0; EMIT(cg, 4); /* movd xmm0, eax */
+            /* divss xmm0, xmm12  —  F3 41 0F 5E C4 */
+            b = BUF(cg); b[0]=0xF3; b[1]=0x41; b[2]=0x0F; b[3]=0x5E; b[4]=0xC4; EMIT(cg, 5);
+            /* vbroadcastss ymm0, xmm0  —  C4 E2 7D 18 C0 */
+            b = BUF(cg); b[0]=0xC4; b[1]=0xE2; b[2]=0x7D; b[3]=0x18; b[4]=0xC0; EMIT(cg, 5);
+
+            /* RDX = n & ~7 (8-lane vec scale).  Actually 8-lane uses ymm,
+             * but we already have the scale broadcast in ymm0 — switch to
+             * 8-lane multiply. */
+            pn = emit_mov_reg_reg(BUF(cg), REG_RDX, REG_RBX); EMIT(cg, pn);
+            b = BUF(cg); b[0]=0x48; b[1]=0x83; b[2]=0xE2; b[3]=0xF8; EMIT(cg, 4);
+
+            pn = emit_xor_reg_reg(BUF(cg), REG_RSI, REG_RSI); EMIT(cg, pn);
+            CgCountedLoop sc = cg_loop_begin(cg, REG_RSI, REG_RDX);
+            /* vmovups ymm1, [rdi + rsi*4]  —  C5 FD 10 0C B7 */
+            b = BUF(cg); b[0]=0xC5; b[1]=0xFD; b[2]=0x10; b[3]=0x0C; b[4]=0xB7; EMIT(cg, 5);
+            /* vmulps ymm1, ymm1, ymm0   —  C5 F4 59 C8 */
+            b = BUF(cg); b[0]=0xC5; b[1]=0xF4; b[2]=0x59; b[3]=0xC8; EMIT(cg, 4);
+            /* vmovups [rdi + rsi*4], ymm1  —  C5 FD 11 0C B7 */
+            b = BUF(cg); b[0]=0xC5; b[1]=0xFD; b[2]=0x11; b[3]=0x0C; b[4]=0xB7; EMIT(cg, 5);
+            cg_loop_end(cg, sc, 8);
+
+            /* Scalar tail for n mod 8 (mulss). */
+            CgCountedLoop sct = cg_loop_begin(cg, REG_RSI, REG_RBX);
+            /* movss xmm1, [rdi + rsi*4]   F3 0F 10 0C B7 */
+            b = BUF(cg); b[0]=0xF3; b[1]=0x0F; b[2]=0x10; b[3]=0x0C; b[4]=0xB7; EMIT(cg, 5);
+            /* mulss xmm1, xmm0           F3 0F 59 C8 */
+            b = BUF(cg); b[0]=0xF3; b[1]=0x0F; b[2]=0x59; b[3]=0xC8; EMIT(cg, 4);
+            /* movss [rdi + rsi*4], xmm1  F3 0F 11 0C B7 */
+            b = BUF(cg); b[0]=0xF3; b[1]=0x0F; b[2]=0x11; b[3]=0x0C; b[4]=0xB7; EMIT(cg, 5);
+            cg_loop_end(cg, sct, 1);
+
+            b = BUF(cg); b[0]=0xC5; b[1]=0xF8; b[2]=0x77; EMIT(cg, 3); /* vzeroupper */
+            pn = emit_pop(BUF(cg), REG_RBX); EMIT(cg, pn);
+            pn = emit_xor_reg_reg(BUF(cg), REG_RAX, REG_RAX); EMIT(cg, pn);
+            return 1;
+        }
         if (strcmp(name, "arr_f64_conv2d_3x3_p1") == 0 && argc == 5) {
             /* AVX2 direct convolution, hardcoded for MNIST-size CNNs:
              *   Input    : C_in = 1, 28 × 28 spatial, caller pre-pads to

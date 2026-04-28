@@ -1396,6 +1396,32 @@ fn main() -> i32 {
 EOF
 run_test "atomic_f64_nan_guard" /tmp/edge_atomic_nan.ari "NAN_GUARD_OK" "atomic_add_f64 with NaN delta is a no-op (counter stays usable for finite adds)"
 
+# #42  Hot-GP `i = i + 1` direct-add path must keep rax in sync.  An
+# earlier version of the fast path emitted just `add r_v, imm` and
+# left rax stale.  The unrolled while loop's first condition check
+# was emitted while a prelude `mov r_v, rax` was still the most
+# recent instruction, so a peephole (load_local) skipped the rax
+# reload at that site.  After the body wrapped back to the top, rax
+# held the previous-iter's i instead of the current r_v, allowing
+# one extra iteration — sum(0..k-1) became sum(1..k).  Caught with
+# k=10: 0+1+…+9 should be 45.0, the bug returned 55.0.
+cat > /tmp/edge_hotgp_loop_rax.ari << 'EOF'
+fn compute(k: i32) -> f64 {
+    let acc: f64 = 0.0;
+    let i: i32 = 0;
+    while (i < k) {
+        acc = acc + int_to_float(i);
+        i = i + 1;
+    }
+    return acc;
+}
+fn main() -> i32 {
+    if (math_abs(compute(10) - 45.0) < 0.0001) { print_str("HOTGP_OK"); }
+    return 0;
+}
+EOF
+run_test "hotgp_loop_rax_sync" /tmp/edge_hotgp_loop_rax.ari "HOTGP_OK" "hot-GP `i = i + 1` direct add must leave rax = r_v so the next loop-top condition reads current i"
+
 # ────────────────────────────────────────────────────────────────────
 
 echo ""

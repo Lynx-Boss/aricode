@@ -2033,6 +2033,81 @@ static void emit_assignment(CodegenState *cg, const ASTNode *node) {
         return;
     }
 
+    /* Hot-GP compound-op peephole:
+     *   v = v + imm32    → add r_v, imm32 ; mov r_v, rax    (7 bytes vs 10)
+     *   v = v - imm32    → sub r_v, imm32 ; mov r_v, rax
+     *   v = v + r_w      → add r_v, r_w   ; mov r_v, rax
+     *   v = v - r_w      → sub r_v, r_w   ; mov r_v, rax
+     *
+     * Without this, `i = i + 1` on a hot-GP `i` (the most common
+     * statement in any loop) goes via three instructions through rax
+     * — `mov rax, r_v ; add rax, 1 ; mov r_v, rax` — and the register
+     * renamer can't break the false rax dependency.  The direct form
+     * is two instructions and the rax→r_v dep is gone.
+     *
+     * Trailing `mov r_v, rax` (3 bytes, AT&T `mov %rax, %r_v`) maintains
+     * the invariant that *after* an assignment, rax mirrors the new
+     * value of v.  Multiple downstream peepholes rely on it (notably
+     * the one in emit_load_local that skips the reload when the last
+     * 3 bytes are exactly that pattern).  Without it, while-loop
+     * condition checks at the top of an unrolled loop reused stale
+     * rax from the previous body and ran one extra iteration. */
+    if (!v->is_float && v->hot_gp >= 0) {
+        const ASTNode *rhs = node->children[1];
+        if (rhs && rhs->type == NODE_BINARY_OP && rhs->op &&
+            (strcmp(rhs->op, "+") == 0 || strcmp(rhs->op, "-") == 0) &&
+            rhs->child_count >= 2) {
+            const ASTNode *left = rhs->children[0];
+            const ASTNode *right = rhs->children[1];
+            int is_sub = (strcmp(rhs->op, "-") == 0);
+            if (left && left->type == NODE_IDENTIFIER && left->string_val &&
+                strcmp(left->string_val, v->name) == 0) {
+                int emitted = 0;
+                if (right && right->type == NODE_INT_LITERAL &&
+                    right->int_val >= INT32_MIN && right->int_val <= INT32_MAX) {
+                    int32_t imm = (int32_t)right->int_val;
+                    uint8_t *b = BUF(cg);
+                    b[0] = rex(1, 0, 0, (v->hot_gp >= 8) ? 1 : 0);
+                    if (imm >= -128 && imm <= 127) {
+                        b[1] = 0x83;
+                        b[2] = (uint8_t)((3 << 6) | (((is_sub ? 5 : 0) & 7) << 3) |
+                                         (v->hot_gp & 7));
+                        b[3] = (uint8_t)imm;
+                        EMIT(cg, 4);
+                    } else {
+                        b[1] = 0x81;
+                        b[2] = (uint8_t)((3 << 6) | (((is_sub ? 5 : 0) & 7) << 3) |
+                                         (v->hot_gp & 7));
+                        memcpy(b + 3, &imm, 4);
+                        EMIT(cg, 7);
+                    }
+                    emitted = 1;
+                }
+                if (!emitted) {
+                    int right_gp = node_hot_gp_reg(cg, right);
+                    if (right_gp >= 0) {
+                        uint8_t *b = BUF(cg);
+                        b[0] = rex(1, (right_gp >= 8) ? 1 : 0, 0,
+                                      (v->hot_gp >= 8) ? 1 : 0);
+                        b[1] = is_sub ? 0x29 : 0x01;
+                        b[2] = (uint8_t)((3 << 6) | ((right_gp & 7) << 3) |
+                                         (v->hot_gp & 7));
+                        EMIT(cg, 3);
+                        emitted = 1;
+                    }
+                }
+                if (emitted) {
+                    /* mov rax, r_v — restore the post-assignment invariant
+                     * so downstream code (loop condition reload-skip,
+                     * cross-statement peepholes, etc.) keeps working. */
+                    int n2 = emit_mov_reg_reg(BUF(cg), REG_RAX, v->hot_gp);
+                    EMIT(cg, n2);
+                    return;
+                }
+            }
+        }
+    }
+
     /* Cold-int compound-op peephole:
      *   v = v + imm32    → add [rbp+off], imm32
      *   v = v - imm32    → sub [rbp+off], imm32

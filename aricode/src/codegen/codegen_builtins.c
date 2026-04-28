@@ -4331,7 +4331,11 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             emit_exp_coeff_stack_setup(cg);
 
             /* xmm12 = 0.0 (running sum). */
-            b = BUF(cg); b[0]=0x44; b[1]=0x0F; b[2]=0x57; b[3]=0xE4; EMIT(cg, 4); /* xorps xmm12, xmm12 */
+            /* xorps xmm12, xmm12 — REX.RB so both target and source resolve
+             * to xmm12.  Earlier 0x44 (REX.R only) made the source xmm4 and
+             * the running sum inherited whatever xmm4 held — soft-corrupted
+             * the second call onward when the caller had touched xmm4. */
+            b = BUF(cg); b[0]=0x45; b[1]=0x0F; b[2]=0x57; b[3]=0xE4; EMIT(cg, 4);
 
             pn = emit_xor_reg_reg(BUF(cg), REG_RSI, REG_RSI); EMIT(cg, pn);
             CgCountedLoop ex = cg_loop_begin(cg, REG_RSI, REG_RDX);

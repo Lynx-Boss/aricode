@@ -1564,6 +1564,30 @@ fn main() -> i32 {
 EOF
 run_test "f32_layernorm" /tmp/edge_f32_layernorm.ari "LAYERNORM_OK" "f32 layernorm: mean→0 each group; same input pattern at different scales normalizes identically"
 
+# #49  arr_f32_softmax called twice — the running-sum accumulator
+# (xmm12) was being seeded with `xorps xmm12, xmm12` whose REX byte
+# was missing the B-bit, so the source resolved to xmm4 and the sum
+# inherited whatever the caller had in xmm4 from a previous call.
+# A single softmax was correct (xmm4 happened to be 0); two in a row
+# broke.  This regression test catches that exact failure shape.
+cat > /tmp/edge_f32_softmax_twice.ari << 'EOF'
+fn main() -> i32 {
+    let n: i32 = 2;
+    let buf: i32 = arr_f32_new(n);
+    arr_f32_set(buf, 0, 0.5);  arr_f32_set(buf, 1, 0.0);
+    arr_f32_softmax(buf);
+    let s1: f64 = arr_f32_get(buf, 0) + arr_f32_get(buf, 1);
+    arr_f32_set(buf, 0, 0.0);  arr_f32_set(buf, 1, 0.7071);
+    arr_f32_softmax(buf);
+    let s2: f64 = arr_f32_get(buf, 0) + arr_f32_get(buf, 1);
+    if (math_abs(s1 - 1.0) < 0.001 && math_abs(s2 - 1.0) < 0.001) {
+        print_str("SOFTMAX_TWICE_OK");
+    }
+    return 0;
+}
+EOF
+run_test "f32_softmax_twice" /tmp/edge_f32_softmax_twice.ari "SOFTMAX_TWICE_OK" "two consecutive arr_f32_softmax calls both normalize to 1.0 (xmm12 sum-init must clear, not OR with xmm4)"
+
 # ────────────────────────────────────────────────────────────────────
 
 echo ""

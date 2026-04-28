@@ -4,7 +4,7 @@ Honest, number-backed picture of what the compiler can do, what's
 fast, what's slow, and what's still on the backlog.  Updated after
 each performance or feature push.
 
-Last updated: 2026-04-28 (17/17 f32 builtins; full f32 CNN trains end-to-end with AdamW; parallel f32 variant hits 98.65 % in 23 s)
+Last updated: 2026-04-28 (Phase A.8 closed: 17/17 f32 builtins + arr_f32_exp/softmax; futex barriers + atomic_add_f64 NaN guard; full f32 CNN trains end-to-end with AdamW; parallel f32 variant hits 98.65 % in 23 s; sparring suite re-verified)
 
 ---
 
@@ -19,31 +19,36 @@ Small programs, thousands to ~10 K iterations inside the binary.
 Binary load + dynamic linker setup dominate the clock, and aricode's
 static-syscall, tiny-binary model wins there.
 
-Sparring suite (5 000 iterations per binary, best-of-10), measured
-after this session's peephole landings:
+Sparring suite (5 000 iterations per binary, best-of-10), re-run
+2026-04-28 as a regression sanity check after the Phase A.8 f32
+work + the futex / NaN-guard / f32-exp / f32-softmax landings.
+None of those code paths are exercised by these tiny startup-bound
+programs, so the timings are expected to match prior runs within
+system noise — and they do (aricode column ±5 % of the previous
+session, all wins held):
 
-| Challenge       | C -O2 (glibc) | aricode | aricode wins by | Δ vs previous session |
-|-----------------|--------------:|--------:|----------------:|----------------------:|
-| 01_add          |   371 µs      | 266 µs  | **1.40×**       | −6.4 %                |
-| 02_fib          |   373         | 267     |   1.40          | −8.0 %                |
-| 03_factorial    |   376         | 276     |   1.36          | −2.4 %                |
-| 05_ackermann    |   387         | 293     |   1.32          | −5.5 %                |
-| 06_collatz      |   378         | 266     |   1.42          | −6.7 %                |
-| 07_mersenne     |   411         | 347     |   1.18          | −4.9 %                |
-| 08_gcd          |   371         | 268     |   1.38          | −5.5 %                |
-| 09_primecount   |   376         | 270     | **1.39**        | −4.0 %                |
-| 10_powmod       |   373         | 275     |   1.36          | −2.0 %                |
-| 11_isqrt        |   372         | 276     |   1.35          | −1.5 %                |
-| 12_perceptron   |   380         | 295     |   1.29          | −3.5 %                |
-| 13_minimax      |   388         | 327     |   1.19          | −8.1 %                |
-| 14_leibniz      |   385         | 298     | **1.29**        | **−15.7 %**           |
-| 15_arraysum     |   393         | 274     | **1.43**        | −4.6 %                |
+| Challenge       | C -O2 (glibc) | aricode | aricode wins by |
+|-----------------|--------------:|--------:|----------------:|
+| 01_add          |   396 µs      | 279 µs  | **1.42×**       |
+| 02_fib          |   396         | 277     |   1.43          |
+| 03_factorial    |   394         | 276     |   1.43          |
+| 05_ackermann    |   390         | 302     |   1.29          |
+| 06_collatz      |   390         | 275     |   1.42          |
+| 07_mersenne     |   426         | 352     |   1.21          |
+| 08_gcd          |   386         | 271     |   1.42          |
+| 09_primecount   |   390         | 278     |   1.40          |
+| 10_powmod       |   383         | 275     |   1.39          |
+| 11_isqrt        |   388         | 275     |   1.41          |
+| 12_perceptron   |   379         | 300     |   1.26          |
+| 13_minimax      |   408         | 334     |   1.22          |
+| 14_leibniz      |   397         | 297     |   1.34          |
+| 15_arraysum     |   387         | 283     | **1.37**        |
 
-Every benchmark improved versus the pre-peephole baseline, no
-regressions.  Biggest win is `14_leibniz` — a float-heavy inner loop
-with a `sign = 0.0 - sign` per iteration, which is exactly the shape
-the new `0.0 - x → btc rax, 63` peephole and the `movq xmm0, rax`
-elision were designed to catch.
+aricode wins on every challenge.  The biggest gaps still come from
+the float-heavy / divsd-bound loops (`07_mersenne`, `12_perceptron`,
+`13_minimax`) where the f64 hot-var allocator can't fully hide the
+operand-shuffle cost; an instruction scheduler or auto-vectoriser
+would close more of that.
 
 Known wart: binary sizes grew between runs on most challenges
 (e.g. `09_primecount` 544 B → 655 B, `12_perceptron` 1.6 KB → 4.2 KB
@@ -364,14 +369,18 @@ float-summation-order variance when 64 per-sample gradients reduce as
 
 **Caveats**
 - `thread_wait` uses `wait4`, which returns `-ECHILD` for CLONE_THREAD
-  children — the intended coordination pattern today is
-  "workers `atomic_add_i64` a shared done counter, parent spin-waits
-  on it."  Fine for short-running workers; a futex wait is the next
-  step for long-running ones.
-- No `atomic_add_f64` yet.  Gradient aggregation across threads
-  should prefer per-thread gradient buffers + a serial reduction by
-  the parent over cmpxchg-loop atomics — less contention, predictable
-  numerics.
+  children — the supported pattern is "workers `atomic_add_i64` a
+  shared done counter, parent `futex_wait`s on it" (Phase A.8).  In
+  `mnist_cnn_par2_f32` this drops the parent from a 4.50 user/real
+  ratio to 3.57 — same wall time, 20 s of CPU recovered per training
+  run because the parent now actually sleeps during barriers.
+- `atomic_add_f64` uses a `lock cmpxchg` loop.  Contention makes it
+  noticeably slower than `atomic_add_i64`; prefer per-thread gradient
+  buffers + a serial reduction by the parent.  As of Phase A.8 a NaN
+  delta is silently dropped (a single bad gradient would otherwise
+  poison the slot for the rest of the run — `mem + delta = NaN +
+  finite = NaN`, and cmpxchg compares NaN-bits to NaN-bits and
+  succeeds, so the slot would be permanently stuck).
 
 ---
 
@@ -382,7 +391,7 @@ Two complementary suites in `aricode/tests/`:
 | Suite          | Tests | Runtime | Covers                                    |
 |----------------|------:|--------:|-------------------------------------------|
 | `run_all.sh`   |    39 |   ~90 ms | Arithmetic, strings, arrays, error handling, file I/O, SIMD basics, imports, memory |
-| `run_edge.sh`  |    51 |  ~2.5 s | Softmax scalar tails & underflow clamp, vec exp/expm1 range, f64 return-contract (xmm0 + rax), hot-var register allocation, branch peephole, short-circuit `&&`/`||`, CNN forward/backward spot checks, threading (spawn, arg-passing, i64 + f64 atomic contention), f32 builtin parity (matvec, conv2d, adam_apply, mul/dot_range, sparse-moment chunk advance) |
+| `run_edge.sh`  |    55 |  ~2.5 s | Softmax scalar tails & underflow clamp, vec exp/expm1 range, f64 return-contract (xmm0 + rax), hot-var register allocation, branch peephole, short-circuit `&&`/`||`, CNN forward/backward spot checks, threading (spawn, arg-passing, i64 + f64 atomic contention, futex barrier, NaN-delta guard), f32 builtin parity (matvec, conv2d, adam_apply, mul/dot_range, exp, softmax, sparse-moment chunk advance) |
 
 Run both with one command:
 
@@ -417,8 +426,8 @@ caught in under 100 ms.
 | `math_pow` / pow_int scalar   | shipped (stdlib) |
 | `thread_spawn(func[, arg])`   | shipped      |
 | `atomic_add_i64`              | shipped (`lock xadd`) |
-| `atomic_add_f64`              | shipped (`lock cmpxchg` loop) |
-| Futex-based thread_wait       | **not shipped** (spin-on-counter barrier works today) |
+| `atomic_add_f64`              | shipped (`lock cmpxchg` loop, NaN-delta dropped to keep counter usable) |
+| `futex_wait` / `futex_wake`   | shipped (`__NR_futex` 202 with FUTEX_PRIVATE) |
 | Instruction scheduler         | **not shipped** |
 | Auto-vectoriser pass          | **not shipped** |
 | CNN builtins (conv2d, pool)   | shipped (`arr_f64_conv2d_3x3_p1*`) |
@@ -446,10 +455,12 @@ caught in under 100 ms.
   knobs in place it reaches 98.14 % vs SGD's 97.15 %.
 - **No CNN builtins** — MNIST runs as an MLP.  Conv2d and max-pool
   are the next big additions when someone needs ~99 %.
-- **f32 `arr_f32_softmax` / `arr_f32_exp`** not yet shipped.  The
-  current f32 CNN demo runs softmax in user-space scalar code (10
-  outputs, ~30 µs/call — negligible at this scale).  Would matter
-  for larger output heads.
+- **f32 `arr_f32_softmax` / `arr_f32_exp`** shipped (Phase A.8).
+  Both reuse the f64 `vec_exp_body` via promote/narrow, so the
+  per-iter throughput is 4 elements (not 8 like a true f32 polynomial
+  body would give).  Both require `n` mod 4 = 0 — fine for power-of-
+  two attention heads / hidden sizes; not yet drop-in for the
+  10-class MNIST output head, which still runs scalar.
 
 ---
 

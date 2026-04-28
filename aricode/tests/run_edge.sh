@@ -1260,6 +1260,32 @@ fn main() -> i32 {
 EOF
 run_test "f32_dot_range" /tmp/edge_f32_dr.ari "DR_OK" "f32 dot_range over slice [10..40)·[5..35) matches f64 within 1e-3"
 
+# #37  arr_f32_adam_apply on a sparse-moment buffer — only one lane in
+# the second 8-lane chunk has non-zero (m, v).  This catches the bug
+# where the m-chunk vmovups had VEX X̃=0 and silently used R14 as the
+# index, so every iter past the first re-read m[0..7] instead of
+# advancing. CNN AdamW would diverge to NaN on first step. The first
+# 8-lane chunk update (and the fully-populated #33 above) cannot
+# detect this — only a sparse pattern past the first chunk does.
+cat > /tmp/edge_f32_adam_sparse.ari << 'EOF'
+fn main() -> i32 {
+    let n: i32 = 32;
+    let W: i32 = arr_f32_new(n);
+    let m: i32 = arr_f32_new(n);
+    let v: i32 = arr_f32_new(n);
+    arr_f32_fill(W, 0.1);
+    arr_f32_fill(m, 0.0);
+    arr_f32_fill(v, 0.0);
+    arr_f32_set(m, 17, 0.001);   // lane 17 → second-half chunk
+    arr_f32_set(v, 17, 0.000001);
+    arr_f32_adam_apply(W, m, v, 0.001, 0.0000001);
+    let w17: f64 = arr_f32_get(W, 17);
+    if (math_abs(w17 - 0.099) < 0.0005) { print_str("ADAM_SPARSE_OK"); }
+    return 0;
+}
+EOF
+run_test "f32_adam_sparse" /tmp/edge_f32_adam_sparse.ari "ADAM_SPARSE_OK" "f32 adam_apply advances RSI through every 8-lane chunk (sparse m,v at lane 17 must update W[17])"
+
 # ────────────────────────────────────────────────────────────────────
 
 echo ""

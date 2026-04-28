@@ -5416,8 +5416,12 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             pn = emit_xor_reg_reg(BUF(cg), REG_RSI, REG_RSI); EMIT(cg, pn);
 
             CgCountedLoop vec = cg_loop_begin(cg, REG_RSI, REG_RDX);
-            /* ymm2 = m chunk: vmovups ymm2, [r8 + rsi*4]  C4 81 7C 10 14 B0 */
-            b = BUF(cg); b[0]=0xC4; b[1]=0x81; b[2]=0x7C; b[3]=0x10;
+            /* ymm2 = m chunk: vmovups ymm2, [r8 + rsi*4]  C4 C1 7C 10 14 B0
+             * VEX byte 1: R~=1 (ymm2<8), X~=1 (rsi<8), B~=0 (r8>=8) → 0xC1.
+             * Earlier 0x81 had X~=0 which silently turned rsi into r14, so
+             * every iter re-read m[0..7] instead of advancing — Adam steps
+             * past the first 8-lane chunk used stale moments and blew up. */
+            b = BUF(cg); b[0]=0xC4; b[1]=0xC1; b[2]=0x7C; b[3]=0x10;
             b[4]=(uint8_t)((0<<6) | ((2 & 7)<<3) | 4);
             b[5]=(uint8_t)((2<<6) | ((REG_RSI & 7)<<3) | (8 & 7));
             EMIT(cg, 6);

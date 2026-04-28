@@ -1373,6 +1373,29 @@ fn main() -> i32 {
 EOF
 run_test "futex_barrier" /tmp/edge_futex.ari "FUTEX_OK" "futex_wait/futex_wake barrier across 4 workers reaches N=4"
 
+# #41  atomic_add_f64 NaN guard.  Without the guard, a single NaN
+# delta poisons the slot forever — the cmpxchg compares NaN-bits
+# against NaN-bits (succeeds), addsd then keeps producing NaN, so
+# every subsequent add is a no-op stuck at NaN.  Guard makes the NaN
+# call a no-op instead, leaving the counter usable for the rest of
+# the run.
+cat > /tmp/edge_atomic_nan.ari << 'EOF'
+fn make_nan() -> f64 {
+    let z: f64 = 0.0;
+    return z / z;
+}
+fn main() -> i32 {
+    let ctr: i32 = arr_f64_new(1);
+    arr_f64_set(ctr, 0, 0.0);
+    atomic_add_f64(ctr, 0, 1.0);
+    atomic_add_f64(ctr, 0, make_nan());
+    atomic_add_f64(ctr, 0, 5.0);
+    if (math_abs(arr_f64_get(ctr, 0) - 6.0) < 0.0001) { print_str("NAN_GUARD_OK"); }
+    return 0;
+}
+EOF
+run_test "atomic_f64_nan_guard" /tmp/edge_atomic_nan.ari "NAN_GUARD_OK" "atomic_add_f64 with NaN delta is a no-op (counter stays usable for finite adds)"
+
 # ────────────────────────────────────────────────────────────────────
 
 echo ""

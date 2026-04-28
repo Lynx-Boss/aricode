@@ -7342,6 +7342,29 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xCA;
             EMIT(cg, 5);
 
+            /* Defensive NaN guard: if delta is NaN, return current memory
+             * value WITHOUT modifying.  Without this, a single NaN
+             * contribution would permanently poison the slot — every
+             * subsequent f64 add hits `mem + delta = NaN + finite = NaN`,
+             * the cmpxchg compares NaN-bits == NaN-bits and succeeds, so
+             * the slot is stuck.  Common ML failure mode where one
+             * worker's gradient blows up; the cleaner contract is "drop
+             * the broken contribution, keep the running total finite". */
+            /* ucomisd xmm1, xmm1 — sets PF=1 iff xmm1 is NaN. */
+            b = BUF(cg); b[0]=0x66; b[1]=0x0F; b[2]=0x2E; b[3]=0xC9; EMIT(cg, 4);
+            /* jnp .normal_path — skip past the early-return when delta is finite.
+             *   0F 8B rel32 (patched after we know the offset). */
+            size_t jnp_pos = cg->code_size;
+            b = BUF(cg); b[0]=0x0F; b[1]=0x8B; memset(b+2,0,4); EMIT(cg, 6);
+            /* Early-return arm: load current mem into rax/xmm0, jump to done. */
+            b = BUF(cg); b[0]=0x48; b[1]=0x8B; b[2]=0x06; EMIT(cg, 3); /* mov rax, [rsi] */
+            b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xC0; /* movq xmm0, rax */
+            EMIT(cg, 5);
+            size_t early_jmp_pos = cg->code_size;
+            b = BUF(cg); b[0]=0xE9; memset(b+1,0,4); EMIT(cg, 5); /* jmp .done */
+            int32_t jnp_off = (int32_t)(cg->code_size - (jnp_pos + 6));
+            memcpy(cg->code + jnp_pos + 2, &jnp_off, 4);
+
             /* Initial load: mov rax, [rsi]  —  48 8B 06 */
             b = BUF(cg); b[0]=0x48; b[1]=0x8B; b[2]=0x06; EMIT(cg, 3);
 
@@ -7369,6 +7392,10 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
              * f64 return contract is satisfied. */
             b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xC0;
             EMIT(cg, 5);
+
+            /* .done — patched-target for the NaN-guard early-jmp. */
+            int32_t early_jmp_off = (int32_t)(cg->code_size - (early_jmp_pos + 5));
+            memcpy(cg->code + early_jmp_pos + 1, &early_jmp_off, 4);
             return 1;
         }
 

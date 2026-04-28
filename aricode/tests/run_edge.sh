@@ -1479,6 +1479,91 @@ fn main() -> i32 {
 EOF
 run_test "hotgp_imm32" /tmp/edge_hotgp_imm32.ari "99928" "hot-GP fast path: imm32 form (0x81) for ±128 and beyond"
 
+# #46  arr_f32_softmax with n=10 (a multiple-of-4 boundary failure
+# case before the scalar tail landed).  Pass 2's vec body handles 8
+# elements; the last 2 must go through the scalar tail to reach the
+# correct probability distribution.
+cat > /tmp/edge_f32_softmax_tail.ari << 'EOF'
+fn main() -> i32 {
+    let n: i32 = 10;
+    let buf: i32 = arr_f32_new(n);
+    let i: i32 = 0;
+    while (i < n) { arr_f32_set(buf, i, int_to_float(i)); i = i + 1; }
+    arr_f32_softmax(buf);
+    let total: f64 = 0.0;
+    let any_neg: i32 = 0;
+    i = 0;
+    while (i < n) {
+        let v: f64 = arr_f32_get(buf, i);
+        if (v < 0.0) { any_neg = 1; }
+        total = total + v;
+        i = i + 1;
+    }
+    // Largest input was 9, so buf[9] should be the largest probability.
+    let buf9_max: i32 = 1;
+    i = 0;
+    while (i < 9) {
+        if (arr_f32_get(buf, i) >= arr_f32_get(buf, 9)) { buf9_max = 0; }
+        i = i + 1;
+    }
+    if (any_neg == 0 && buf9_max == 1 && math_abs(total - 1.0) < 0.0001) {
+        print_str("SOFTMAX_TAIL_OK");
+    }
+    return 0;
+}
+EOF
+run_test "f32_softmax_tail" /tmp/edge_f32_softmax_tail.ari "SOFTMAX_TAIL_OK" "f32 softmax with n%4!=0: scalar tail reaches valid distribution, argmax=last"
+
+# #47  arr_f32_transpose 3×4 → 4×3.  Spot-check a few elements rather
+# than the full matrix.
+cat > /tmp/edge_f32_transpose.ari << 'EOF'
+fn main() -> i32 {
+    let m: i32 = 3; let n: i32 = 4;
+    let src: i32 = arr_f32_new(m * n);
+    let dst: i32 = arr_f32_new(n * m);
+    let i: i32 = 0;
+    while (i < m * n) { arr_f32_set(src, i, int_to_float(i)); i = i + 1; }
+    arr_f32_transpose(src, dst, m, n);
+    // src[1][2] = 1*4 + 2 = 6, should be at dst[2][1] = 2*3 + 1 = 7
+    // src[0][0] = 0, dst[0][0] = 0
+    // src[2][3] = 11, should be at dst[3][2] = 3*3 + 2 = 11
+    let ok: i32 = 1;
+    if (math_abs(arr_f32_get(dst, 7) - 6.0) > 0.0001) { ok = 0; }
+    if (math_abs(arr_f32_get(dst, 0) - 0.0) > 0.0001) { ok = 0; }
+    if (math_abs(arr_f32_get(dst, 11) - 11.0) > 0.0001) { ok = 0; }
+    if (ok == 1) { print_str("TRANSPOSE_OK"); }
+    return 0;
+}
+EOF
+run_test "f32_transpose" /tmp/edge_f32_transpose.ari "TRANSPOSE_OK" "f32 transpose 3x4 → 4x3 maps src[i][j] to dst[j][i]"
+
+# #48  arr_f32_layernorm: each group should have mean ~0 and var ~1
+# after normalization.  Two groups, different scales, both should
+# normalize to the same canonical pattern.
+cat > /tmp/edge_f32_layernorm.ari << 'EOF'
+fn main() -> i32 {
+    let dim: i32 = 4;
+    let buf: i32 = arr_f32_new(2 * dim);
+    arr_f32_set(buf, 0, 1.0);  arr_f32_set(buf, 1, 2.0);
+    arr_f32_set(buf, 2, 3.0);  arr_f32_set(buf, 3, 4.0);
+    arr_f32_set(buf, 4, 10.0); arr_f32_set(buf, 5, 20.0);
+    arr_f32_set(buf, 6, 30.0); arr_f32_set(buf, 7, 40.0);
+    arr_f32_layernorm(buf, dim, 0.00001);
+    let s0: f64 = arr_f32_get(buf, 0) + arr_f32_get(buf, 1) + arr_f32_get(buf, 2) + arr_f32_get(buf, 3);
+    let s1: f64 = arr_f32_get(buf, 4) + arr_f32_get(buf, 5) + arr_f32_get(buf, 6) + arr_f32_get(buf, 7);
+    // Same pattern → element-wise equal.
+    let same_pattern: i32 = 1;
+    let i: i32 = 0;
+    while (i < dim) {
+        if (math_abs(arr_f32_get(buf, i) - arr_f32_get(buf, dim + i)) > 0.001) { same_pattern = 0; }
+        i = i + 1;
+    }
+    if (same_pattern == 1 && math_abs(s0) < 0.001 && math_abs(s1) < 0.001) { print_str("LAYERNORM_OK"); }
+    return 0;
+}
+EOF
+run_test "f32_layernorm" /tmp/edge_f32_layernorm.ari "LAYERNORM_OK" "f32 layernorm: mean→0 each group; same input pattern at different scales normalizes identically"
+
 # ────────────────────────────────────────────────────────────────────
 
 echo ""

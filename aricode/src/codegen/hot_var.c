@@ -82,6 +82,9 @@ int call_is_xmm_safe(const char *fn) {
     if (strcmp(fn, "arr_f32_copy_at")    == 0) return 1;
     if (strcmp(fn, "arr_f32_copy_slice") == 0) return 1;
     if (strcmp(fn, "arr_f32_adam_apply") == 0) return 1;
+    /* arr_f32_transpose / layernorm: scalar kernels, only touch xmm0..xmm3. */
+    if (strcmp(fn, "arr_f32_transpose")  == 0) return 1;
+    if (strcmp(fn, "arr_f32_layernorm")  == 0) return 1;
     /* Builtins that clobber ymm8..ymm15 are also callable from
      * xmm-safe bodies — the caller (emit_call_expr) wraps them with
      * a vmovupd save/restore of the cache registers when it notices

@@ -1588,6 +1588,28 @@ fn main() -> i32 {
 EOF
 run_test "f32_softmax_twice" /tmp/edge_f32_softmax_twice.ari "SOFTMAX_TWICE_OK" "two consecutive arr_f32_softmax calls both normalize to 1.0 (xmm12 sum-init must clear, not OR with xmm4)"
 
+# #50  embed_file: raw bytes baked into .text by the compiler must
+# round-trip as a normal f32 array (length from [base − 8], data
+# accessible via arr_f32_get).  Tests both the JMP-over-data layout
+# and the RIP-relative LEA computation.
+python3 -c "import struct; open('/tmp/edge_embed_blob.f32','wb').write(b''.join(struct.pack('<f', float(i)*1.5) for i in range(12)))"
+cat > /tmp/edge_embed.ari << 'EOF'
+fn main() -> i32 {
+    let buf: i32 = embed_file("/tmp/edge_embed_blob.f32");
+    let ok: i32 = 1;
+    if (arr_len(buf) != 12) { ok = 0; }
+    if (math_abs(arr_f32_get(buf, 0) - 0.0)  > 0.0001) { ok = 0; }
+    if (math_abs(arr_f32_get(buf, 1) - 1.5)  > 0.0001) { ok = 0; }
+    if (math_abs(arr_f32_get(buf, 11) - 16.5) > 0.0001) { ok = 0; }
+    // arr_f32_sum should also work over the embedded buffer.
+    let s: f64 = arr_f32_sum(buf);
+    if (math_abs(s - 99.0) > 0.001) { ok = 0; }    // 1.5 * (0+1+...+11) = 99.0
+    if (ok == 1) { print_str("EMBED_OK"); }
+    return 0;
+}
+EOF
+run_test "embed_file" /tmp/edge_embed.ari "EMBED_OK" "embed_file: 12 f32 baked into .text round-trip via arr_len/get/sum"
+
 # ────────────────────────────────────────────────────────────────────
 
 echo ""

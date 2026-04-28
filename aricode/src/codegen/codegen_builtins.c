@@ -13,6 +13,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
 
 /* Emit `movq xmm0, rax` (5 bytes) with a wasted-emit peephole: when
  * the previous instruction was `movq rax, xmm0`, rax and xmm0 already
@@ -1945,6 +1946,100 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             /* Return base ptr (rax = mmap_ptr + 8) */
             pn = emit_pop(BUF(cg), REG_RAX); EMIT(cg, pn);
             pn = emit_add_reg_imm(BUF(cg), REG_RAX, 8); EMIT(cg, pn);
+            return 1;
+        }
+
+        if (strcmp(name, "embed_file") == 0 && argc == 1) {
+            /* embed_file("path.f32"): read the file at compile time, embed
+             * its bytes inline in .text with a faked [i64 length] prefix so
+             * the result is shape-compatible with arr_f32_* (which read
+             * length from [base − 8]).  Returns the data pointer.
+             *
+             * Inference deployments use this to bake the weight blob into
+             * the binary itself — no runtime file I/O, one self-contained
+             * artefact to ship.  The data lives in the read-only text
+             * mapping; arr_f32_matvec / dot / etc. only ever READ from it.
+             *
+             * Layout emitted at the call site:
+             *
+             *     jmp .past_blob          ; 5 bytes  (skip the data)
+             *   .blob:
+             *     .qword n_elements       ; 8 bytes  (matches [base − 8])
+             *     .data raw_bytes         ; file_size bytes
+             *   .past_blob:
+             *     lea rax, [.blob + 8]    ; 7 bytes  (RIP-relative)
+             *
+             * File size must be a multiple of 4 (whole f32 elements). */
+            ASTNode *arg = node->children[1];
+            if (!arg || arg->type != NODE_STRING_LITERAL || !arg->string_val) {
+                cg_error(cg, "embed_file requires a string literal at %d:%d",
+                         node->line, node->col);
+                return 1;
+            }
+            const char *path = arg->string_val;
+
+            FILE *f = fopen(path, "rb");
+            if (!f) {
+                cg_error(cg, "embed_file: cannot open '%s' at %d:%d",
+                         path, node->line, node->col);
+                return 1;
+            }
+            fseek(f, 0, SEEK_END);
+            long fsize = ftell(f);
+            fseek(f, 0, SEEK_SET);
+            if (fsize < 0) {
+                fclose(f);
+                cg_error(cg, "embed_file: ftell failed for '%s'", path);
+                return 1;
+            }
+            if ((fsize & 3) != 0) {
+                fclose(f);
+                cg_error(cg, "embed_file: '%s' size %ld not a multiple of 4 "
+                             "(expected raw f32 array)", path, fsize);
+                return 1;
+            }
+            int64_t n_elements = (int64_t)(fsize / 4);
+
+            uint8_t *blob = (uint8_t *)malloc((size_t)fsize);
+            if (!blob || fread(blob, 1, (size_t)fsize, f) != (size_t)fsize) {
+                if (blob) free(blob);
+                fclose(f);
+                cg_error(cg, "embed_file: read failed for '%s'", path);
+                return 1;
+            }
+            fclose(f);
+
+            int pn; uint8_t *b;
+
+            /* jmp rel32 over the blob (placeholder, patched below). */
+            size_t jmp_pos = cg->code_size;
+            pn = emit_jmp(BUF(cg), 0); EMIT(cg, pn);
+
+            /* [i64 n_elements] + raw bytes */
+            size_t blob_pos = cg->code_size;
+            memcpy(BUF(cg), &n_elements, 8);
+            cg->code_size += 8;
+            memcpy(BUF(cg), blob, (size_t)fsize);
+            cg->code_size += (size_t)fsize;
+            free(blob);
+
+            /* Patch the JMP to land just past the data. */
+            int32_t jmp_off = (int32_t)(cg->code_size - (jmp_pos + 5));
+            memcpy(cg->code + jmp_pos + 1, &jmp_off, 4);
+
+            /* lea rax, [rip + (blob_pos + 8 − end_of_lea)]
+             *   REX.W=1 → 0x48
+             *   opcode 0x8D (LEA r,m)
+             *   ModRM mod=00 reg=000 (rax) rm=101 (RIP+disp32) → 0x05 */
+            int64_t target = (int64_t)(blob_pos + 8);
+            int64_t lea_end = (int64_t)(cg->code_size + 7);
+            int32_t lea_off = (int32_t)(target - lea_end);
+            b = BUF(cg);
+            b[0] = 0x48;
+            b[1] = 0x8D;
+            b[2] = 0x05;
+            memcpy(b + 3, &lea_off, 4);
+            EMIT(cg, 7);
             return 1;
         }
 

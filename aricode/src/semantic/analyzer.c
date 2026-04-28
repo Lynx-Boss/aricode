@@ -311,6 +311,7 @@ static AriType *builtin_return_type(const char *name) {
         {"arr_f32_softmax",    TYPE_I32},
         {"arr_f32_transpose",  TYPE_I32},
         {"arr_f32_layernorm",  TYPE_I32},
+        {"embed_file",         TYPE_I32},
         /* f64 — f64 array ops that return f64 */
         {"arr_f64_get",     TYPE_F64},
         {"arr_f64_sum",     TYPE_F64},

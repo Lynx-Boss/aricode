@@ -7427,5 +7427,123 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             return 1;
         }
 
+        if (strcmp(name, "futex_wait") == 0 && argc == 3) {
+            /* futex_wait(base, idx, expected) -> i32
+             *
+             *   Sleep until *(base + idx*8) is woken.  The kernel compares
+             *   the LOW 32 bits of the slot against `expected` atomically;
+             *   if they don't match it returns -EAGAIN immediately (the
+             *   value-already-changed race that motivates the typical
+             *   load-then-wait loop the caller writes around this).
+             *
+             *   FUTEX_PRIVATE_FLAG (128) is OR'd into the op because every
+             *   aricode thread shares the parent's VM under CLONE_VM —
+             *   private futexes skip the kernel's hash-tab cross-process
+             *   path and are noticeably faster for in-process barriers.
+             *
+             *   Slot is read as the low 32 bits of an i64 element so the
+             *   same buffer can be incremented via atomic_add_i64.  Caller
+             *   keeps the counter under 2^31 (workers count to N_WORKERS,
+             *   so trivially satisfied).
+             *
+             *   Returns:  0           on wake
+             *             -EAGAIN     if the slot didn't equal `expected`
+             *             -EINTR etc. on signal interruption
+             */
+            int pn; uint8_t *b;
+
+            emit_expression(cg, node->children[3]); /* expected → RAX */
+            pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
+            emit_expression(cg, node->children[2]); /* idx → RAX */
+            pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
+            emit_expression(cg, node->children[1]); /* base → RAX */
+            pn = emit_pop(BUF(cg), REG_RCX); EMIT(cg, pn); /* RCX = idx */
+            pn = emit_pop(BUF(cg), REG_RDX); EMIT(cg, pn); /* RDX = expected */
+
+            /* Bounds-check on idx (mirrors atomic_add_i64). */
+            pn = emit_mov_reg_mem(BUF(cg), REG_RSI, REG_RAX, -8); EMIT(cg, pn);
+            pn = emit_cmp_reg_reg(BUF(cg), REG_RCX, REG_RSI); EMIT(cg, pn);
+            size_t jb_pos = cg->code_size;
+            b = BUF(cg); b[0]=0x0F; b[1]=0x82; memset(b+2,0,4); EMIT(cg, 6);
+            {
+                const char *errmsg = "Runtime error: futex_wait index out of bounds\n";
+                emit_runtime_error(cg, errmsg, strlen(errmsg));
+            }
+            int32_t jb_off = (int32_t)(cg->code_size - (jb_pos + 6));
+            memcpy(cg->code + jb_pos + 2, &jb_off, 4);
+
+            /* lea rdi, [rax + rcx*8]  —  RDI = address of target slot. */
+            b = BUF(cg);
+            b[0] = rex(1, reg_ext(REG_RDI), reg_ext(REG_RCX), reg_ext(REG_RAX));
+            b[1] = 0x8D;
+            b[2] = modrm(0, REG_RDI & 7, 4);
+            b[3] = (uint8_t)((3 << 6) | ((REG_RCX & 7) << 3) | (REG_RAX & 7));
+            EMIT(cg, 4);
+
+            /* RSI = FUTEX_WAIT (0) | FUTEX_PRIVATE_FLAG (128) = 128 */
+            pn = emit_mov_reg_imm32(BUF(cg), REG_RSI, 128); EMIT(cg, pn);
+            /* RDX already holds expected. */
+            /* r10 = NULL (no timeout). */
+            b = BUF(cg); b[0]=0x4D; b[1]=0x31; b[2]=0xD2; EMIT(cg, 3);
+            /* r8 = 0, r9 = 0 (uaddr2/val3 unused for WAIT). */
+            b = BUF(cg); b[0]=0x4D; b[1]=0x31; b[2]=0xC0; EMIT(cg, 3);
+            b = BUF(cg); b[0]=0x4D; b[1]=0x31; b[2]=0xC9; EMIT(cg, 3);
+            /* rax = 202 = __NR_futex */
+            pn = emit_mov_reg_imm32(BUF(cg), REG_RAX, 202); EMIT(cg, pn);
+            pn = emit_syscall(BUF(cg)); EMIT(cg, pn);
+            return 1;
+        }
+
+        if (strcmp(name, "futex_wake") == 0 && argc == 3) {
+            /* futex_wake(base, idx, n_waiters) -> i32
+             *
+             *   Wake up to `n_waiters` threads currently blocked in
+             *   futex_wait on the slot at base + idx*8.  The typical
+             *   call is `futex_wake(done_ctr, 0, INT32_MAX)` from the
+             *   last worker so any number of parents/peers waiting on
+             *   the barrier all proceed.
+             *
+             *   Returns the count of threads actually woken (≤ n).
+             */
+            int pn; uint8_t *b;
+
+            emit_expression(cg, node->children[3]); /* n → RAX */
+            pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
+            emit_expression(cg, node->children[2]); /* idx → RAX */
+            pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
+            emit_expression(cg, node->children[1]); /* base → RAX */
+            pn = emit_pop(BUF(cg), REG_RCX); EMIT(cg, pn); /* RCX = idx */
+            pn = emit_pop(BUF(cg), REG_RDX); EMIT(cg, pn); /* RDX = n */
+
+            pn = emit_mov_reg_mem(BUF(cg), REG_RSI, REG_RAX, -8); EMIT(cg, pn);
+            pn = emit_cmp_reg_reg(BUF(cg), REG_RCX, REG_RSI); EMIT(cg, pn);
+            size_t jb_pos = cg->code_size;
+            b = BUF(cg); b[0]=0x0F; b[1]=0x82; memset(b+2,0,4); EMIT(cg, 6);
+            {
+                const char *errmsg = "Runtime error: futex_wake index out of bounds\n";
+                emit_runtime_error(cg, errmsg, strlen(errmsg));
+            }
+            int32_t jb_off = (int32_t)(cg->code_size - (jb_pos + 6));
+            memcpy(cg->code + jb_pos + 2, &jb_off, 4);
+
+            /* lea rdi, [rax + rcx*8] */
+            b = BUF(cg);
+            b[0] = rex(1, reg_ext(REG_RDI), reg_ext(REG_RCX), reg_ext(REG_RAX));
+            b[1] = 0x8D;
+            b[2] = modrm(0, REG_RDI & 7, 4);
+            b[3] = (uint8_t)((3 << 6) | ((REG_RCX & 7) << 3) | (REG_RAX & 7));
+            EMIT(cg, 4);
+
+            /* RSI = FUTEX_WAKE (1) | FUTEX_PRIVATE_FLAG (128) = 129 */
+            pn = emit_mov_reg_imm32(BUF(cg), REG_RSI, 129); EMIT(cg, pn);
+            /* RDX already holds n. */
+            b = BUF(cg); b[0]=0x4D; b[1]=0x31; b[2]=0xD2; EMIT(cg, 3); /* r10=0 */
+            b = BUF(cg); b[0]=0x4D; b[1]=0x31; b[2]=0xC0; EMIT(cg, 3); /* r8=0 */
+            b = BUF(cg); b[0]=0x4D; b[1]=0x31; b[2]=0xC9; EMIT(cg, 3); /* r9=0 */
+            pn = emit_mov_reg_imm32(BUF(cg), REG_RAX, 202); EMIT(cg, pn);
+            pn = emit_syscall(BUF(cg)); EMIT(cg, pn);
+            return 1;
+        }
+
     return 0;
 }

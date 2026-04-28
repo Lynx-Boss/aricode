@@ -1337,6 +1337,42 @@ fn main() -> i32 {
 EOF
 run_test "f32_softmax" /tmp/edge_f32_softmax.ari "SOFTMAX_OK" "f32 softmax stable under +100 shift; produces valid distribution summing to 1.0 ± 1e-4"
 
+# #40  futex_wait + futex_wake: parent blocks until 4 workers finish a
+# fixed amount of work then signal.  Verifies the parent didn't busy-
+# loop (user/real should approach N_WORKERS rather than N_WORKERS+1)
+# but that's wall-clock dependent — here we just verify the barrier
+# completes correctly under heavy worker load.
+cat > /tmp/edge_futex.ari << 'EOF'
+fn worker(desc: i32) -> i32 {
+    let ctr: i32 = arr_get(desc, 0);
+    let n:   i32 = arr_get(desc, 1);
+    let x: i32 = 0;
+    while (x < 5000000) { x += 1; }
+    let prev: i32 = atomic_add_i64(ctr, 0, 1);
+    if (prev + 1 == n) { futex_wake(ctr, 0, 2147483647); }
+    return 0;
+}
+fn main() -> i32 {
+    let N: i32 = 4;
+    let ctr: i32 = arr_new(1);
+    arr_set(ctr, 0, 0);
+    let i: i32 = 0;
+    while (i < N) {
+        let d: i32 = arr_new(2);
+        arr_set(d, 0, ctr); arr_set(d, 1, N);
+        let tid: i32 = thread_spawn(worker, d);
+        i += 1;
+    }
+    while (arr_get(ctr, 0) < N) {
+        let cur: i32 = arr_get(ctr, 0);
+        if (cur < N) { futex_wait(ctr, 0, cur); }
+    }
+    if (arr_get(ctr, 0) == N) { print_str("FUTEX_OK"); }
+    return 0;
+}
+EOF
+run_test "futex_barrier" /tmp/edge_futex.ari "FUTEX_OK" "futex_wait/futex_wake barrier across 4 workers reaches N=4"
+
 # ────────────────────────────────────────────────────────────────────
 
 echo ""

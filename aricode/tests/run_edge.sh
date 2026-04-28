@@ -1420,7 +1420,64 @@ fn main() -> i32 {
     return 0;
 }
 EOF
-run_test "hotgp_loop_rax_sync" /tmp/edge_hotgp_loop_rax.ari "HOTGP_OK" "hot-GP `i = i + 1` direct add must leave rax = r_v so the next loop-top condition reads current i"
+run_test "hotgp_loop_rax_sync" /tmp/edge_hotgp_loop_rax.ari "HOTGP_OK" "hot-GP i=i+1 direct add must leave rax = r_v so the next loop-top condition reads current i"
+
+# #43  Hot-GP subtraction: `i = i - 1` countdown.  Different opcode
+# (sub /5 vs add /0) and different end condition; ensures the sub
+# leg of the fast path also keeps rax in sync.
+cat > /tmp/edge_hotgp_sub.ari << 'EOF'
+fn count_down(start: i32) -> i32 {
+    let i: i32 = start;
+    let s: i32 = 0;
+    while (i > 0) {
+        s = s + i;
+        i = i - 1;
+    }
+    return s;
+}
+fn main() -> i32 {
+    print_int(count_down(10));   // 10+9+...+1 = 55
+    return 0;
+}
+EOF
+run_test "hotgp_sub" /tmp/edge_hotgp_sub.ari "55" "hot-GP i=i-1 direct sub keeps rax synced for next loop check"
+
+# #44  Hot-GP register-register: `s = s + i` where both are hot-GP.
+# Exercises the second leg of the fast path (Form 2: add r_v, r_w).
+# Without the trailing rax sync the unrolled loop's mid-check reads
+# stale rax from the body's last expression — caught here because
+# the inner sum exercises that exact pattern.
+cat > /tmp/edge_hotgp_regreg.ari << 'EOF'
+fn sum_to(n: i32) -> i32 {
+    let s: i32 = 0;
+    let i: i32 = 1;
+    while (i <= n) {
+        s = s + i;
+        i = i + 1;
+    }
+    return s;
+}
+fn main() -> i32 {
+    print_int(sum_to(100));   // 100*101/2 = 5050
+    return 0;
+}
+EOF
+run_test "hotgp_regreg" /tmp/edge_hotgp_regreg.ari "5050" "hot-GP s=s+i both-register fast path: sum_to(100) = 5050"
+
+# #45  Large immediate that overflows imm8 and forces the 0x81 form.
+# A positive 128 (just past imm8 boundary) and a 100000 (full imm32)
+# both cover the 7-byte branch.
+cat > /tmp/edge_hotgp_imm32.ari << 'EOF'
+fn main() -> i32 {
+    let v: i32 = 0;
+    v = v + 128;        // imm8 boundary: must use 0x81
+    v = v + 100000;     // full imm32
+    v = v - 200;        // imm32 sub (200 > 127)
+    print_int(v);       // 128 + 100000 - 200 = 99928
+    return 0;
+}
+EOF
+run_test "hotgp_imm32" /tmp/edge_hotgp_imm32.ari "99928" "hot-GP fast path: imm32 form (0x81) for ±128 and beyond"
 
 # ────────────────────────────────────────────────────────────────────
 

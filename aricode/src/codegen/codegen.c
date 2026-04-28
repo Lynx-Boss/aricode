@@ -2001,6 +2001,89 @@ static void emit_while(CodegenState *cg, const ASTNode *node) {
 }
 
 /*
+ * Hot-GP compound-op fast path:
+ *   v = v + imm32     →  add r_v, imm32 ; mov rax, r_v   (7 bytes, fits imm8 form)
+ *   v = v - imm32     →  sub r_v, imm32 ; mov rax, r_v
+ *   v = v + r_w       →  add r_v, r_w   ; mov rax, r_v
+ *   v = v - r_w       →  sub r_v, r_w   ; mov rax, r_v
+ *
+ * Without this, an `i = i + 1` on a hot-GP `i` (the most common
+ * statement in any loop) goes via three instructions through rax —
+ * `mov rax, r_v ; add rax, 1 ; mov r_v, rax` — and the register
+ * renamer can't break the false rax dependency.
+ *
+ * Trailing `mov rax, r_v` is mandatory.  Multiple downstream peepholes
+ * (notably emit_load_local's reload-skip) assume that after an
+ * assignment, rax mirrors the new value of the lhs.  Skipping the sync
+ * caused while loops to read stale rax at the loop top after wrap-back
+ * — sum(0..k-1) computed as sum(1..k); see edge test #56.
+ *
+ * Returns 1 if the fast path fired (caller skips the general assignment
+ * path), 0 to fall through.  Hot-XMM, struct-field, and cold-int paths
+ * stay where they are.
+ */
+static int try_emit_hot_gp_compound(CodegenState *cg, LocalVar *v,
+                                    const ASTNode *rhs) {
+    if (v->is_float || v->hot_gp < 0) return 0;
+    if (!rhs || rhs->type != NODE_BINARY_OP || !rhs->op ||
+        rhs->child_count < 2) return 0;
+    if (strcmp(rhs->op, "+") != 0 && strcmp(rhs->op, "-") != 0) return 0;
+
+    const ASTNode *left  = rhs->children[0];
+    const ASTNode *right = rhs->children[1];
+    if (!left || left->type != NODE_IDENTIFIER || !left->string_val ||
+        strcmp(left->string_val, v->name) != 0) return 0;
+
+    int is_sub = (strcmp(rhs->op, "-") == 0);
+    int subop  = is_sub ? 5 : 0;   /* /5 = sub, /0 = add (in 0x83/0x81 forms) */
+    int dst    = v->hot_gp;
+    int dst_lo = dst & 7;
+    int dst_hi = (dst >= 8) ? 1 : 0;
+    int emitted = 0;
+
+    /* Form 1: v ±= imm32.  Use 0x83 imm8 when it fits a signed byte
+     * (the common `i += 1` / `s -= 4` case), else 0x81 imm32. */
+    if (right && right->type == NODE_INT_LITERAL &&
+        right->int_val >= INT32_MIN && right->int_val <= INT32_MAX) {
+        int32_t imm = (int32_t)right->int_val;
+        uint8_t *b = BUF(cg);
+        b[0] = rex(1, 0, 0, dst_hi);
+        if (imm >= -128 && imm <= 127) {
+            b[1] = 0x83;
+            b[2] = (uint8_t)((3 << 6) | ((subop & 7) << 3) | dst_lo);
+            b[3] = (uint8_t)imm;
+            EMIT(cg, 4);
+        } else {
+            b[1] = 0x81;
+            b[2] = (uint8_t)((3 << 6) | ((subop & 7) << 3) | dst_lo);
+            memcpy(b + 3, &imm, 4);
+            EMIT(cg, 7);
+        }
+        emitted = 1;
+    }
+
+    /* Form 2: v ±= w  where w is also hot-GP.  add/sub reg, reg. */
+    if (!emitted) {
+        int rsrc = node_hot_gp_reg(cg, right);
+        if (rsrc >= 0) {
+            uint8_t *b = BUF(cg);
+            b[0] = rex(1, (rsrc >= 8) ? 1 : 0, 0, dst_hi);
+            b[1] = is_sub ? 0x29 : 0x01;
+            b[2] = (uint8_t)((3 << 6) | ((rsrc & 7) << 3) | dst_lo);
+            EMIT(cg, 3);
+            emitted = 1;
+        }
+    }
+
+    if (!emitted) return 0;
+
+    /* Restore rax = r_v invariant for downstream peepholes. */
+    int n = emit_mov_reg_reg(BUF(cg), REG_RAX, dst);
+    EMIT(cg, n);
+    return 1;
+}
+
+/*
  * Variable assignment (x = expr).
  * The parser stores this as NODE_BINARY_OP with op="=".
  *   child[0] = identifier (lvalue)
@@ -2033,80 +2116,7 @@ static void emit_assignment(CodegenState *cg, const ASTNode *node) {
         return;
     }
 
-    /* Hot-GP compound-op peephole:
-     *   v = v + imm32    → add r_v, imm32 ; mov r_v, rax    (7 bytes vs 10)
-     *   v = v - imm32    → sub r_v, imm32 ; mov r_v, rax
-     *   v = v + r_w      → add r_v, r_w   ; mov r_v, rax
-     *   v = v - r_w      → sub r_v, r_w   ; mov r_v, rax
-     *
-     * Without this, `i = i + 1` on a hot-GP `i` (the most common
-     * statement in any loop) goes via three instructions through rax
-     * — `mov rax, r_v ; add rax, 1 ; mov r_v, rax` — and the register
-     * renamer can't break the false rax dependency.  The direct form
-     * is two instructions and the rax→r_v dep is gone.
-     *
-     * Trailing `mov r_v, rax` (3 bytes, AT&T `mov %rax, %r_v`) maintains
-     * the invariant that *after* an assignment, rax mirrors the new
-     * value of v.  Multiple downstream peepholes rely on it (notably
-     * the one in emit_load_local that skips the reload when the last
-     * 3 bytes are exactly that pattern).  Without it, while-loop
-     * condition checks at the top of an unrolled loop reused stale
-     * rax from the previous body and ran one extra iteration. */
-    if (!v->is_float && v->hot_gp >= 0) {
-        const ASTNode *rhs = node->children[1];
-        if (rhs && rhs->type == NODE_BINARY_OP && rhs->op &&
-            (strcmp(rhs->op, "+") == 0 || strcmp(rhs->op, "-") == 0) &&
-            rhs->child_count >= 2) {
-            const ASTNode *left = rhs->children[0];
-            const ASTNode *right = rhs->children[1];
-            int is_sub = (strcmp(rhs->op, "-") == 0);
-            if (left && left->type == NODE_IDENTIFIER && left->string_val &&
-                strcmp(left->string_val, v->name) == 0) {
-                int emitted = 0;
-                if (right && right->type == NODE_INT_LITERAL &&
-                    right->int_val >= INT32_MIN && right->int_val <= INT32_MAX) {
-                    int32_t imm = (int32_t)right->int_val;
-                    uint8_t *b = BUF(cg);
-                    b[0] = rex(1, 0, 0, (v->hot_gp >= 8) ? 1 : 0);
-                    if (imm >= -128 && imm <= 127) {
-                        b[1] = 0x83;
-                        b[2] = (uint8_t)((3 << 6) | (((is_sub ? 5 : 0) & 7) << 3) |
-                                         (v->hot_gp & 7));
-                        b[3] = (uint8_t)imm;
-                        EMIT(cg, 4);
-                    } else {
-                        b[1] = 0x81;
-                        b[2] = (uint8_t)((3 << 6) | (((is_sub ? 5 : 0) & 7) << 3) |
-                                         (v->hot_gp & 7));
-                        memcpy(b + 3, &imm, 4);
-                        EMIT(cg, 7);
-                    }
-                    emitted = 1;
-                }
-                if (!emitted) {
-                    int right_gp = node_hot_gp_reg(cg, right);
-                    if (right_gp >= 0) {
-                        uint8_t *b = BUF(cg);
-                        b[0] = rex(1, (right_gp >= 8) ? 1 : 0, 0,
-                                      (v->hot_gp >= 8) ? 1 : 0);
-                        b[1] = is_sub ? 0x29 : 0x01;
-                        b[2] = (uint8_t)((3 << 6) | ((right_gp & 7) << 3) |
-                                         (v->hot_gp & 7));
-                        EMIT(cg, 3);
-                        emitted = 1;
-                    }
-                }
-                if (emitted) {
-                    /* mov rax, r_v — restore the post-assignment invariant
-                     * so downstream code (loop condition reload-skip,
-                     * cross-statement peepholes, etc.) keeps working. */
-                    int n2 = emit_mov_reg_reg(BUF(cg), REG_RAX, v->hot_gp);
-                    EMIT(cg, n2);
-                    return;
-                }
-            }
-        }
-    }
+    if (try_emit_hot_gp_compound(cg, v, node->children[1])) return;
 
     /* Cold-int compound-op peephole:
      *   v = v + imm32    → add [rbp+off], imm32

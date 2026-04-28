@@ -4,7 +4,7 @@ Honest, number-backed picture of what the compiler can do, what's
 fast, what's slow, and what's still on the backlog.  Updated after
 each performance or feature push.
 
-Last updated: 2026-04-26 (16/16 f32 builtins shipped — arr_f32_conv2d_3x3_p1 closes the CNN front)
+Last updated: 2026-04-28 (17/17 f32 builtins; full f32 CNN trains end-to-end with AdamW; parallel f32 variant hits 98.65 % in 23 s)
 
 ---
 
@@ -79,7 +79,22 @@ manageable.
 
 Starting point was 4.2-4.8× slower; the chain of codegen
 optimisations listed in `project_instruction_scheduling` (memory)
-closed roughly 60-65 % of the gap.  Latest wins (2026-04-25):
+closed roughly 60-65 % of the gap.  Latest wins (2026-04-28):
+
+- **Phase A.8 — full f32 CNN training stack** — closes the f32 ML
+  front: `arr_f32_dot_range` (8-lane vfmadd231ps over a slice of two
+  f32 arrays with separate offsets) lands as the 17th f32 builtin and
+  cuts the f32 CNN backward by 2.2× when wired into
+  `conv2d_backward_weights_f32`.  Single-threaded `mnist_cnn_f32` now
+  trains to 98.60 % in 76 s, parallel `mnist_cnn_par2_f32` to 98.65 %
+  in 23.2 s (3.27× over single-thread, 4.46-core occupancy).  The
+  unblocking fix was a single-bit VEX-encoding bug in
+  `arr_f32_adam_apply` (byte-1 `0x81` set X̃=0, silently aliasing
+  RSI→R14 — every iter past lane 7 re-read m[0..7] and CNN AdamW
+  diverged to NaN on the first batch).  Edge test #51
+  (`f32_adam_sparse`) prevents regression; older test #33 missed it
+  because every lane having non-zero (m, v) gave numerically-similar
+  steps regardless of whether iter k advanced.
 
 - **f32 AVX2 dense kernels** (Phase A.3) — three more builtins close
   the dense-layer side of the f32 stack: arr_f32_matvec /
@@ -237,12 +252,15 @@ from 1e-3 down to 1e-5 over 20 epochs.  Uses the fused AVX2
 
 137 s wall-clock, ~50 KB binary.
 
-**`mnist_cnn.ari`** — one-conv CNN with the same AdamW + smoothing +
-cosine recipe.  Architecture: Conv 1→8ch (3×3, pad 1) + ReLU +
-MaxPool 2×2 + FC 1568→64 + ReLU + FC 64→10.  Conv forward uses the
-AVX2 `arr_f64_conv2d_3x3_p1` builtin; im2col + backward_weights
-use the `arr_f64_fill` / `copy_slice` / `copy_at` bulk-memory
-builtins for what used to be scalar inner loops.
+**`mnist_cnn.ari` / `mnist_cnn_f32.ari` / `mnist_cnn_par2_f32.ari`** —
+one-conv CNN with the same AdamW + smoothing + cosine recipe across
+three precision/parallelism variants.  Architecture: Conv 1→8ch
+(3×3, pad 1) + ReLU + MaxPool 2×2 + FC 1568→64 + ReLU + FC 64→10.
+Conv forward uses the AVX2 `arr_f64_conv2d_3x3_p1` (or `_f32`)
+builtin; im2col + backward_weights use the `fill` / `copy_slice` /
+`copy_at` bulk-memory builtins for what used to be scalar inner
+loops.  The f32 variant uses the full f32 stack (matvec, matvec_T,
+outer_accum, conv2d_3x3_p1, adam_apply, dot_range).
 
 | Epoch | train NLL | test acc |
 |-------|-----------|----------|
@@ -252,6 +270,20 @@ builtins for what used to be scalar inner loops.
 
 **97 s wall-clock**, ~65 KB binary.  Beats the MLP at half the epoch
 budget with ~2× fewer parameters (101 K vs 203 K).
+
+f32 + parallel variants:
+
+| Demo                     | Wall  | Test acc | Notes                                |
+|--------------------------|------:|---------:|--------------------------------------|
+| `mnist_cnn.ari` (f64, AdamW)         |  97 s | 98.66 %  | baseline above                        |
+| `mnist_cnn_f32_sgd.ari` (f32, SGD)   |  76 s | 98.24 %  | full f32 stack, plain SGD             |
+| `mnist_cnn_f32.ari` (f32, AdamW)     |  76 s | 98.60 %  | unblocked by `adam_apply` VEX fix     |
+| `mnist_cnn_par2_f32.ari` (f32+4-thread) | **23.2 s** | **98.65 %** | 3.27× over single-thread, 4.46-core occupancy |
+
+The 76 s f32 vs 97 s f64 single-thread gap is bandwidth-bound — the
+W_fc1 weight tensor (64 × 1568 floats) halves in size, so each Adam
+step touches 401 KB instead of 802 KB and stays closer to the L2
+working set.
 
 Wall-clock trajectory across the session's CNN AVX2 work
 (identical training trajectory / final accuracy in every row):
@@ -350,7 +382,7 @@ Two complementary suites in `aricode/tests/`:
 | Suite          | Tests | Runtime | Covers                                    |
 |----------------|------:|--------:|-------------------------------------------|
 | `run_all.sh`   |    39 |   ~90 ms | Arithmetic, strings, arrays, error handling, file I/O, SIMD basics, imports, memory |
-| `run_edge.sh`  |    40 |  ~2.5 s | Softmax scalar tails & underflow clamp, vec exp/expm1 range, f64 return-contract (xmm0 + rax), hot-var register allocation, branch peephole, short-circuit `&&`/`||`, CNN forward/backward spot checks, threading (spawn, arg-passing, i64 + f64 atomic contention) |
+| `run_edge.sh`  |    51 |  ~2.5 s | Softmax scalar tails & underflow clamp, vec exp/expm1 range, f64 return-contract (xmm0 + rax), hot-var register allocation, branch peephole, short-circuit `&&`/`||`, CNN forward/backward spot checks, threading (spawn, arg-passing, i64 + f64 atomic contention), f32 builtin parity (matvec, conv2d, adam_apply, mul/dot_range, sparse-moment chunk advance) |
 
 Run both with one command:
 
@@ -414,6 +446,10 @@ caught in under 100 ms.
   knobs in place it reaches 98.14 % vs SGD's 97.15 %.
 - **No CNN builtins** — MNIST runs as an MLP.  Conv2d and max-pool
   are the next big additions when someone needs ~99 %.
+- **f32 `arr_f32_softmax` / `arr_f32_exp`** not yet shipped.  The
+  current f32 CNN demo runs softmax in user-space scalar code (10
+  outputs, ~30 µs/call — negligible at this scale).  Would matter
+  for larger output heads.
 
 ---
 

@@ -417,6 +417,164 @@ static void cg_vmovapd(CodegenState *cg, int dst, int src) {
     EMIT(cg, 2);
 }
 
+/* ====================================================================
+ *  Named helpers for legacy SSE (66/F2/F3 + REX) and small VEX patterns
+ * ====================================================================
+ *
+ * Every byte sequence below was previously hand-rolled at the call
+ * site.  We hit three REX-byte typos in the last month doing that —
+ *
+ *   - `xorps xmm12, xmm12` written as 0x44 0x0F 0x57 0xE4 (REX.R only,
+ *     so the source field decoded to xmm4, not xmm12);
+ *   - `mov r10, rcx` written as 0x4D 0x89 0xCA (REX.WRB instead of
+ *     REX.WB, so the source decoded to r9, not rcx);
+ *   - `movq xmm15, rax` written as 0x66 0x49 0x0F 0x6E 0xF8 (REX.WB
+ *     instead of REX.WR, so the destination decoded to xmm7, not
+ *     xmm15).
+ *
+ * Each typo survived eyeballing review and only surfaced when the
+ * end-to-end accuracy test caught the regression.  These helpers
+ * compute REX.W/R/X/B from the operand register indices, so picking a
+ * high reg (>= 8) for either side produces the correct prefix
+ * automatically.  The "I forgot to set R when I made the dst ymm12"
+ * bug class disappears here.
+ *
+ * Naming: cg_<mnemonic>_<form>().  All take logical register indices
+ * (0..15) and emit the legacy SSE encoding when no VEX equivalent is
+ * needed (xorps, movq) or the right VEX form when there is one
+ * (cvtsd2ss has both; we pick legacy here for binary-size symmetry
+ * with neighbouring scalar code).
+ */
+
+/* xorps xmm_dst, xmm_src — legacy SSE register-only.
+ *   prefix: REX (0x40 + W=0 + R=(dst>=8) + B=(src>=8))
+ *   opcode: 0F 57 /r
+ *   modrm:  11 reg=dst&7 r/m=src&7
+ *
+ * The REX byte is omitted entirely when both operands are low (xmm0..7)
+ * and W is 0 — saves a byte and matches what gcc emits for the common
+ * case.  When either operand is high, REX is required. */
+static void cg_xorps_xmm(CodegenState *cg, int dst, int src) {
+    uint8_t *b = BUF(cg);
+    int rex = 0;
+    if (dst >= 8) rex |= 0x04;   /* REX.R */
+    if (src >= 8) rex |= 0x01;   /* REX.B */
+    int n = 0;
+    if (rex) b[n++] = (uint8_t)(0x40 | rex);
+    b[n++] = 0x0F;
+    b[n++] = 0x57;
+    b[n++] = (uint8_t)(0xC0 | ((dst & 7) << 3) | (src & 7));
+    EMIT(cg, n);
+}
+
+/* movq xmm_dst, r64_src  (66 REX.W 0F 6E /r). */
+static void cg_movq_xmm_from_reg(CodegenState *cg, int xmm_dst, int reg_src) {
+    uint8_t *b = BUF(cg);
+    int rex = 0x48;   /* REX.W = 1 */
+    if (xmm_dst >= 8) rex |= 0x04;   /* REX.R */
+    if (reg_src >= 8) rex |= 0x01;   /* REX.B */
+    b[0] = 0x66;
+    b[1] = (uint8_t)rex;
+    b[2] = 0x0F;
+    b[3] = 0x6E;
+    b[4] = (uint8_t)(0xC0 | ((xmm_dst & 7) << 3) | (reg_src & 7));
+    EMIT(cg, 5);
+}
+
+/* movq r64_dst, xmm_src  (66 REX.W 0F 7E /r).  This is the
+ * SSE2 store-to-GPR form; the modrm.reg field still encodes the
+ * xmm operand, modrm.r/m encodes the GPR. */
+static void cg_movq_reg_from_xmm(CodegenState *cg, int reg_dst, int xmm_src) {
+    uint8_t *b = BUF(cg);
+    int rex = 0x48;
+    if (xmm_src >= 8) rex |= 0x04;
+    if (reg_dst >= 8) rex |= 0x01;
+    b[0] = 0x66;
+    b[1] = (uint8_t)rex;
+    b[2] = 0x0F;
+    b[3] = 0x7E;
+    b[4] = (uint8_t)(0xC0 | ((xmm_src & 7) << 3) | (reg_dst & 7));
+    EMIT(cg, 5);
+}
+
+/* cvtsd2ss xmm_dst, xmm_src — legacy SSE2.
+ *   prefix: F2 [REX]
+ *   opcode: 0F 5A /r
+ * REX is omitted when both operands are low; required (REX = 0x40 |
+ * REX.R | REX.B) when either is high. */
+static void cg_cvtsd2ss(CodegenState *cg, int dst, int src) {
+    uint8_t *b = BUF(cg);
+    int rex = 0;
+    if (dst >= 8) rex |= 0x04;
+    if (src >= 8) rex |= 0x01;
+    int n = 0;
+    b[n++] = 0xF2;
+    if (rex) b[n++] = (uint8_t)(0x40 | rex);
+    b[n++] = 0x0F;
+    b[n++] = 0x5A;
+    b[n++] = (uint8_t)(0xC0 | ((dst & 7) << 3) | (src & 7));
+    EMIT(cg, n);
+}
+
+/* cvtsi2ss xmm_dst, r32_src — i32 → f32 in xmm low lane.
+ *   prefix: F3 [REX]
+ *   opcode: 0F 2A /r
+ * Note: r32 source means REX.W is NOT set (we want the 32-bit form;
+ * the 64-bit form would mis-convert when bit 63 of the gpr is set). */
+static void cg_cvtsi2ss_from_reg32(CodegenState *cg, int xmm_dst, int reg_src) {
+    uint8_t *b = BUF(cg);
+    int rex = 0;
+    if (xmm_dst >= 8) rex |= 0x04;
+    if (reg_src >= 8) rex |= 0x01;
+    int n = 0;
+    b[n++] = 0xF3;
+    if (rex) b[n++] = (uint8_t)(0x40 | rex);
+    b[n++] = 0x0F;
+    b[n++] = 0x2A;
+    b[n++] = (uint8_t)(0xC0 | ((xmm_dst & 7) << 3) | (reg_src & 7));
+    EMIT(cg, n);
+}
+
+/* mulss xmm_dst, xmm_src — legacy SSE scalar f32 multiply.
+ *   prefix: F3 [REX]
+ *   opcode: 0F 59 /r
+ */
+static void cg_mulss(CodegenState *cg, int dst, int src) {
+    uint8_t *b = BUF(cg);
+    int rex = 0;
+    if (dst >= 8) rex |= 0x04;
+    if (src >= 8) rex |= 0x01;
+    int n = 0;
+    b[n++] = 0xF3;
+    if (rex) b[n++] = (uint8_t)(0x40 | rex);
+    b[n++] = 0x0F;
+    b[n++] = 0x59;
+    b[n++] = (uint8_t)(0xC0 | ((dst & 7) << 3) | (src & 7));
+    EMIT(cg, n);
+}
+
+/* vbroadcastss ymm_dst, xmm_src — VEX register-source broadcast.
+ *
+ * Pre-existing kernels build this byte sequence inline (see eg.
+ * arr_f32_softmax line 4521).  The encoding requires:
+ *   byte1 = 0xC4
+ *   byte2 = R~_X~_B~_mmmmm where R~=!(dst>=8), X~=1, B~=!(src>=8)
+ *   byte3 = W=0 vvvv=1111 L=1 pp=01 → 0x7D
+ *   opcode = 0x18
+ *   modrm  = 11 reg=dst&7 r/m=src&7
+ */
+static void cg_vbroadcastss_ymm_xmm(CodegenState *cg, int ymm_dst, int xmm_src) {
+    uint8_t *b = BUF(cg);
+    int Rb = (ymm_dst < 8) ? 1 : 0;
+    int Bb = (xmm_src < 8) ? 1 : 0;
+    b[0] = 0xC4;
+    b[1] = (uint8_t)((Rb << 7) | (1 << 6) | (Bb << 5) | 2);   /* mmmmm = 0F38 */
+    b[2] = 0x7D;
+    b[3] = 0x18;
+    b[4] = (uint8_t)(0xC0 | ((ymm_dst & 7) << 3) | (xmm_src & 7));
+    EMIT(cg, 5);
+}
+
 /* vbroadcastsd ymm_dst, [rsp + disp8]  — memory-source broadcast.
  *
  * This is the inner-loop-friendly broadcast: one instruction, no GPR
@@ -4515,10 +4673,11 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             memcpy(b+1, &neg_mask, 4); EMIT(cg, 5);
             /* movd xmm14, eax  —  66 44 0F 6E F0 */
             b = BUF(cg); b[0]=0x66; b[1]=0x44; b[2]=0x0F; b[3]=0x6E; b[4]=0xF0; EMIT(cg, 5);
-            /* xorps xmm11, xmm14  —  44 0F 57 DE  (legacy SSE: xmm11 ^ xmm14) */
-            b = BUF(cg); b[0]=0x45; b[1]=0x0F; b[2]=0x57; b[3]=0xDE; EMIT(cg, 4);
-            /* vbroadcastss ymm15, xmm11  —  C4 42 7D 18 FB */
-            b = BUF(cg); b[0]=0xC4; b[1]=0x42; b[2]=0x7D; b[3]=0x18; b[4]=0xFB; EMIT(cg, 5);
+            /* Negate the max via xor with the sign-bit mask in xmm14,
+             * then broadcast (-max) across ymm15 for the lane-wise
+             * subtract step in pass 2. */
+            cg_xorps_xmm(cg, /*dst=*/11, /*src=*/14);
+            cg_vbroadcastss_ymm_xmm(cg, /*ymm_dst=*/15, /*xmm_src=*/11);
 
             /* ── Pass 2: buf[i] = exp(buf[i] + (-max)); accumulate sum. ──
              * Use the f32-promote/exp/narrow pattern, plus an addss into
@@ -4534,11 +4693,11 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             emit_exp_coeff_stack_setup(cg);
 
             /* xmm12 = 0.0 (running sum). */
-            /* xorps xmm12, xmm12 — REX.RB so both target and source resolve
-             * to xmm12.  Earlier 0x44 (REX.R only) made the source xmm4 and
-             * the running sum inherited whatever xmm4 held — soft-corrupted
-             * the second call onward when the caller had touched xmm4. */
-            b = BUF(cg); b[0]=0x45; b[1]=0x0F; b[2]=0x57; b[3]=0xE4; EMIT(cg, 4);
+            /* xorps xmm12, xmm12 — running-sum init.  Migrated to the
+             * cg_xorps_xmm helper which derives both REX.R and REX.B from
+             * the operand indices; the original byte-literal version
+             * silently produced `xorps xmm12, xmm4` (see edge test #49). */
+            cg_xorps_xmm(cg, /*dst=*/12, /*src=*/12);
 
             pn = emit_xor_reg_reg(BUF(cg), REG_RSI, REG_RSI); EMIT(cg, pn);
             CgCountedLoop ex = cg_loop_begin(cg, REG_RSI, REG_RDX);
@@ -5534,20 +5693,14 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             b = BUF(cg); b[0]=0x4C; b[1]=0x8B; b[2]=0x54; b[3]=0x24; b[4]=0x38; EMIT(cg, 5); /* mov r10, [rsp+56] C_out */
 
             /* Load scale_f64 from [rsp+64], demote to f32 in xmm15.
-             *   mov rax, [rsp+64]            48 8B 44 24 40
-             *   movq xmm15, rax              66 4C 0F 6E F8
-             *     REX.W=1, REX.R=1 (target xmm15 high), REX.B=0 (rax low) → 0x4C
-             *     ModRM 11_111_000 = 0xF8  (reg=15&7=7, r/m=rax&7=0)
-             *   cvtsd2ss xmm15, xmm15        F2 45 0F 5A FF
-             *
-             * Earlier 0x49 (REX.WB) had REX.B set instead of REX.R, so the
-             * decoder turned it into `movq xmm7, r8` — scale ended up in
-             * xmm7 (clobbered by later code) and xmm15 stayed at whatever
-             * the caller had, eventually multiplying every weight by 0
-             * and the conv produced bias-only outputs. */
+             * The hand-rolled `movq xmm15, rax` byte sequence here used
+             * to be a REX-typo trap (REX.WB instead of REX.WR turned
+             * the destination into xmm7).  The cg_movq_xmm_from_reg
+             * helper computes REX.R/B from the operand indices, so a
+             * future register choice change can't reproduce the bug. */
             b = BUF(cg); b[0]=0x48; b[1]=0x8B; b[2]=0x44; b[3]=0x24; b[4]=0x40; EMIT(cg, 5);
-            b = BUF(cg); b[0]=0x66; b[1]=0x4C; b[2]=0x0F; b[3]=0x6E; b[4]=0xF8; EMIT(cg, 5);
-            b = BUF(cg); b[0]=0xF2; b[1]=0x45; b[2]=0x0F; b[3]=0x5A; b[4]=0xFF; EMIT(cg, 5);
+            cg_movq_xmm_from_reg(cg, 15, REG_RAX);
+            cg_cvtsd2ss(cg, 15, 15);
 
             pn = emit_xor_reg_reg(BUF(cg), REG_RAX, REG_RAX); EMIT(cg, pn);
 
@@ -5573,56 +5726,17 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
              * the rest are low (0..7).
              */
             for (int k = 0; k < 9; k++) {
-                int dst = k;                /* ymm0..ymm8 */
-                int dst_lo = dst & 7;
-                int dst_hi = (dst >= 8) ? 1 : 0;
-                /* movsx ecx, byte ptr [r11 + k]
-                 *   REX.B = 1 (r11 high) → 0x41
-                 *   opcode 0F BE /r
-                 *   ModRM mod=01 reg=001 (ecx) r/m=011 (r11&7) → 0x4B
-                 *   disp8 = k */
+                /* movsx ecx, byte ptr [r11 + k]  —  41 0F BE 4B kk
+                 *   REX.B=1 (r11 high), opcode 0F BE, mod=01 reg=ecx
+                 *   r/m=r11&7=011, disp8=k.  No helper yet for movsx-from-
+                 *   memory; left inline (single byte sequence, hard to typo). */
                 b = BUF(cg);
                 b[0] = 0x41; b[1] = 0x0F; b[2] = 0xBE; b[3] = 0x4B; b[4] = (uint8_t)k;
                 EMIT(cg, 5);
 
-                /* cvtsi2ss xmm_dst, ecx
-                 *   F3 [REX.R? 0x44 : 0] 0F 2A modrm
-                 *   ModRM mod=11 reg=dst&7 r/m=001 (ecx) */
-                b = BUF(cg); b[0] = 0xF3;
-                int off = 1;
-                if (dst_hi) { b[off++] = 0x44; }   /* REX.R */
-                b[off++] = 0x0F; b[off++] = 0x2A;
-                b[off++] = (uint8_t)((3 << 6) | (dst_lo << 3) | 1);
-                EMIT(cg, off);
-
-                /* mulss xmm_dst, xmm15
-                 *   F3 [REX.RB] 0F 59 modrm
-                 *   REX needed because xmm15 is high; if dst is low, just
-                 *   REX.B = 1 → 0x41; if dst is high, REX.RB → 0x45. */
-                b = BUF(cg); b[0] = 0xF3;
-                off = 1;
-                if (dst_hi) { b[off++] = 0x45; }
-                else        { b[off++] = 0x41; }
-                b[off++] = 0x0F; b[off++] = 0x59;
-                /* ModRM mod=11 reg=dst&7 r/m=15&7=7 → 0xC0 | (dst&7)<<3 | 7 */
-                b[off++] = (uint8_t)((3 << 6) | (dst_lo << 3) | 7);
-                EMIT(cg, off);
-
-                /* vbroadcastss ymm_dst, xmm_dst
-                 *   3-byte VEX:
-                 *     byte1: R~ X~ B~ mmmmm
-                 *       R~ = !dst_hi (target reg)
-                 *       X~ = 1
-                 *       B~ = !dst_hi (source xmm)
-                 *     byte2: 0x7D
-                 *     opcode 0x18
-                 *     ModRM 11_dst&7_dst&7 */
-                int Rb = dst_hi ? 0 : 1;
-                uint8_t byte1 = (uint8_t)((Rb << 7) | (1 << 6) | (Rb << 5) | 2);
-                b = BUF(cg);
-                b[0] = 0xC4; b[1] = byte1; b[2] = 0x7D; b[3] = 0x18;
-                b[4] = (uint8_t)((3 << 6) | (dst_lo << 3) | dst_lo);
-                EMIT(cg, 5);
+                cg_cvtsi2ss_from_reg32(cg, /*xmm_dst=*/k, /*reg_src=*/REG_RCX);
+                cg_mulss(cg, /*dst=*/k, /*src=*/15);            /* xmm_k *= xmm15 (scale) */
+                cg_vbroadcastss_ymm_xmm(cg, /*ymm_dst=*/k, /*xmm_src=*/k);
             }
 
             /* Broadcast bias[c] into ymm9 (same encoding as the f32 conv). */
@@ -7654,16 +7768,14 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             b = BUF(cg); b[0]=0x4C; b[1]=0x8B; b[2]=0x44; b[3]=0x24; b[4]=0x28; EMIT(cg, 5); /* mov r8,  [rsp+40] y */
             b = BUF(cg); b[0]=0x4C; b[1]=0x8B; b[2]=0x4C; b[3]=0x24; b[4]=0x30; EMIT(cg, 5); /* mov r9,  [rsp+48] m */
 
-            /* Build broadcast(scale_f32) in ymm5.
-             *   mov rax, [rsp+56]    ; rax = scale_f64 bits
-             *   movq xmm0, rax       ; xmm0 = scale as f64
-             *   cvtsd2ss xmm0, xmm0  ; xmm0 lane 0 = f32
-             *   vbroadcastss ymm5, xmm0
-             */
+            /* Build broadcast(scale_f32) in ymm5: load f64 scale from
+             * the stack, demote to f32 in xmm0, broadcast across ymm5.
+             * Now via the named helpers — picking an alternate xmm
+             * destination won't reproduce the movq REX-typo class. */
             b = BUF(cg); b[0]=0x48; b[1]=0x8B; b[2]=0x44; b[3]=0x24; b[4]=0x38; EMIT(cg, 5);
-            b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xC0; EMIT(cg, 5);
-            b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x5A; b[3]=0xC0; EMIT(cg, 4);
-            b = BUF(cg); b[0]=0xC4; b[1]=0xE2; b[2]=0x7D; b[3]=0x18; b[4]=0xE8; EMIT(cg, 5);
+            cg_movq_xmm_from_reg(cg, /*xmm_dst=*/0, /*reg_src=*/REG_RAX);
+            cg_cvtsd2ss(cg, /*dst=*/0, /*src=*/0);
+            cg_vbroadcastss_ymm_xmm(cg, /*ymm_dst=*/5, /*xmm_src=*/0);
 
             /* rcx = n = x_f32 length (i64 at [rsi - 8]).  r10 = n & ~7.
              *

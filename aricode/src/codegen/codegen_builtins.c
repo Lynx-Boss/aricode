@@ -8831,8 +8831,38 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             /* movq xmm0, rax — xmm0 = old value as f64. */
             b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E; b[4]=0xC0;
             EMIT(cg, 5);
+
+            /* Defensive NaN-mem auto-repair.  Without this, once a slot
+             * holds NaN bits, every subsequent add `NaN + finite` ≡ NaN,
+             * cmpxchg compares NaN-bits == NaN-bits and succeeds, so the
+             * slot stays poisoned for the rest of the run.  Treat
+             * "current mem is NaN" as "old value is whatever delta is",
+             * i.e. the next finite contribution overwrites the corrupt
+             * slot.  Symmetric to the delta-NaN guard above (which
+             * preserves a finite slot from a NaN delta) — the contract
+             * is "running totals stay finite as long as some contributor
+             * is finite".  A diagnostic-NaN that you actually want to
+             * stick should use a plain f64 store, not atomic_add_f64. */
+            /* ucomisd xmm0, xmm0 — PF=1 iff mem is NaN. */
+            b = BUF(cg); b[0]=0x66; b[1]=0x0F; b[2]=0x2E; b[3]=0xC0; EMIT(cg, 4);
+            /* jnp .normal — finite mem takes the addsd path. */
+            size_t jnp_normal_pos = cg->code_size;
+            b = BUF(cg); b[0]=0x0F; b[1]=0x8B; memset(b+2,0,4); EMIT(cg, 6);
+            /* mem is NaN — set new = delta (skip the addsd). */
+            b = BUF(cg); b[0]=0x66; b[1]=0x0F; b[2]=0x28; b[3]=0xC1; EMIT(cg, 4); /* movapd xmm0, xmm1 */
+            size_t jmp_write_pos = cg->code_size;
+            b = BUF(cg); b[0]=0xE9; memset(b+1,0,4); EMIT(cg, 5);                /* jmp .write */
+            /* .normal: */
+            { int32_t off = (int32_t)(cg->code_size - (jnp_normal_pos + 6));
+              memcpy(cg->code + jnp_normal_pos + 2, &off, 4); }
+
             /* addsd xmm0, xmm1 — xmm0 = old + delta. */
             b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x58; b[3]=0xC1; EMIT(cg, 4);
+
+            /* .write: */
+            { int32_t off = (int32_t)(cg->code_size - (jmp_write_pos + 5));
+              memcpy(cg->code + jmp_write_pos + 1, &off, 4); }
+
             /* movq rdi, xmm0 — rdi = new bits. */
             b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x7E; b[4]=0xC7;
             EMIT(cg, 5);
@@ -8971,9 +9001,22 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             /* r8 = 0, r9 = 0 (uaddr2/val3 unused for WAIT). */
             b = BUF(cg); b[0]=0x4D; b[1]=0x31; b[2]=0xC0; EMIT(cg, 3);
             b = BUF(cg); b[0]=0x4D; b[1]=0x31; b[2]=0xC9; EMIT(cg, 3);
+
+            /* Retry on EINTR.  A signal-interrupted futex_wait returns
+             * -EINTR (= -4 ≡ 0xFFFFFFFFFFFFFFFC) without having actually
+             * woken — semantically the same as "still waiting".  Looping
+             * here means callers don't need to write `while (futex_wait
+             * == -EINTR)` boilerplate and don't lose the wait on
+             * spurious signals (e.g. SIGCHLD from a worker exiting). */
+            size_t futex_retry_pos = cg->code_size;
             /* rax = 202 = __NR_futex */
             pn = emit_mov_reg_imm32(BUF(cg), REG_RAX, 202); EMIT(cg, pn);
             pn = emit_syscall(BUF(cg)); EMIT(cg, pn);
+            /* cmp rax, -4   ;   48 83 F8 FC */
+            b = BUF(cg); b[0]=0x48; b[1]=0x83; b[2]=0xF8; b[3]=0xFC; EMIT(cg, 4);
+            /* je retry  —  0F 84 rel32 */
+            { int32_t back = (int32_t)((int64_t)futex_retry_pos - (int64_t)(cg->code_size + 6));
+              b = BUF(cg); b[0]=0x0F; b[1]=0x84; memcpy(b+2, &back, 4); EMIT(cg, 6); }
             return 1;
         }
 

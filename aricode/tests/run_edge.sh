@@ -1396,6 +1396,30 @@ fn main() -> i32 {
 EOF
 run_test "atomic_f64_nan_guard" /tmp/edge_atomic_nan.ari "NAN_GUARD_OK" "atomic_add_f64 with NaN delta is a no-op (counter stays usable for finite adds)"
 
+# #41b atomic_add_f64 NaN-mem auto-repair.  Symmetric to #41: if the
+# slot itself becomes NaN (e.g. an uninitialised mmap region or an
+# arr_f64_set with a NaN value somewhere), every subsequent
+# `NaN + finite` produces NaN and cmpxchg succeeds, so the slot stays
+# poisoned forever.  Guard treats "current mem is NaN" as "old value
+# = delta", so the next finite add overwrites the corruption and the
+# running total stays usable.  Without this, NAN_REPAIR test would
+# read NaN + 4.0 = NaN, never 7.0.
+cat > /tmp/edge_atomic_nan_mem.ari << 'EOF'
+fn make_nan() -> f64 {
+    let z: f64 = 0.0;
+    return z / z;
+}
+fn main() -> i32 {
+    let ctr: i32 = arr_f64_new(1);
+    arr_f64_set(ctr, 0, make_nan());           // poison the slot
+    atomic_add_f64(ctr, 0, 3.0);               // repair → slot = 3.0
+    atomic_add_f64(ctr, 0, 4.0);               // accumulate → slot = 7.0
+    if (math_abs(arr_f64_get(ctr, 0) - 7.0) < 0.0001) { print_str("NAN_REPAIR_OK"); }
+    return 0;
+}
+EOF
+run_test "atomic_f64_nan_mem_repair" /tmp/edge_atomic_nan_mem.ari "NAN_REPAIR_OK" "atomic_add_f64: NaN slot auto-repairs to delta on the next finite add"
+
 # #42  Hot-GP `i = i + 1` direct-add path must keep rax in sync.  An
 # earlier version of the fast path emitted just `add r_v, imm` and
 # left rax stale.  The unrolled while loop's first condition check

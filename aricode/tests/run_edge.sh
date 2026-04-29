@@ -1629,6 +1629,47 @@ fn main() -> i32 {
 EOF
 run_test "embed_file_bytes" /tmp/edge_embed_b.ari "EMBED_BYTES_OK" "embed_file_bytes: 7 raw bytes (incl. 0x80, 0xFF) baked into .text round-trip"
 
+# #52  arr_i8_matvec_f32: quantised matvec sanity.  W (2 × 8) holds
+# rows [1..8] and [-1..-8] (sign-byte values), x is all-ones, scale
+# = 0.5.  Expected y = [18.0, -18.0].  Catches both the inner FMA
+# loop and the scalar tail (we test n=10 too — vec processes 8,
+# tail processes 2).  Originally caught the REX-byte typo where
+# `mov r10, rcx` had REX.R set and silently turned into
+# `mov r10, r9`, which made the inner loop bound = m & ~7 instead
+# of n & ~7 — fc1 went from 30 µs to 10 ms per call.
+python3 -c "
+W8 = bytes([1,2,3,4,5,6,7,8] + [(-i)&0xff for i in range(1,9)])
+open('/tmp/edge_i8mv_w.i8','wb').write(W8)
+import struct
+open('/tmp/edge_i8mv_x.f32','wb').write(struct.pack('<8f', *([1.0]*8)))
+W10 = bytes([1,2,3,4,5,6,7,8,9,10] + [(-i)&0xff for i in range(1,11)])
+open('/tmp/edge_i8mv_w10.i8','wb').write(W10)
+open('/tmp/edge_i8mv_x10.f32','wb').write(struct.pack('<10f', *([1.0]*10)))
+"
+cat > /tmp/edge_i8mv.ari << 'EOF'
+fn main() -> i32 {
+    let W: i32 = embed_file_bytes("/tmp/edge_i8mv_w.i8");
+    let x: i32 = embed_file("/tmp/edge_i8mv_x.f32");
+    let y: i32 = arr_f32_new(2);
+    arr_i8_matvec_f32(W, x, y, 2, 0.5);
+    let ok: i32 = 1;
+    if (math_abs(arr_f32_get(y, 0) - 18.0) > 0.001) { ok = 0; }
+    if (math_abs(arr_f32_get(y, 1) + 18.0) > 0.001) { ok = 0; }
+    // Now n=10 to exercise the scalar tail.
+    let W10: i32 = embed_file_bytes("/tmp/edge_i8mv_w10.i8");
+    let x10: i32 = embed_file("/tmp/edge_i8mv_x10.f32");
+    let y10: i32 = arr_f32_new(2);
+    arr_i8_matvec_f32(W10, x10, y10, 2, 0.5);
+    // Row 0 sum = 1+2+...+10 = 55, * 0.5 = 27.5
+    // Row 1 sum = -55, * 0.5 = -27.5
+    if (math_abs(arr_f32_get(y10, 0) - 27.5) > 0.001) { ok = 0; }
+    if (math_abs(arr_f32_get(y10, 1) + 27.5) > 0.001) { ok = 0; }
+    if (ok == 1) { print_str("I8MV_OK"); }
+    return 0;
+}
+EOF
+run_test "arr_i8_matvec_f32" /tmp/edge_i8mv.ari "I8MV_OK" "arr_i8_matvec_f32: vec body (n=8) + scalar tail (n=10) match analytic answer"
+
 # ────────────────────────────────────────────────────────────────────
 
 echo ""

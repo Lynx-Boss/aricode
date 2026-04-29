@@ -1721,6 +1721,85 @@ EOF
 run_test "arr_i8_conv2d_3x3_p1" /tmp/edge_i8c.ari "I8CONV_OK" "arr_i8_conv2d_3x3_p1: int8 conv matches f32 conv on dequantised weights bit-for-bit (3136 outputs, max diff < 1e-6)"
 
 # ────────────────────────────────────────────────────────────────────
+#  Defensive runtime checks — these tests expect the program to ABORT
+#  with a Runtime error written to stderr.  Custom flow because the
+#  default run_test swallows stderr.
+# ────────────────────────────────────────────────────────────────────
+
+run_test_aborts_stderr() {
+    local name="$1" file="$2" expect="$3" notes="${4:-}"
+    TOTAL=$((TOTAL + 1))
+    printf "  [%2d] %-38s" "$TOTAL" "$name"
+    if ! "$ARIC" "$file" -o "/tmp/aritest_edge_$name" >/dev/null 2>&1; then
+        printf "${RED}COMPILE FAIL${RESET}\n"
+        FAIL=$((FAIL + 1))
+        return
+    fi
+    local err
+    err=$("/tmp/aritest_edge_$name" 2>&1 >/dev/null) || true
+    if echo "$err" | grep -qF "$expect"; then
+        printf "${GREEN}PASS${RESET}"
+        [ -n "$notes" ] && printf " ${DIM}%s${RESET}" "$notes"
+        printf "\n"
+        PASS=$((PASS + 1))
+    else
+        printf "${RED}FAIL${RESET} ${DIM}(expected '$expect' on stderr)${RESET}\n"
+        printf "         ${DIM}got: $(echo "$err" | tr '\n' ' ' | cut -c 1-70)${RESET}\n"
+        FAIL=$((FAIL + 1))
+    fi
+    rm -f "/tmp/aritest_edge_$name"
+}
+
+# #54  arr_i8_matvec_f32 must reject a W buffer too small for m·n.
+# A caller passing W of just 8 bytes with m=4 and x of length 8 implies
+# 32 bytes required → 24 missing.  The kernel used to silently read past
+# the heap object; now it aborts with a Runtime error before the matmul
+# runs.  This forecloses an info-disclosure primitive when W came from
+# an attacker-controlled .safetensors / .pt weights file.
+python3 -c "import sys; sys.stdout.buffer.write(bytes([1]*8))" > /tmp/edge_i8mv_oob.i8
+python3 -c "
+import struct
+open('/tmp/edge_i8mv_oob.f32','wb').write(struct.pack('<8f', *[1.0]*8))
+"
+cat > /tmp/edge_i8mv_oob.ari <<EOF
+fn main() -> i32 {
+    let W: i32 = embed_file_bytes("/tmp/edge_i8mv_oob.i8");
+    let x: i32 = embed_file("/tmp/edge_i8mv_oob.f32");
+    let y: i32 = arr_f32_new(4);
+    arr_i8_matvec_f32(W, x, y, 4, 1.0);
+    print_str("SHOULD_NOT_REACH");
+    return 0;
+}
+EOF
+run_test_aborts_stderr "i8mv_oob_check" /tmp/edge_i8mv_oob.ari \
+    "arr_i8_matvec_f32 W length < m*n" \
+    "arr_i8_matvec_f32: 8-byte W with m=4,n=8 (need 32) aborts before matmul"
+
+# #55  arr_i8_conv2d_3x3_p1 must reject a W buffer too small for
+# C_out·9 bytes.  9-byte W with C_out=4 → 36 needed, 27 missing.  Same
+# defense as #54 for the conv variant.
+python3 -c "import sys; sys.stdout.buffer.write(bytes([1]*9))" > /tmp/edge_i8c_oob.i8
+python3 -c "
+import struct
+open('/tmp/edge_i8c_oob_pad.f32','wb').write(b'\\0' * (4*30*30))
+open('/tmp/edge_i8c_oob_b.f32','wb').write(struct.pack('<4f', 0.0, 0.0, 0.0, 0.0))
+"
+cat > /tmp/edge_i8c_oob.ari <<EOF
+fn main() -> i32 {
+    let pad: i32 = embed_file("/tmp/edge_i8c_oob_pad.f32");
+    let Wq:  i32 = embed_file_bytes("/tmp/edge_i8c_oob.i8");
+    let bs:  i32 = embed_file("/tmp/edge_i8c_oob_b.f32");
+    let oi:  i32 = arr_f32_new(4 * 28 * 28);
+    arr_i8_conv2d_3x3_p1(pad, Wq, bs, oi, 4, 1.0);
+    print_str("SHOULD_NOT_REACH");
+    return 0;
+}
+EOF
+run_test_aborts_stderr "i8conv_oob_check" /tmp/edge_i8c_oob.ari \
+    "arr_i8_conv2d_3x3_p1 W length < C_out*9" \
+    "arr_i8_conv2d_3x3_p1: 9-byte W with C_out=4 (need 36) aborts before conv"
+
+# ────────────────────────────────────────────────────────────────────
 
 echo ""
 echo -e "${BOLD}${CYAN}============================================================${RESET}"

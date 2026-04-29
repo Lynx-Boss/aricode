@@ -2156,6 +2156,32 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
                              "(expected raw f32 array)", path, fsize);
                 return 1;
             }
+
+            /* Reject the oversize case BEFORE the malloc.  A 10 GB file
+             * (or a symlink to /proc/kcore) would otherwise allocate first
+             * and only then notice the buffer cap, swapping the host to
+             * death.  Cheap path: the size check only depends on fsize.
+             * Also caps fsize itself at INT32_MAX − 20 so the rel32 JMP
+             * over the blob can't overflow even if CODEGEN_MAX_CODE is
+             * raised in the future. */
+            if (fsize > (long)(INT32_MAX - 20)) {
+                fclose(f);
+                cg_error(cg, "embed_file: '%s' (%ld bytes) too large; "
+                             "rel32 JMP over the blob would overflow.",
+                         path, fsize);
+                return 1;
+            }
+            size_t needed = (size_t)5 + 8 + (size_t)fsize + 7;
+            if (cg->code_size + needed > CODEGEN_MAX_CODE) {
+                fclose(f);
+                cg_error(cg, "embed_file: '%s' (%ld bytes) overflows the "
+                             "code buffer (%zu free of %d).  Bump "
+                             "CODEGEN_MAX_CODE in src/codegen/codegen.h.",
+                         path, fsize,
+                         (size_t)CODEGEN_MAX_CODE - cg->code_size,
+                         CODEGEN_MAX_CODE);
+                return 1;
+            }
             int64_t n_elements = (int64_t)(fsize / 4);
 
             uint8_t *blob = (uint8_t *)malloc((size_t)fsize);
@@ -2168,22 +2194,6 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             fclose(f);
 
             int pn; uint8_t *b;
-
-            /* Pre-check: the JMP + length prefix + raw bytes + trailing
-             * LEA must all fit in the code buffer.  Without this an
-             * oversize embed_file walks past `cg->code` and segfaults
-             * before EMIT's bounds check has a chance to fire. */
-            size_t needed = (size_t)5 + 8 + (size_t)fsize + 7;
-            if (cg->code_size + needed > CODEGEN_MAX_CODE) {
-                free(blob);
-                cg_error(cg, "embed_file: '%s' (%ld bytes) overflows the "
-                             "code buffer (%zu free of %d).  Bump "
-                             "CODEGEN_MAX_CODE in src/codegen/codegen.h.",
-                         path, fsize,
-                         (size_t)CODEGEN_MAX_CODE - cg->code_size,
-                         CODEGEN_MAX_CODE);
-                return 1;
-            }
 
             /* jmp rel32 over the blob (placeholder, patched below). */
             size_t jmp_pos = cg->code_size;
@@ -2259,6 +2269,28 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
                 cg_error(cg, "embed_file_bytes: ftell failed for '%s'", path);
                 return 1;
             }
+
+            /* Reject the oversize case BEFORE the malloc.  Same rationale
+             * as embed_file above — don't allocate gigabytes just to
+             * report "doesn't fit". */
+            if (fsize > (long)(INT32_MAX - 20)) {
+                fclose(f);
+                cg_error(cg, "embed_file_bytes: '%s' (%ld bytes) too large; "
+                             "rel32 JMP over the blob would overflow.",
+                         path, fsize);
+                return 1;
+            }
+            size_t needed = (size_t)5 + 8 + (size_t)fsize + 7;
+            if (cg->code_size + needed > CODEGEN_MAX_CODE) {
+                fclose(f);
+                cg_error(cg, "embed_file_bytes: '%s' (%ld bytes) overflows the "
+                             "code buffer (%zu free of %d).  Bump "
+                             "CODEGEN_MAX_CODE in src/codegen/codegen.h.",
+                         path, fsize,
+                         (size_t)CODEGEN_MAX_CODE - cg->code_size,
+                         CODEGEN_MAX_CODE);
+                return 1;
+            }
             int64_t n_bytes = (int64_t)fsize;
 
             uint8_t *blob = (uint8_t *)malloc((size_t)fsize);
@@ -2271,18 +2303,6 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             fclose(f);
 
             int pn; uint8_t *b;
-
-            size_t needed = (size_t)5 + 8 + (size_t)fsize + 7;
-            if (cg->code_size + needed > CODEGEN_MAX_CODE) {
-                free(blob);
-                cg_error(cg, "embed_file_bytes: '%s' (%ld bytes) overflows the "
-                             "code buffer (%zu free of %d).  Bump "
-                             "CODEGEN_MAX_CODE in src/codegen/codegen.h.",
-                         path, fsize,
-                         (size_t)CODEGEN_MAX_CODE - cg->code_size,
-                         CODEGEN_MAX_CODE);
-                return 1;
-            }
 
             size_t jmp_pos = cg->code_size;
             pn = emit_jmp(BUF(cg), 0); EMIT(cg, pn);
@@ -5702,6 +5722,41 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             cg_movq_xmm_from_reg(cg, 15, REG_RAX);
             cg_cvtsd2ss(cg, 15, 15);
 
+            /* Defensive bounds check: C_out·9 bytes must fit inside W_i8's
+             * byte length (header at [r8 - 8]).  Same rationale as
+             * arr_i8_matvec_f32 — without this, a caller that passes a
+             * too-short weight array silently reads heap bytes past the
+             * end of the buffer for every channel iteration. */
+            b = BUF(cg); b[0]=0x4C; b[1]=0x89; b[2]=0xD0; EMIT(cg, 3);          /* mov rax, r10 (C_out) */
+            b = BUF(cg); b[0]=0x48; b[1]=0x6B; b[2]=0xC0; b[3]=0x09; EMIT(cg, 4);/* imul rax, rax, 9 */
+            b = BUF(cg); b[0]=0x49; b[1]=0x8B; b[2]=0x50; b[3]=0xF8; EMIT(cg, 4);/* mov rdx, [r8 - 8] */
+            b = BUF(cg); b[0]=0x48; b[1]=0x39; b[2]=0xD0; EMIT(cg, 3);          /* cmp rax, rdx */
+            size_t i8c_jbe_pos = cg->code_size;
+            b = BUF(cg); b[0]=0x0F; b[1]=0x86; memset(b+2,0,4); EMIT(cg, 6);    /* jbe .ok */
+            {
+                const char *errmsg = "Runtime error: arr_i8_conv2d_3x3_p1 W length < C_out*9\n";
+                size_t errmsg_len = strlen(errmsg);
+                size_t jmp_str = cg->code_size;
+                pn = emit_jmp(BUF(cg), 0); EMIT(cg, pn);
+                size_t str_pos = cg->code_size;
+                memcpy(BUF(cg), errmsg, errmsg_len); cg->code_size += errmsg_len;
+                int32_t jo = (int32_t)(cg->code_size - (jmp_str + 5));
+                memcpy(cg->code + jmp_str + 1, &jo, 4);
+                int32_t rip_off = (int32_t)((int64_t)str_pos - (int64_t)(cg->code_size + 7));
+                b = BUF(cg);
+                b[0]=rex(1,reg_ext(REG_RSI),0,0); b[1]=0x8D;
+                b[2]=modrm(0,REG_RSI,5); memcpy(b+3,&rip_off,4); EMIT(cg,7);
+                pn = emit_mov_reg_imm32(BUF(cg), REG_RDX, (uint32_t)errmsg_len); EMIT(cg, pn);
+                pn = emit_mov_reg_imm32(BUF(cg), REG_RDI, 2); EMIT(cg, pn);
+                pn = emit_mov_reg_imm32(BUF(cg), REG_RAX, 1); EMIT(cg, pn);
+                pn = emit_syscall(BUF(cg)); EMIT(cg, pn);
+                pn = emit_mov_reg_imm32(BUF(cg), REG_RDI, 1); EMIT(cg, pn);
+                pn = emit_mov_reg_imm32(BUF(cg), REG_RAX, 60); EMIT(cg, pn);
+                pn = emit_syscall(BUF(cg)); EMIT(cg, pn);
+            }
+            { int32_t jbe_off = (int32_t)(cg->code_size - (i8c_jbe_pos + 6));
+              memcpy(cg->code + i8c_jbe_pos + 2, &jbe_off, 4); }
+
             pn = emit_xor_reg_reg(BUF(cg), REG_RAX, REG_RAX); EMIT(cg, pn);
 
             /* ═══ Channel loop ═══ */
@@ -7790,6 +7845,44 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
              *   when the outer compared rbx to … itself, falling into a
              *   long chain of partial work. */
             pn = emit_mov_reg_mem(BUF(cg), REG_RCX, REG_RSI, -8); EMIT(cg, pn);
+
+            /* Defensive bounds check: m·n must fit inside W's byte length
+             * (header at [rdi - 8] holds the i8 element count, which equals
+             * the byte count for an i8 array).  Without this, a caller that
+             * passed a too-small W silently read attacker-controlled bytes
+             * past the end of the heap object — undefined output and a
+             * potential information-disclosure primitive when W came from
+             * untrusted weights. */
+            b = BUF(cg); b[0]=0x4C; b[1]=0x89; b[2]=0xC8; EMIT(cg, 3);          /* mov rax, r9 (m) */
+            b = BUF(cg); b[0]=0x48; b[1]=0x0F; b[2]=0xAF; b[3]=0xC1; EMIT(cg, 4);/* imul rax, rcx */
+            b = BUF(cg); b[0]=0x48; b[1]=0x8B; b[2]=0x57; b[3]=0xF8; EMIT(cg, 4);/* mov rdx, [rdi - 8] */
+            b = BUF(cg); b[0]=0x48; b[1]=0x39; b[2]=0xD0; EMIT(cg, 3);          /* cmp rax, rdx */
+            size_t i8mv_jbe_pos = cg->code_size;
+            b = BUF(cg); b[0]=0x0F; b[1]=0x86; memset(b+2,0,4); EMIT(cg, 6);    /* jbe .ok (ahead) */
+            {
+                const char *errmsg = "Runtime error: arr_i8_matvec_f32 W length < m*n\n";
+                size_t errmsg_len = strlen(errmsg);
+                size_t jmp_str = cg->code_size;
+                pn = emit_jmp(BUF(cg), 0); EMIT(cg, pn);
+                size_t str_pos = cg->code_size;
+                memcpy(BUF(cg), errmsg, errmsg_len); cg->code_size += errmsg_len;
+                int32_t jo = (int32_t)(cg->code_size - (jmp_str + 5));
+                memcpy(cg->code + jmp_str + 1, &jo, 4);
+                int32_t rip_off = (int32_t)((int64_t)str_pos - (int64_t)(cg->code_size + 7));
+                b = BUF(cg);
+                b[0]=rex(1,reg_ext(REG_RSI),0,0); b[1]=0x8D;
+                b[2]=modrm(0,REG_RSI,5); memcpy(b+3,&rip_off,4); EMIT(cg,7);
+                pn = emit_mov_reg_imm32(BUF(cg), REG_RDX, (uint32_t)errmsg_len); EMIT(cg, pn);
+                pn = emit_mov_reg_imm32(BUF(cg), REG_RDI, 2); EMIT(cg, pn);
+                pn = emit_mov_reg_imm32(BUF(cg), REG_RAX, 1); EMIT(cg, pn);
+                pn = emit_syscall(BUF(cg)); EMIT(cg, pn);
+                pn = emit_mov_reg_imm32(BUF(cg), REG_RDI, 1); EMIT(cg, pn);
+                pn = emit_mov_reg_imm32(BUF(cg), REG_RAX, 60); EMIT(cg, pn);
+                pn = emit_syscall(BUF(cg)); EMIT(cg, pn);
+            }
+            { int32_t jbe_off = (int32_t)(cg->code_size - (i8mv_jbe_pos + 6));
+              memcpy(cg->code + i8mv_jbe_pos + 2, &jbe_off, 4); }
+
             b = BUF(cg); b[0]=0x49; b[1]=0x89; b[2]=0xCA; EMIT(cg, 3);  /* mov r10, rcx */
             b = BUF(cg); b[0]=0x49; b[1]=0x83; b[2]=0xE2; b[3]=0xF8; EMIT(cg, 4); /* and r10, -8 */
 

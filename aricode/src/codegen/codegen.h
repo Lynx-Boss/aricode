@@ -22,7 +22,12 @@
 /*  Code buffer                                                       */
 /* ------------------------------------------------------------------ */
 
-#define CODEGEN_MAX_CODE   (512 * 1024)  /* 512 KiB max code size    */
+/* Max code/data buffer.  Large enough to hold both the compiled .text
+ * and any inline payloads emitted by embed_file (e.g. CNN weight blobs
+ * baked into a deploy binary).  16 MiB covers small models with room
+ * to spare; the buffer is heap-allocated so this number doesn't show
+ * up in CodegenState's stack footprint. */
+#define CODEGEN_MAX_CODE   (16 * 1024 * 1024)
 #define CODEGEN_MAX_FUNCS  256           /* max function definitions  */
 #define CODEGEN_MAX_VARS   256           /* max locals per function   */
 
@@ -66,8 +71,9 @@ typedef struct {
 /* ------------------------------------------------------------------ */
 
 typedef struct {
-    /* Output code buffer */
-    uint8_t     code[CODEGEN_MAX_CODE];
+    /* Output code buffer.  Heap-allocated by codegen_init() so the
+     * struct itself stays small enough for stack allocation. */
+    uint8_t    *code;
     size_t      code_size;
 
     /* Function table */

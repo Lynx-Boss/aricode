@@ -2011,6 +2011,22 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
 
             int pn; uint8_t *b;
 
+            /* Pre-check: the JMP + length prefix + raw bytes + trailing
+             * LEA must all fit in the code buffer.  Without this an
+             * oversize embed_file walks past `cg->code` and segfaults
+             * before EMIT's bounds check has a chance to fire. */
+            size_t needed = (size_t)5 + 8 + (size_t)fsize + 7;
+            if (cg->code_size + needed > CODEGEN_MAX_CODE) {
+                free(blob);
+                cg_error(cg, "embed_file: '%s' (%ld bytes) overflows the "
+                             "code buffer (%zu free of %d).  Bump "
+                             "CODEGEN_MAX_CODE in src/codegen/codegen.h.",
+                         path, fsize,
+                         (size_t)CODEGEN_MAX_CODE - cg->code_size,
+                         CODEGEN_MAX_CODE);
+                return 1;
+            }
+
             /* jmp rel32 over the blob (placeholder, patched below). */
             size_t jmp_pos = cg->code_size;
             pn = emit_jmp(BUF(cg), 0); EMIT(cg, pn);

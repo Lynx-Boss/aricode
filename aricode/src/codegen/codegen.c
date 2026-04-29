@@ -2788,6 +2788,13 @@ static int patch_calls(CodegenState *cg) {
 
 void codegen_init(CodegenState *cg) {
     memset(cg, 0, sizeof(CodegenState));
+    cg->code = (uint8_t *)malloc(CODEGEN_MAX_CODE);
+    if (!cg->code) {
+        fprintf(stderr,
+                "codegen_init: malloc(%d bytes) failed for the code buffer.\n",
+                CODEGEN_MAX_CODE);
+        exit(1);
+    }
 }
 
 int codegen_generate(CodegenState *cg, const ASTNode *ast) {

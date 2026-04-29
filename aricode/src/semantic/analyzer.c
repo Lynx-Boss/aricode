@@ -310,6 +310,7 @@ static AriType *builtin_return_type(const char *name) {
         {"arr_f32_exp",        TYPE_I32},
         {"arr_f32_softmax",    TYPE_I32},
         {"arr_i8_matvec_f32",  TYPE_I32},
+        {"arr_i8_conv2d_3x3_p1", TYPE_I32},
         {"arr_f32_transpose",  TYPE_I32},
         {"arr_f32_layernorm",  TYPE_I32},
         {"embed_file",         TYPE_I32},

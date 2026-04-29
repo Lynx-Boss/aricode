@@ -5475,6 +5475,317 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             return 1;
         }
 
+        if (strcmp(name, "arr_i8_conv2d_3x3_p1") == 0 && argc == 6) {
+            /* Quantised cousin of arr_f32_conv2d_3x3_p1.
+             *
+             *   arr_i8_conv2d_3x3_p1(padded, W_i8, bias, output, C_out, scale)
+             *
+             * Same algorithm as the f32 version — pre-broadcast 9 weights
+             * into ymm0..ymm8 once per output channel, then run the 28-
+             * row × (3 ymm + 1 xmm) × 9-FMA inner stack.  The only
+             * differences:
+             *
+             *   - Weight stride is 9 bytes per channel (8 i8 + 1 i8) not
+             *     9 × 4 = 36 bytes.
+             *   - Each weight load is one `movsx eax, byte ptr [r11+k]`
+             *     (sign-extend i8 → i32) plus `cvtsi2ss / mulss / vbroadcastss`
+             *     to apply the per-tensor scale and broadcast to a ymm.
+             *   - Scale is f64 in (typical caller) and demoted to f32 once
+             *     before the channel loop into xmm15; per-weight `mulss`
+             *     reads from xmm15.
+             *
+             * Bias stays f32.  Output stays f32.  The conv builtin's
+             * accuracy floor is set by the i8 weights themselves
+             * (post-quantisation), not by anything in the kernel.
+             *
+             * The 9-broadcast cost rises from ~9 instructions to ~36, but
+             * it's amortised over 28 × 28 × 9 = 7056 FMAs per channel —
+             * single-digit µs per channel either way.
+             */
+            emit_expression(cg, node->children[6]); /* scale (f64 bits → RAX) */
+            int pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
+            emit_expression(cg, node->children[5]); /* C_out */
+            pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
+            emit_expression(cg, node->children[4]); /* output */
+            pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
+            emit_expression(cg, node->children[3]); /* bias */
+            pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
+            emit_expression(cg, node->children[2]); /* W_i8 */
+            pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
+            emit_expression(cg, node->children[1]); /* padded → RAX */
+            uint8_t *b;
+
+            pn = emit_push(BUF(cg), REG_RBX); EMIT(cg, pn);
+            b = BUF(cg); b[0]=0x41; b[1]=0x54; EMIT(cg, 2);  /* push r12 */
+            b = BUF(cg); b[0]=0x41; b[1]=0x55; EMIT(cg, 2);  /* push r13 */
+            b = BUF(cg); b[0]=0x41; b[1]=0x56; EMIT(cg, 2);  /* push r14 */
+
+            /* Stack now (top → bottom):
+             *   [rsp+ 0] r14    [rsp+32] W_i8
+             *   [rsp+ 8] r13    [rsp+40] bias
+             *   [rsp+16] r12    [rsp+48] output
+             *   [rsp+24] rbx    [rsp+56] C_out
+             *                   [rsp+64] scale (f64)
+             */
+            pn = emit_mov_reg_reg(BUF(cg), REG_RDI, REG_RAX); EMIT(cg, pn); /* rdi = padded */
+            b = BUF(cg); b[0]=0x4C; b[1]=0x8B; b[2]=0x44; b[3]=0x24; b[4]=0x20; EMIT(cg, 5); /* mov r8,  [rsp+32] W_i8 */
+            b = BUF(cg); b[0]=0x48; b[1]=0x8B; b[2]=0x5C; b[3]=0x24; b[4]=0x28; EMIT(cg, 5); /* mov rbx, [rsp+40] bias */
+            b = BUF(cg); b[0]=0x4C; b[1]=0x8B; b[2]=0x4C; b[3]=0x24; b[4]=0x30; EMIT(cg, 5); /* mov r9,  [rsp+48] output */
+            b = BUF(cg); b[0]=0x4C; b[1]=0x8B; b[2]=0x54; b[3]=0x24; b[4]=0x38; EMIT(cg, 5); /* mov r10, [rsp+56] C_out */
+
+            /* Load scale_f64 from [rsp+64], demote to f32 in xmm15.
+             *   mov rax, [rsp+64]            48 8B 44 24 40
+             *   movq xmm15, rax              66 4C 0F 6E F8
+             *     REX.W=1, REX.R=1 (target xmm15 high), REX.B=0 (rax low) → 0x4C
+             *     ModRM 11_111_000 = 0xF8  (reg=15&7=7, r/m=rax&7=0)
+             *   cvtsd2ss xmm15, xmm15        F2 45 0F 5A FF
+             *
+             * Earlier 0x49 (REX.WB) had REX.B set instead of REX.R, so the
+             * decoder turned it into `movq xmm7, r8` — scale ended up in
+             * xmm7 (clobbered by later code) and xmm15 stayed at whatever
+             * the caller had, eventually multiplying every weight by 0
+             * and the conv produced bias-only outputs. */
+            b = BUF(cg); b[0]=0x48; b[1]=0x8B; b[2]=0x44; b[3]=0x24; b[4]=0x40; EMIT(cg, 5);
+            b = BUF(cg); b[0]=0x66; b[1]=0x4C; b[2]=0x0F; b[3]=0x6E; b[4]=0xF8; EMIT(cg, 5);
+            b = BUF(cg); b[0]=0xF2; b[1]=0x45; b[2]=0x0F; b[3]=0x5A; b[4]=0xFF; EMIT(cg, 5);
+
+            pn = emit_xor_reg_reg(BUF(cg), REG_RAX, REG_RAX); EMIT(cg, pn);
+
+            /* ═══ Channel loop ═══ */
+            size_t channel_loop_start = cg->code_size;
+            b = BUF(cg); b[0]=0x4C; b[1]=0x39; b[2]=0xD0; EMIT(cg, 3);
+            size_t jge_done_pos = cg->code_size;
+            b = BUF(cg); b[0]=0x0F; b[1]=0x8D; b[2]=0; b[3]=0; b[4]=0; b[5]=0; EMIT(cg, 6);
+
+            /* r11 = c * 9 + W_i8_base   (1 byte per int8 weight) */
+            b = BUF(cg); b[0]=0x49; b[1]=0x89; b[2]=0xC3; EMIT(cg, 3);              /* mov r11, rax */
+            b = BUF(cg); b[0]=0x4D; b[1]=0x6B; b[2]=0xDB; b[3]=0x09; EMIT(cg, 4);    /* imul r11, r11, 9 */
+            b = BUF(cg); b[0]=0x4D; b[1]=0x01; b[2]=0xC3; EMIT(cg, 3);              /* add r11, r8 */
+
+            /* Broadcast (scale · W_i8[c, k]) into ymm0..ymm8.
+             * For each k:
+             *   movsx ecx, byte ptr [r11 + k]   ; 41 0F BE 4B kk   (REX.B for r11)
+             *   cvtsi2ss xmm_k, ecx              ; F3 [REX.R if k>=8] 0F 2A
+             *   mulss xmm_k, xmm15               ; F3 [REX.RB] 0F 59
+             *   vbroadcastss ymm_k, xmm_k        ; C4 [byte1] 7D 18 modrm
+             *
+             * All target ymm/xmm 0..8 — ymm8 needs REX.R/REX.B encoding,
+             * the rest are low (0..7).
+             */
+            for (int k = 0; k < 9; k++) {
+                int dst = k;                /* ymm0..ymm8 */
+                int dst_lo = dst & 7;
+                int dst_hi = (dst >= 8) ? 1 : 0;
+                /* movsx ecx, byte ptr [r11 + k]
+                 *   REX.B = 1 (r11 high) → 0x41
+                 *   opcode 0F BE /r
+                 *   ModRM mod=01 reg=001 (ecx) r/m=011 (r11&7) → 0x4B
+                 *   disp8 = k */
+                b = BUF(cg);
+                b[0] = 0x41; b[1] = 0x0F; b[2] = 0xBE; b[3] = 0x4B; b[4] = (uint8_t)k;
+                EMIT(cg, 5);
+
+                /* cvtsi2ss xmm_dst, ecx
+                 *   F3 [REX.R? 0x44 : 0] 0F 2A modrm
+                 *   ModRM mod=11 reg=dst&7 r/m=001 (ecx) */
+                b = BUF(cg); b[0] = 0xF3;
+                int off = 1;
+                if (dst_hi) { b[off++] = 0x44; }   /* REX.R */
+                b[off++] = 0x0F; b[off++] = 0x2A;
+                b[off++] = (uint8_t)((3 << 6) | (dst_lo << 3) | 1);
+                EMIT(cg, off);
+
+                /* mulss xmm_dst, xmm15
+                 *   F3 [REX.RB] 0F 59 modrm
+                 *   REX needed because xmm15 is high; if dst is low, just
+                 *   REX.B = 1 → 0x41; if dst is high, REX.RB → 0x45. */
+                b = BUF(cg); b[0] = 0xF3;
+                off = 1;
+                if (dst_hi) { b[off++] = 0x45; }
+                else        { b[off++] = 0x41; }
+                b[off++] = 0x0F; b[off++] = 0x59;
+                /* ModRM mod=11 reg=dst&7 r/m=15&7=7 → 0xC0 | (dst&7)<<3 | 7 */
+                b[off++] = (uint8_t)((3 << 6) | (dst_lo << 3) | 7);
+                EMIT(cg, off);
+
+                /* vbroadcastss ymm_dst, xmm_dst
+                 *   3-byte VEX:
+                 *     byte1: R~ X~ B~ mmmmm
+                 *       R~ = !dst_hi (target reg)
+                 *       X~ = 1
+                 *       B~ = !dst_hi (source xmm)
+                 *     byte2: 0x7D
+                 *     opcode 0x18
+                 *     ModRM 11_dst&7_dst&7 */
+                int Rb = dst_hi ? 0 : 1;
+                uint8_t byte1 = (uint8_t)((Rb << 7) | (1 << 6) | (Rb << 5) | 2);
+                b = BUF(cg);
+                b[0] = 0xC4; b[1] = byte1; b[2] = 0x7D; b[3] = 0x18;
+                b[4] = (uint8_t)((3 << 6) | (dst_lo << 3) | dst_lo);
+                EMIT(cg, 5);
+            }
+
+            /* Broadcast bias[c] into ymm9 (same encoding as the f32 conv). */
+            b = BUF(cg);
+            b[0]=0xC4; b[1]=0x62; b[2]=0x7D; b[3]=0x18;
+            b[4]=0x0C; b[5]=0x83;
+            EMIT(cg, 6);
+
+            /* output_c_base: rsi = r9 + c*3136. */
+            b = BUF(cg); b[0]=0x48; b[1]=0x89; b[2]=0xC6; EMIT(cg, 3);
+            b = BUF(cg); b[0]=0x48; b[1]=0x69; b[2]=0xF6;
+            int32_t k3136 = 3136;
+            memcpy(b+3, &k3136, 4); EMIT(cg, 7);
+            b = BUF(cg); b[0]=0x4C; b[1]=0x01; b[2]=0xCE; EMIT(cg, 3);
+
+            pn = emit_xor_reg_reg(BUF(cg), REG_RCX, REG_RCX); EMIT(cg, pn);
+
+            /* From here on the body is identical to arr_f32_conv2d_3x3_p1
+             * (after weight broadcasts, the kernel doesn't care that the
+             * weights came from int8 — they're plain f32 in ymm0..ymm8). */
+
+            /* ═══ Y loop ═══ */
+            size_t y_loop_start = cg->code_size;
+            b = BUF(cg); b[0]=0x48; b[1]=0x83; b[2]=0xF9; b[3]=28; EMIT(cg, 4);
+            size_t jge_next_c_pos = cg->code_size;
+            b = BUF(cg); b[0]=0x0F; b[1]=0x8D; b[2]=0; b[3]=0; b[4]=0; b[5]=0; EMIT(cg, 6);
+
+            b = BUF(cg); b[0]=0x49; b[1]=0x89; b[2]=0xCC; EMIT(cg, 3);
+            b = BUF(cg); b[0]=0x4D; b[1]=0x6B; b[2]=0xE4; b[3]=0x78; EMIT(cg, 4);
+            b = BUF(cg); b[0]=0x49; b[1]=0x01; b[2]=0xFC; EMIT(cg, 3);
+            b = BUF(cg); b[0]=0x4D; b[1]=0x8D; b[2]=0x6C; b[3]=0x24; b[4]=0x78; EMIT(cg, 5);
+            b = BUF(cg); b[0]=0x4D; b[1]=0x8D; b[2]=0xB4; b[3]=0x24;
+            int32_t d240 = 240;
+            memcpy(b+4, &d240, 4);
+            EMIT(cg, 8);
+
+            b = BUF(cg); b[0]=0x49; b[1]=0x89; b[2]=0xCB; EMIT(cg, 3);
+            b = BUF(cg); b[0]=0x4D; b[1]=0x6B; b[2]=0xDB; b[3]=0x70; EMIT(cg, 4);
+            b = BUF(cg); b[0]=0x49; b[1]=0x01; b[2]=0xF3; EMIT(cg, 3);
+
+            pn = emit_xor_reg_reg(BUF(cg), REG_RDX, REG_RDX); EMIT(cg, pn);
+
+            /* X vec loop (3 iters of 8 lanes). */
+            size_t x_loop_start = cg->code_size;
+            b = BUF(cg); b[0]=0x48; b[1]=0x83; b[2]=0xFA; b[3]=0x60; EMIT(cg, 4);
+            size_t jge_post_vec_pos = cg->code_size;
+            b = BUF(cg); b[0]=0x0F; b[1]=0x8D; b[2]=0; b[3]=0; b[4]=0; b[5]=0; EMIT(cg, 6);
+
+            cg_vmovapd(cg, 10, 9);
+
+            #define EMIT_LOAD_F32_I8(base_lo, disp) do {                       \
+                b = BUF(cg);                                                    \
+                b[0] = 0xC4; b[1] = 0x41; b[2] = 0x7C; b[3] = 0x10;             \
+                b[4] = 0x5C;                                                    \
+                b[5] = 0x10 | (base_lo);                                        \
+                b[6] = (uint8_t)(disp);                                         \
+                EMIT(cg, 7);                                                    \
+            } while (0)
+
+            EMIT_LOAD_F32_I8(4, 0);  cg_vfmadd231ps(cg, 10, 11, 0);
+            EMIT_LOAD_F32_I8(4, 4);  cg_vfmadd231ps(cg, 10, 11, 1);
+            EMIT_LOAD_F32_I8(4, 8);  cg_vfmadd231ps(cg, 10, 11, 2);
+            EMIT_LOAD_F32_I8(5, 0);  cg_vfmadd231ps(cg, 10, 11, 3);
+            EMIT_LOAD_F32_I8(5, 4);  cg_vfmadd231ps(cg, 10, 11, 4);
+            EMIT_LOAD_F32_I8(5, 8);  cg_vfmadd231ps(cg, 10, 11, 5);
+            EMIT_LOAD_F32_I8(6, 0);  cg_vfmadd231ps(cg, 10, 11, 6);
+            EMIT_LOAD_F32_I8(6, 4);  cg_vfmadd231ps(cg, 10, 11, 7);
+            EMIT_LOAD_F32_I8(6, 8);  cg_vfmadd231ps(cg, 10, 11, 8);
+
+            #undef EMIT_LOAD_F32_I8
+
+            /* vmovups [r11 + rdx], ymm10 */
+            b = BUF(cg);
+            b[0] = 0xC4; b[1] = 0x41; b[2] = 0x7C; b[3] = 0x11;
+            b[4] = 0x14;
+            b[5] = 0x13;
+            EMIT(cg, 6);
+
+            b = BUF(cg); b[0]=0x48; b[1]=0x83; b[2]=0xC2; b[3]=0x20; EMIT(cg, 4);
+            {
+                int32_t back = (int32_t)((int64_t)x_loop_start - (int64_t)(cg->code_size + 5));
+                b = BUF(cg); b[0]=0xE9;
+                memcpy(b+1, &back, 4);
+                EMIT(cg, 5);
+            }
+
+            {
+                int32_t off = (int32_t)((int64_t)cg->code_size - (int64_t)(jge_post_vec_pos + 6));
+                memcpy(cg->code + jge_post_vec_pos + 2, &off, 4);
+            }
+
+            /* X tail (4-lane xmm) — same as f32 conv. */
+            cg_vex3(cg, 10, 0, 9, 0, 0, 1, 1);
+            b = BUF(cg); b[0]=0x28; b[1]=0xC0 | ((10&7)<<3) | (9&7); EMIT(cg, 2);
+
+            #define EMIT_LOAD_F32_XMM_I8(base_lo, disp) do {                   \
+                int32_t d = (int32_t)(disp);                                    \
+                b = BUF(cg);                                                    \
+                b[0] = 0xC4; b[1] = 0x41; b[2] = 0x78; b[3] = 0x10;             \
+                b[4] = 0x80 | ((11 & 7) << 3) | 4;                              \
+                b[5] = 0x10 | (base_lo);                                        \
+                memcpy(b + 6, &d, 4);                                           \
+                EMIT(cg, 10);                                                   \
+            } while (0)
+
+            EMIT_LOAD_F32_XMM_I8(4, 0);  cg_vfmadd231ps_xmm(cg, 10, 11, 0);
+            EMIT_LOAD_F32_XMM_I8(4, 4);  cg_vfmadd231ps_xmm(cg, 10, 11, 1);
+            EMIT_LOAD_F32_XMM_I8(4, 8);  cg_vfmadd231ps_xmm(cg, 10, 11, 2);
+            EMIT_LOAD_F32_XMM_I8(5, 0);  cg_vfmadd231ps_xmm(cg, 10, 11, 3);
+            EMIT_LOAD_F32_XMM_I8(5, 4);  cg_vfmadd231ps_xmm(cg, 10, 11, 4);
+            EMIT_LOAD_F32_XMM_I8(5, 8);  cg_vfmadd231ps_xmm(cg, 10, 11, 5);
+            EMIT_LOAD_F32_XMM_I8(6, 0);  cg_vfmadd231ps_xmm(cg, 10, 11, 6);
+            EMIT_LOAD_F32_XMM_I8(6, 4);  cg_vfmadd231ps_xmm(cg, 10, 11, 7);
+            EMIT_LOAD_F32_XMM_I8(6, 8);  cg_vfmadd231ps_xmm(cg, 10, 11, 8);
+
+            #undef EMIT_LOAD_F32_XMM_I8
+
+            {
+                int32_t d96 = 96;
+                b = BUF(cg);
+                b[0] = 0xC4; b[1] = 0x41; b[2] = 0x78; b[3] = 0x11;
+                b[4] = 0x80 | ((10 & 7) << 3) | 3;
+                memcpy(b + 5, &d96, 4);
+                EMIT(cg, 9);
+            }
+
+            b = BUF(cg); b[0]=0x48; b[1]=0xFF; b[2]=0xC1; EMIT(cg, 3);
+            {
+                int32_t back = (int32_t)((int64_t)y_loop_start - (int64_t)(cg->code_size + 5));
+                b = BUF(cg); b[0]=0xE9;
+                memcpy(b+1, &back, 4);
+                EMIT(cg, 5);
+            }
+
+            {
+                int32_t off = (int32_t)((int64_t)cg->code_size - (int64_t)(jge_next_c_pos + 6));
+                memcpy(cg->code + jge_next_c_pos + 2, &off, 4);
+            }
+
+            b = BUF(cg); b[0]=0x48; b[1]=0xFF; b[2]=0xC0; EMIT(cg, 3);
+            {
+                int32_t back = (int32_t)((int64_t)channel_loop_start - (int64_t)(cg->code_size + 5));
+                b = BUF(cg); b[0]=0xE9;
+                memcpy(b+1, &back, 4);
+                EMIT(cg, 5);
+            }
+
+            {
+                int32_t off = (int32_t)((int64_t)cg->code_size - (int64_t)(jge_done_pos + 6));
+                memcpy(cg->code + jge_done_pos + 2, &off, 4);
+            }
+
+            /* Epilog: vzeroupper, restore callee-saved, drop the 5 stacked args. */
+            b = BUF(cg); b[0]=0xC5; b[1]=0xF8; b[2]=0x77; EMIT(cg, 3);
+            b = BUF(cg); b[0]=0x41; b[1]=0x5E; EMIT(cg, 2);
+            b = BUF(cg); b[0]=0x41; b[1]=0x5D; EMIT(cg, 2);
+            b = BUF(cg); b[0]=0x41; b[1]=0x5C; EMIT(cg, 2);
+            pn = emit_pop(BUF(cg), REG_RBX); EMIT(cg, pn);
+            b = BUF(cg); b[0]=0x48; b[1]=0x83; b[2]=0xC4; b[3]=0x28; EMIT(cg, 4); /* add rsp, 40 (5 args) */
+            pn = emit_xor_reg_reg(BUF(cg), REG_RAX, REG_RAX); EMIT(cg, pn);
+            return 1;
+        }
+
         if (strcmp(name, "arr_f64_conv2d_3x3_p1_multi") == 0 && argc == 6) {
             /* Multi-channel direct convolution:
              *   Input    : C_in channels of 28×28, pre-padded to 30×30 each.

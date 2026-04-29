@@ -1670,6 +1670,56 @@ fn main() -> i32 {
 EOF
 run_test "arr_i8_matvec_f32" /tmp/edge_i8mv.ari "I8MV_OK" "arr_i8_matvec_f32: vec body (n=8) + scalar tail (n=10) match analytic answer"
 
+# #53  arr_i8_conv2d_3x3_p1: int8 conv must match f32 conv on
+# dequantised weights bit-for-bit.  This is the test that caught a
+# typo in the movq xmm15, rax encoding (REX byte was 0x49 not 0x4C —
+# scale ended up in xmm7 instead, and every weight got multiplied by
+# 0, producing bias-only output).
+/tmp/aricode_venv/bin/python -c "
+import struct, numpy as np
+np.random.seed(7)
+inp = np.random.uniform(-1, 1, (28, 28)).astype(np.float32)
+padded = np.zeros((30, 30), dtype=np.float32)
+padded[1:29, 1:29] = inp
+W = np.random.uniform(-1, 1, (4, 9)).astype(np.float32)
+scale = float(np.abs(W).max() / 127)
+W_i8 = np.round(W / scale).clip(-128, 127).astype(np.int8)
+W_dq = (W_i8.astype(np.float32) * scale)
+b = np.array([0.1, -0.2, 0.3, -0.4], dtype=np.float32)
+open('/tmp/edge_i8c_pad.f32','wb').write(padded.tobytes())
+open('/tmp/edge_i8c_w.i8','wb').write(W_i8.tobytes())
+open('/tmp/edge_i8c_wf.f32','wb').write(W_dq.tobytes())
+open('/tmp/edge_i8c_b.f32','wb').write(b.tobytes())
+print(repr(scale))
+" > /tmp/edge_i8c_scale.txt
+SCALE_LITERAL=$(cat /tmp/edge_i8c_scale.txt)
+cat > /tmp/edge_i8c.ari <<EOF
+fn main() -> i32 {
+    let pad: i32 = embed_file("/tmp/edge_i8c_pad.f32");
+    let Wq: i32 = embed_file_bytes("/tmp/edge_i8c_w.i8");
+    let Wf: i32 = embed_file("/tmp/edge_i8c_wf.f32");
+    let bs: i32 = embed_file("/tmp/edge_i8c_b.f32");
+    let scale: f64 = ${SCALE_LITERAL};
+
+    let oi: i32 = arr_f32_new(4 * 28 * 28);
+    let of: i32 = arr_f32_new(4 * 28 * 28);
+    arr_i8_conv2d_3x3_p1(pad, Wq, bs, oi, 4, scale);
+    arr_f32_conv2d_3x3_p1(pad, Wf, bs, of, 4);
+
+    let max_d: f64 = 0.0;
+    let i: i32 = 0;
+    while (i < 4 * 28 * 28) {
+        let d: f64 = arr_f32_get(oi, i) - arr_f32_get(of, i);
+        if (d < 0.0) { d = 0.0 - d; }
+        if (d > max_d) { max_d = d; }
+        i = i + 1;
+    }
+    if (max_d < 0.000001) { print_str("I8CONV_OK"); }
+    return 0;
+}
+EOF
+run_test "arr_i8_conv2d_3x3_p1" /tmp/edge_i8c.ari "I8CONV_OK" "arr_i8_conv2d_3x3_p1: int8 conv matches f32 conv on dequantised weights bit-for-bit (3136 outputs, max diff < 1e-6)"
+
 # ────────────────────────────────────────────────────────────────────
 
 echo ""

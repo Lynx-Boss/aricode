@@ -2059,6 +2059,98 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             return 1;
         }
 
+        if (strcmp(name, "embed_file_bytes") == 0 && argc == 1) {
+            /* embed_file_bytes("path"): like embed_file, but the [i64 length]
+             * prefix is the *byte count* of the file rather than the f32
+             * element count.  The returned pointer is byte-addressable via
+             * byte_at(buf, i); arr_len(buf) returns the byte count.  Used
+             * for int8-quantised weights, raw lookup tables, vocab blobs,
+             * etc. — anything that doesn't fit the f32-per-element model.
+             *
+             * Layout emitted (same JMP-over-data + RIP-relative LEA shape
+             * as embed_file):
+             *
+             *     jmp .past_blob          ; 5 bytes
+             *   .blob:
+             *     .qword n_bytes          ; 8 bytes
+             *     .data raw_bytes         ; file_size bytes
+             *   .past_blob:
+             *     lea rax, [.blob + 8]    ; 7 bytes
+             *
+             * No alignment requirement on file size.
+             */
+            ASTNode *arg = node->children[1];
+            if (!arg || arg->type != NODE_STRING_LITERAL || !arg->string_val) {
+                cg_error(cg, "embed_file_bytes requires a string literal at %d:%d",
+                         node->line, node->col);
+                return 1;
+            }
+            const char *path = arg->string_val;
+
+            FILE *f = fopen(path, "rb");
+            if (!f) {
+                cg_error(cg, "embed_file_bytes: cannot open '%s' at %d:%d",
+                         path, node->line, node->col);
+                return 1;
+            }
+            fseek(f, 0, SEEK_END);
+            long fsize = ftell(f);
+            fseek(f, 0, SEEK_SET);
+            if (fsize < 0) {
+                fclose(f);
+                cg_error(cg, "embed_file_bytes: ftell failed for '%s'", path);
+                return 1;
+            }
+            int64_t n_bytes = (int64_t)fsize;
+
+            uint8_t *blob = (uint8_t *)malloc((size_t)fsize);
+            if (!blob || fread(blob, 1, (size_t)fsize, f) != (size_t)fsize) {
+                if (blob) free(blob);
+                fclose(f);
+                cg_error(cg, "embed_file_bytes: read failed for '%s'", path);
+                return 1;
+            }
+            fclose(f);
+
+            int pn; uint8_t *b;
+
+            size_t needed = (size_t)5 + 8 + (size_t)fsize + 7;
+            if (cg->code_size + needed > CODEGEN_MAX_CODE) {
+                free(blob);
+                cg_error(cg, "embed_file_bytes: '%s' (%ld bytes) overflows the "
+                             "code buffer (%zu free of %d).  Bump "
+                             "CODEGEN_MAX_CODE in src/codegen/codegen.h.",
+                         path, fsize,
+                         (size_t)CODEGEN_MAX_CODE - cg->code_size,
+                         CODEGEN_MAX_CODE);
+                return 1;
+            }
+
+            size_t jmp_pos = cg->code_size;
+            pn = emit_jmp(BUF(cg), 0); EMIT(cg, pn);
+
+            size_t blob_pos = cg->code_size;
+            memcpy(BUF(cg), &n_bytes, 8);
+            cg->code_size += 8;
+            memcpy(BUF(cg), blob, (size_t)fsize);
+            cg->code_size += (size_t)fsize;
+            free(blob);
+
+            int32_t jmp_off = (int32_t)(cg->code_size - (jmp_pos + 5));
+            memcpy(cg->code + jmp_pos + 1, &jmp_off, 4);
+
+            int64_t target = (int64_t)(blob_pos + 8);
+            int64_t lea_end = (int64_t)(cg->code_size + 7);
+            int32_t lea_off = (int32_t)(target - lea_end);
+            b = BUF(cg);
+            b[0] = 0x48;
+            b[1] = 0x8D;
+            b[2] = 0x05;
+            memcpy(b + 3, &lea_off, 4);
+            EMIT(cg, 7);
+            return 1;
+        }
+
         if (strcmp(name, "str_len") == 0 && argc == 1) {
             emit_expression(cg, node->children[1]); /* base -> RAX */
             /* length at [rax - 8] */

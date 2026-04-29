@@ -1610,6 +1610,25 @@ fn main() -> i32 {
 EOF
 run_test "embed_file" /tmp/edge_embed.ari "EMBED_OK" "embed_file: 12 f32 baked into .text round-trip via arr_len/get/sum"
 
+# #51  embed_file_bytes: arbitrary bytes baked into .text, length
+# prefix = byte count.  Used by aricode-pack's int8 quantisation path.
+python3 -c "open('/tmp/edge_embed_b.bin','wb').write(bytes([0,1,2,127,128,255,7]))"
+cat > /tmp/edge_embed_b.ari << 'EOF'
+fn main() -> i32 {
+    let buf: i32 = embed_file_bytes("/tmp/edge_embed_b.bin");
+    let ok: i32 = 1;
+    if (arr_len(buf) != 7)         { ok = 0; }
+    if (byte_at(buf, 0)   != 0)    { ok = 0; }
+    if (byte_at(buf, 3)   != 127)  { ok = 0; }
+    if (byte_at(buf, 4)   != 128)  { ok = 0; }   // unsigned read
+    if (byte_at(buf, 5)   != 255)  { ok = 0; }
+    if (byte_at(buf, 6)   != 7)    { ok = 0; }
+    if (ok == 1) { print_str("EMBED_BYTES_OK"); }
+    return 0;
+}
+EOF
+run_test "embed_file_bytes" /tmp/edge_embed_b.ari "EMBED_BYTES_OK" "embed_file_bytes: 7 raw bytes (incl. 0x80, 0xFF) baked into .text round-trip"
+
 # ────────────────────────────────────────────────────────────────────
 
 echo ""

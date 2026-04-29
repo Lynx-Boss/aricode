@@ -1801,6 +1801,59 @@ run_test_aborts_stderr "i8conv_oob_check" /tmp/edge_i8c_oob.ari \
 
 # ────────────────────────────────────────────────────────────────────
 
+# #70  arr_f32_conv2d_3x3_p1_multi: multi-channel f32 conv must match
+# the numpy ground truth bit-for-bit (within 1e-5).  Replaces the user-
+# fn channel loop the packer emits for C_in > 1; this test locks in
+# the algebraic equivalence and the per-row tile structure (3 ymm + 1
+# xmm tail) under the load-modify-store accumulation pattern.
+/tmp/aricode_venv/bin/python -c "
+import numpy as np
+np.random.seed(11)
+C_in, C_out = 3, 4
+inp = np.random.uniform(-1, 1, (C_in, 28, 28)).astype(np.float32)
+padded = np.zeros((C_in, 30, 30), dtype=np.float32)
+padded[:, 1:29, 1:29] = inp
+W = np.random.uniform(-1, 1, (C_out, C_in, 3, 3)).astype(np.float32)
+b = np.random.uniform(-0.5, 0.5, (C_out,)).astype(np.float32)
+# Reference: explicit 3x3 conv via einsum unfold
+out = np.zeros((C_out, 28, 28), dtype=np.float32)
+for co in range(C_out):
+    out[co] += b[co]
+    for ci in range(C_in):
+        for ky in range(3):
+            for kx in range(3):
+                out[co] += W[co, ci, ky, kx] * padded[ci, ky:ky+28, kx:kx+28]
+open('/tmp/edge_mcv_pad.f32', 'wb').write(padded.tobytes())
+open('/tmp/edge_mcv_w.f32',   'wb').write(W.tobytes())
+open('/tmp/edge_mcv_b.f32',   'wb').write(b.tobytes())
+open('/tmp/edge_mcv_ref.f32', 'wb').write(out.tobytes())
+"
+cat > /tmp/edge_mcv.ari <<EOF
+fn main() -> i32 {
+    let pad: i32 = embed_file("/tmp/edge_mcv_pad.f32");
+    let W:   i32 = embed_file("/tmp/edge_mcv_w.f32");
+    let bs:  i32 = embed_file("/tmp/edge_mcv_b.f32");
+    let ref: i32 = embed_file("/tmp/edge_mcv_ref.f32");
+    let out: i32 = arr_f32_new(4 * 28 * 28);
+    arr_f32_conv2d_3x3_p1_multi(pad, 3, W, bs, out, 4);
+
+    let max_d: f64 = 0.0;
+    let i: i32 = 0;
+    while (i < 4 * 28 * 28) {
+        let d: f64 = arr_f32_get(out, i) - arr_f32_get(ref, i);
+        if (d < 0.0) { d = 0.0 - d; }
+        if (d > max_d) { max_d = d; }
+        i = i + 1;
+    }
+    if (max_d < 0.00001) { print_str("MCV_OK"); }
+    return 0;
+}
+EOF
+run_test "arr_f32_conv2d_3x3_p1_multi" /tmp/edge_mcv.ari "MCV_OK" \
+    "arr_f32_conv2d_3x3_p1_multi: C_in=3, C_out=4 matches numpy reference within 1e-5 (3136 outputs/channel)"
+
+# ────────────────────────────────────────────────────────────────────
+
 echo ""
 echo -e "${BOLD}${CYAN}============================================================${RESET}"
 printf "  Total:  ${BOLD}%d${RESET}\n" "$TOTAL"

@@ -306,6 +306,7 @@ static AriType *builtin_return_type(const char *name) {
         {"arr_f32_copy_slice", TYPE_I32},
         {"arr_f32_adam_apply", TYPE_I32},
         {"arr_f32_conv2d_3x3_p1", TYPE_I32},
+        {"arr_f32_conv2d_3x3_p1_multi", TYPE_I32},
         {"arr_f32_mul",        TYPE_I32},
         {"arr_f32_exp",        TYPE_I32},
         {"arr_f32_softmax",    TYPE_I32},

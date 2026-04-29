@@ -1876,6 +1876,60 @@ EOF
 run_test "arr_f32_conv2d_3x3_p1_multi" /tmp/edge_mcv.ari "MCV_OK" \
     "arr_f32_conv2d_3x3_p1_multi: C_in=3, C_out=4 matches numpy reference within 1e-5 (3136 outputs/channel)"
 
+# #71  arr_i8_conv2d_3x3_p1_multi: int8 multi-channel conv must match
+# the f32 multi-channel conv on dequantised weights bit-for-bit.
+# Same kind of equivalence check as #67 for the single-channel int8
+# variant.  Locks in: weight base offset (c_out*C_in + c_in)*9, the
+# i8 → f32 dequant chain (movsx/cvtsi2ss/mulss/vbroadcastss), the
+# C_in derivation from the W byte-length header, and the load-modify-
+# store accumulation across the C_in dimension.
+/tmp/aricode_venv/bin/python -c "
+import numpy as np
+np.random.seed(13)
+C_in, C_out = 3, 4
+inp = np.random.uniform(-1, 1, (C_in, 28, 28)).astype(np.float32)
+padded = np.zeros((C_in, 30, 30), dtype=np.float32)
+padded[:, 1:29, 1:29] = inp
+W = np.random.uniform(-1, 1, (C_out, C_in, 3, 3)).astype(np.float32)
+scale = float(np.abs(W).max() / 127)
+W_i8 = np.round(W / scale).clip(-128, 127).astype(np.int8)
+W_dq = (W_i8.astype(np.float32) * scale)
+b = np.random.uniform(-0.5, 0.5, (C_out,)).astype(np.float32)
+open('/tmp/edge_i8mcv_pad.f32', 'wb').write(padded.tobytes())
+open('/tmp/edge_i8mcv_w.i8',    'wb').write(W_i8.tobytes())
+open('/tmp/edge_i8mcv_wf.f32',  'wb').write(W_dq.tobytes())
+open('/tmp/edge_i8mcv_b.f32',   'wb').write(b.tobytes())
+print(repr(scale))
+" > /tmp/edge_i8mcv_scale.txt
+SCALE_LITERAL=$(cat /tmp/edge_i8mcv_scale.txt)
+cat > /tmp/edge_i8mcv.ari <<EOF
+fn main() -> i32 {
+    let pad: i32 = embed_file("/tmp/edge_i8mcv_pad.f32");
+    let Wq:  i32 = embed_file_bytes("/tmp/edge_i8mcv_w.i8");
+    let Wf:  i32 = embed_file("/tmp/edge_i8mcv_wf.f32");
+    let bs:  i32 = embed_file("/tmp/edge_i8mcv_b.f32");
+    let scale: f64 = ${SCALE_LITERAL};
+
+    let oi: i32 = arr_f32_new(4 * 28 * 28);
+    let of: i32 = arr_f32_new(4 * 28 * 28);
+    arr_i8_conv2d_3x3_p1_multi(pad, Wq, bs, oi, 4, scale);
+    arr_f32_conv2d_3x3_p1_multi(pad, 3, Wf, bs, of, 4);
+
+    let max_d: f64 = 0.0;
+    let i: i32 = 0;
+    while (i < 4 * 28 * 28) {
+        let d: f64 = arr_f32_get(oi, i) - arr_f32_get(of, i);
+        if (d < 0.0) { d = 0.0 - d; }
+        if (d > max_d) { max_d = d; }
+        i = i + 1;
+    }
+    if (max_d < 0.000001) { print_str("I8MCV_OK"); }
+    return 0;
+}
+EOF
+run_test "arr_i8_conv2d_3x3_p1_multi" /tmp/edge_i8mcv.ari "I8MCV_OK" \
+    "arr_i8_conv2d_3x3_p1_multi: C_in=3, C_out=4 matches f32-multi on dequantised weights bit-for-bit"
+
 # ────────────────────────────────────────────────────────────────────
 
 echo ""

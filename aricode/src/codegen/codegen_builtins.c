@@ -575,6 +575,32 @@ static void cg_vbroadcastss_ymm_xmm(CodegenState *cg, int ymm_dst, int xmm_src) 
     EMIT(cg, 5);
 }
 
+/* Bias-channel broadcast for the 3×3 conv kernels.
+ *
+ *   vbroadcast{ss,sd} ymm9, [rbx + rax * (4|8)]
+ *
+ * All six 3×3 conv variants (f64-single/multi, f32-single/multi,
+ * i8-single/multi) share this exact pattern at the top of each
+ * output-channel iteration: rax is the c_out counter, rbx is the
+ * bias array base, and ymm9 holds the broadcast bias for the rest
+ * of the channel block.  Differences are only the element opcode
+ * (ss/sd) and the SIB scale (×4 for f32 / ×8 for f64) — captured by
+ * the `is_f64` parameter.  Factors out a recurring 4-line byte-
+ * sequence that's the kind of place a stray copy/paste typo would
+ * silently swap rax and rbx in the SIB and produce a wrong-channel
+ * bias-broadcast — same hazard class the named-instruction helpers
+ * (commit b555466) were introduced to eliminate. */
+static void cg_bias_broadcast_ymm9(CodegenState *cg, int is_f64) {
+    uint8_t *b = BUF(cg);
+    b[0] = 0xC4;
+    b[1] = 0x62;                       /* R~=0 (ymm9 high) X~=1 B~=1 mmmmm=02 */
+    b[2] = 0x7D;                       /* W=0 vvvv=1111 L=1 pp=01 (66 prefix) */
+    b[3] = (uint8_t)(is_f64 ? 0x19 : 0x18);   /* sd vs ss */
+    b[4] = 0x0C;                       /* mod=00 reg=001(ymm9&7) r/m=100(SIB) */
+    b[5] = (uint8_t)(is_f64 ? 0xC3 : 0x83);   /* SIB: scale=11/10 idx=000(rax) base=011(rbx) */
+    EMIT(cg, 6);
+}
+
 /* vbroadcastsd ymm_dst, [rsp + disp8]  — memory-source broadcast.
  *
  * This is the inner-loop-friendly broadcast: one instruction, no GPR
@@ -5148,24 +5174,8 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
                 EMIT(cg, 6);
             }
 
-            /* Broadcast bias[c] → ymm9.  Encoding: vbroadcastsd ymm9, [rbx+rax*8]
-             *   SIB addressing: modrm.r/m = 100 (SIB indicator)
-             *   SIB: scale=3 (*8), index=rax (000), base=rbx (011)
-             *   → SIB byte = (3<<6) | (0<<3) | 3 = 0xC3
-             *   modrm = mod=00 | reg=9<<3 (but R bit set) | r/m=100
-             *
-             * For ymm9 (R_bar=0):
-             *   byte1 = 0<<7 | 1<<6 | 1<<5 | 2 = 0x62  (B̄=1 since rbx<8)
-             *   byte2 = 0x7D
-             *   byte3 = 0x19
-             *   modrm = 00 | ((9&7)<<3) | 4 = (1<<3) | 4 = 0x0C
-             *   SIB = 0xC3
-             */
-            b = BUF(cg);
-            b[0] = 0xC4; b[1] = 0x62; b[2] = 0x7D; b[3] = 0x19;
-            b[4] = 0x0C;   /* mod=00, reg=1 (ymm9 low 3), r/m=100 (SIB) */
-            b[5] = 0xC3;   /* SIB: *8, rax, rbx */
-            EMIT(cg, 6);
+            /* Broadcast bias[c] → ymm9.  vbroadcastsd ymm9, [rbx + rax*8] */
+            cg_bias_broadcast_ymm9(cg, /*is_f64=*/1);
 
             /* output_c_base: rsi = r9 + c*6272.
              * mov rsi, rax : 48 89 C6
@@ -5452,16 +5462,8 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
                 EMIT(cg, 6);
             }
 
-            /* Broadcast bias[c] into ymm9.  vbroadcastss ymm9, [rbx + rax*4]:
-             *   byte2: R~=0 (ymm9 high), X~=1 (rax low), B~=1 (rbx low) → 0x62
-             *   byte3: 0x7D
-             *   opcode: 0x18
-             *   modrm: 00 (1<<3) 100 = 0x0C
-             *   SIB: scale=10 (×4), idx=rax(000), base=rbx(011) → 10_000_011 = 0x83 */
-            b = BUF(cg);
-            b[0]=0xC4; b[1]=0x62; b[2]=0x7D; b[3]=0x18;
-            b[4]=0x0C; b[5]=0x83;
-            EMIT(cg, 6);
+            /* Broadcast bias[c] into ymm9.  vbroadcastss ymm9, [rbx + rax*4]. */
+            cg_bias_broadcast_ymm9(cg, /*is_f64=*/0);
 
             /* output_c_base: rsi = r9 + c*3136. */
             b = BUF(cg); b[0]=0x48; b[1]=0x89; b[2]=0xC6; EMIT(cg, 3);                 /* mov rsi, rax */
@@ -5794,11 +5796,8 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
                 cg_vbroadcastss_ymm_xmm(cg, /*ymm_dst=*/k, /*xmm_src=*/k);
             }
 
-            /* Broadcast bias[c] into ymm9 (same encoding as the f32 conv). */
-            b = BUF(cg);
-            b[0]=0xC4; b[1]=0x62; b[2]=0x7D; b[3]=0x18;
-            b[4]=0x0C; b[5]=0x83;
-            EMIT(cg, 6);
+            /* Broadcast bias[c] into ymm9. */
+            cg_bias_broadcast_ymm9(cg, /*is_f64=*/0);
 
             /* output_c_base: rsi = r9 + c*3136. */
             b = BUF(cg); b[0]=0x48; b[1]=0x89; b[2]=0xC6; EMIT(cg, 3);
@@ -6049,14 +6048,8 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             int32_t k6272 = 6272; memcpy(b+3, &k6272, 4); EMIT(cg, 7);
             b = BUF(cg); b[0]=0x4C; b[1]=0x01; b[2]=0xCE; EMIT(cg, 3);
 
-            /* Broadcast bias[c_out] to ymm9:
-             *   vbroadcastsd ymm9, [rbx + rax*8]
-             *   VEX.256.66.0F38.W0 19 /r with SIB, rbx base, rax index, scale 3.
-             *   R_bar=0 (ymm9>=8), X_bar=1, B_bar=1, mmmmm=2 → byte1=0x62
-             *   byte2=0x7D.  opcode 0x19.  modrm: mod=00, reg=1, r/m=100
-             *   (SIB) → 0x0C.  SIB: scale=3, index=rax, base=rbx → 0xC3. */
-            b = BUF(cg); b[0]=0xC4; b[1]=0x62; b[2]=0x7D; b[3]=0x19;
-            b[4]=0x0C; b[5]=0xC3; EMIT(cg, 6);
+            /* Broadcast bias[c_out] to ymm9: vbroadcastsd ymm9, [rbx + rax*8]. */
+            cg_bias_broadcast_ymm9(cg, /*is_f64=*/1);
 
             /* Fill output[c_out*784..+784] with bias:
              *   xor edx, edx
@@ -6423,12 +6416,8 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             int32_t k3136_m = 3136; memcpy(b+3, &k3136_m, 4); EMIT(cg, 7);
             b = BUF(cg); b[0]=0x4C; b[1]=0x01; b[2]=0xCE; EMIT(cg, 3);            /* add rsi, r9 */
 
-            /* Bias broadcast: vbroadcastss ymm9, [rbx + rax*4]
-             *   byte1: R~=0 (ymm9>=8) X~=1 B~=1 → 0x62
-             *   byte2: 0x7D, opcode 0x18 (ss; sd was 0x19)
-             *   modrm 00_001_100 = 0x0C, SIB scale=10 idx=000 base=011 = 0x83 */
-            b = BUF(cg); b[0]=0xC4; b[1]=0x62; b[2]=0x7D; b[3]=0x18;
-            b[4]=0x0C; b[5]=0x83; EMIT(cg, 6);
+            /* Bias broadcast: vbroadcastss ymm9, [rbx + rax*4]. */
+            cg_bias_broadcast_ymm9(cg, /*is_f64=*/0);
 
             /* Fill output[c_out, :, :] with bias broadcast (3136 bytes
              * = 98 ymm stores). */
@@ -6757,9 +6746,8 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             int32_t k3136_im = 3136; memcpy(b+3, &k3136_im, 4); EMIT(cg, 7);
             b = BUF(cg); b[0]=0x4C; b[1]=0x01; b[2]=0xCE; EMIT(cg, 3);            /* add rsi, r9 */
 
-            /* Bias broadcast: vbroadcastss ymm9, [rbx + rax*4] */
-            b = BUF(cg); b[0]=0xC4; b[1]=0x62; b[2]=0x7D; b[3]=0x18;
-            b[4]=0x0C; b[5]=0x83; EMIT(cg, 6);
+            /* Bias broadcast: vbroadcastss ymm9, [rbx + rax*4]. */
+            cg_bias_broadcast_ymm9(cg, /*is_f64=*/0);
 
             /* Fill output[c_out] with bias broadcast (3136 bytes / 32 = 98 stores). */
             pn = emit_xor_reg_reg(BUF(cg), REG_RDX, REG_RDX); EMIT(cg, pn);

@@ -3549,6 +3549,80 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             EMIT(cg, 5);
             return 1;
         }
+        if (strcmp(name, "arr_i8_new") == 0 && argc == 1) {
+            /* arr_i8_new(n) — allocate n int8 elements (1 byte each).
+             *
+             * Layout matches embed_file_bytes' on-disk shape so an i8
+             * buffer from either source is interchangeable:
+             *   [base-8] = n   (i64 byte count; arr_len returns n)
+             *   [base+0..base+n) = the i8 data
+             *
+             * Same MAP_PRIVATE|ANON mmap as arr_f64_new / arr_f32_new;
+             * just a different shift (0 vs 3 vs 2) for n → bytes.
+             *
+             * Primary use: programmatic construction of test/staging
+             * buffers in pure aricode, so the i8 builtins
+             * (arr_i8_matvec_f32, arr_i8_conv2d_3x3_p1*) can be exercised
+             * without a Python preprocessing step that writes
+             * embed_file_bytes input.  Also handy for runtime int8
+             * intermediate tensors in larger pipelines. */
+            emit_expression(cg, node->children[1]); /* n → RAX */
+            int pn; uint8_t *b;
+            pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);          /* save n */
+            /* mmap byte length = n + 8.  No shift. */
+            pn = emit_add_reg_imm(BUF(cg), REG_RAX, 8); EMIT(cg, pn);
+            pn = emit_mov_reg_reg(BUF(cg), REG_RSI, REG_RAX); EMIT(cg, pn);
+            pn = emit_xor_reg_reg(BUF(cg), REG_RDI, REG_RDI); EMIT(cg, pn);
+            pn = emit_mov_reg_imm32(BUF(cg), REG_RDX, 3); EMIT(cg, pn);
+            b = BUF(cg); b[0]=0x49; b[1]=0xC7; b[2]=0xC2;
+            int32_t v=0x22; memcpy(b+3,&v,4); EMIT(cg,7);
+            b = BUF(cg); b[0]=0x49; b[1]=0xC7; b[2]=0xC0;
+            v=-1; memcpy(b+3,&v,4); EMIT(cg,7);
+            b = BUF(cg); b[0]=0x4D; b[1]=0x31; b[2]=0xC9; EMIT(cg,3);
+            pn = emit_mov_reg_imm32(BUF(cg), REG_RAX, 9); EMIT(cg, pn);
+            pn = emit_syscall(BUF(cg)); EMIT(cg, pn);
+            /* Store byte length (= n) at [rax]. */
+            pn = emit_pop(BUF(cg), REG_RCX); EMIT(cg, pn);
+            b = BUF(cg);
+            b[0] = rex(1, reg_ext(REG_RCX), 0, reg_ext(REG_RAX));
+            b[1] = 0x89; b[2] = modrm(0, REG_RCX, REG_RAX);
+            EMIT(cg, 3);
+            /* Skip past the 8-byte length prefix. */
+            pn = emit_add_reg_imm(BUF(cg), REG_RAX, 8); EMIT(cg, pn);
+            return 1;
+        }
+        if (strcmp(name, "arr_i8_set") == 0 && argc == 3) {
+            /* arr_i8_set(base, idx, val) — store low byte of val at base[idx].
+             *
+             * Bounds-checked against the byte-length header at [base-8].
+             * val is i32-typed at the language level (we don't have a
+             * dedicated i8 type); the low 8 bits get stored.  Useful for
+             * programmatically filling an arr_i8_new buffer for tests. */
+            emit_expression(cg, node->children[3]); /* val → RAX */
+            int pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
+            emit_expression(cg, node->children[2]); /* idx */
+            pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
+            emit_expression(cg, node->children[1]); /* base → RAX */
+            pn = emit_pop(BUF(cg), REG_RCX); EMIT(cg, pn);          /* RCX = idx */
+            pn = emit_pop(BUF(cg), REG_RDX); EMIT(cg, pn);          /* RDX = val */
+            uint8_t *b;
+
+            /* Bounds check against [rax-8]. */
+            pn = emit_mov_reg_mem(BUF(cg), REG_RSI, REG_RAX, -8); EMIT(cg, pn);
+            pn = emit_cmp_reg_reg(BUF(cg), REG_RCX, REG_RSI); EMIT(cg, pn);
+            size_t jb_pos = cg->code_size;
+            b = BUF(cg); b[0]=0x0F; b[1]=0x82; memset(b+2,0,4); EMIT(cg, 6);
+            {
+                const char *errmsg = "Runtime error: arr_i8_set index out of bounds\n";
+                emit_runtime_error(cg, errmsg, strlen(errmsg));
+            }
+            int32_t jb_off = (int32_t)(cg->code_size - (jb_pos + 6));
+            memcpy(cg->code + jb_pos + 2, &jb_off, 4);
+
+            /* mov byte ptr [rax + rcx*1], dl  —  88 14 08 (no REX). */
+            b = BUF(cg); b[0]=0x88; b[1]=0x14; b[2]=0x08; EMIT(cg, 3);
+            return 1;
+        }
         if (strcmp(name, "arr_f32_new") == 0 && argc == 1) {
             /* arr_f32_new(n)  —  allocate n f32 elements (4 bytes each).
              *

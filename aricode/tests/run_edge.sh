@@ -1930,6 +1930,50 @@ EOF
 run_test "arr_i8_conv2d_3x3_p1_multi" /tmp/edge_i8mcv.ari "I8MCV_OK" \
     "arr_i8_conv2d_3x3_p1_multi: C_in=3, C_out=4 matches f32-multi on dequantised weights bit-for-bit"
 
+# #73  arr_i8_new + arr_i8_set: programmatic i8 buffer construction.
+# Round-trip: allocate, fill with a known pattern (incl. negative i8
+# via int values that map to 0..255 byte range), feed through
+# arr_i8_matvec_f32, compare against the analytic result.  Without
+# arr_i8_new the only way to construct an i8 buffer was via Python
+# preprocessing + embed_file_bytes, which forced every i8 test to go
+# through external file I/O.
+cat > /tmp/edge_i8_new.ari << 'EOF'
+fn main() -> i32 {
+    let n: i32 = 8;
+    let m: i32 = 2;
+    let W: i32 = arr_i8_new(m * n);                  // 16-byte buffer
+    if (arr_len(W) != 16) { return 1; }              // length header check
+
+    // W = [[1, 2, 3, 4, 5, 6, 7, 8],
+    //      [-1, -2, -3, -4, -5, -6, -7, -8]]
+    let i: i32 = 0;
+    while (i < n) {
+        arr_i8_set(W, i, i + 1);
+        arr_i8_set(W, n + i, 0 - (i + 1));           // negative byte: stored as 0..255
+        i = i + 1;
+    }
+
+    // x = [1, 1, 1, 1, 1, 1, 1, 1]
+    let x: i32 = arr_f32_new(n);
+    arr_f32_fill(x, 1.0);
+
+    // y = scale · W · x  with scale = 0.5
+    //   y[0] = 0.5 · (1+2+3+4+5+6+7+8) = 18.0
+    //   y[1] = 0.5 · -(1+2+3+4+5+6+7+8) = -18.0
+    let y: i32 = arr_f32_new(m);
+    arr_i8_matvec_f32(W, x, y, m, 0.5);
+
+    let y0: f64 = arr_f32_get(y, 0);
+    let y1: f64 = arr_f32_get(y, 1);
+    if (math_abs(y0 - 18.0) < 0.0001 && math_abs(y1 + 18.0) < 0.0001) {
+        print_str("I8_NEW_OK");
+    }
+    return 0;
+}
+EOF
+run_test "arr_i8_new_and_set" /tmp/edge_i8_new.ari "I8_NEW_OK" \
+    "arr_i8_new(16) + arr_i8_set populate W in pure aricode; arr_i8_matvec_f32 reads it back correctly (sign byte handled, scale applied)"
+
 # ────────────────────────────────────────────────────────────────────
 
 echo ""

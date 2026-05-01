@@ -127,7 +127,7 @@ cat > /tmp/aribench_i8_matvec.ari <<EOF
 fn main() -> i32 {
     let m: i32 = 64;
     let n: i32 = 3136;
-    let W: i32 = arr_i8_new(m * n);
+    let W: i32 = arr_i8_new(m * n);     // zero-initialised by mmap
     let x: i32 = arr_f32_new(n);
     let y: i32 = arr_f32_new(m);
     arr_f32_fill(x, 0.5);
@@ -143,15 +143,7 @@ fn main() -> i32 {
     return 0;
 }
 EOF
-# arr_i8_new isn't a thing; use the analogous-builtin shape via i8 file.
-# Fall back to allocating raw bytes in an i64 buffer + reinterpreting.
-# (skip if unavailable.)
-if ! grep -q "arr_i8_new" /home/serverbig/git-proyect/aricoderoot/aricode/src/codegen/codegen_builtins.c; then
-    rm -f /tmp/aribench_i8_matvec.ari
-    printf "  %-40s ${DIM}(skipped: arr_i8_new not in codegen)${RESET}\n" "arr_i8_matvec_f32"
-else
-    bench "arr_i8_matvec_f32 (m=64, n=3136)" $N /tmp/aribench_i8_matvec.ari
-fi
+bench "arr_i8_matvec_f32 (m=64, n=3136)" $N /tmp/aribench_i8_matvec.ari
 
 # ─── arr_f32_conv2d_3x3_p1  (single-channel) ────────────────────────
 # cnn2 conv1 shape: 1 input channel, 8 output channels, 28×28 spatial.

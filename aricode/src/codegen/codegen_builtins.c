@@ -3591,6 +3591,53 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             pn = emit_add_reg_imm(BUF(cg), REG_RAX, 8); EMIT(cg, pn);
             return 1;
         }
+        if (strcmp(name, "arr_i8_get") == 0 && argc == 2) {
+            /* arr_i8_get(base, idx) -> i32  —  sign-extending byte load.
+             *
+             * Distinct from byte_at, which returns 0..255 unsigned and
+             * was the only way callers used to read i8 weight bytes
+             * (forcing every reader to manually `if (v >= 128) v -= 256`).
+             * arr_i8_get does the sign-extend in hardware via movsx.
+             *
+             * Bounds-checked against the byte-length header at [base-8],
+             * matching the rest of the array-get family.  byte_at stays
+             * available for the unchecked loop case.
+             *
+             *   mov rsi, [rax - 8]    ; length
+             *   cmp rcx, rsi
+             *   jb  .ok
+             *   <runtime error>
+             * .ok:
+             *   movsx rax, byte ptr [rax + rcx*1]
+             */
+            emit_expression(cg, node->children[2]); /* idx → RAX */
+            int pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
+            emit_expression(cg, node->children[1]); /* base → RAX */
+            pn = emit_pop(BUF(cg), REG_RCX); EMIT(cg, pn);
+            uint8_t *b;
+
+            pn = emit_mov_reg_mem(BUF(cg), REG_RSI, REG_RAX, -8); EMIT(cg, pn);
+            pn = emit_cmp_reg_reg(BUF(cg), REG_RCX, REG_RSI); EMIT(cg, pn);
+            size_t jb_pos = cg->code_size;
+            b = BUF(cg); b[0]=0x0F; b[1]=0x82; memset(b+2,0,4); EMIT(cg, 6);
+            {
+                const char *errmsg = "Runtime error: arr_i8_get index out of bounds\n";
+                emit_runtime_error(cg, errmsg, strlen(errmsg));
+            }
+            int32_t jb_off = (int32_t)(cg->code_size - (jb_pos + 6));
+            memcpy(cg->code + jb_pos + 2, &jb_off, 4);
+
+            /* movsx rax, byte ptr [rax + rcx*1]   —  48 0F BE 04 08
+             *   REX.W=1, opcode 0F BE (movsx r64, r/m8)
+             *   ModRM: mod=00 reg=rax(0) r/m=4 (SIB)
+             *   SIB:   scale=00 idx=rcx(1) base=rax(0) → 0x08 */
+            b = BUF(cg);
+            b[0] = 0x48; b[1] = 0x0F; b[2] = 0xBE;
+            b[3] = (uint8_t)((0 << 6) | ((REG_RAX & 7) << 3) | 4);
+            b[4] = (uint8_t)((0 << 6) | ((REG_RCX & 7) << 3) | (REG_RAX & 7));
+            EMIT(cg, 5);
+            return 1;
+        }
         if (strcmp(name, "arr_i8_set") == 0 && argc == 3) {
             /* arr_i8_set(base, idx, val) — store low byte of val at base[idx].
              *

@@ -1974,6 +1974,28 @@ EOF
 run_test "arr_i8_new_and_set" /tmp/edge_i8_new.ari "I8_NEW_OK" \
     "arr_i8_new(16) + arr_i8_set populate W in pure aricode; arr_i8_matvec_f32 reads it back correctly (sign byte handled, scale applied)"
 
+# #74  arr_i8_get sign-extension: byte_at returns 0..255, so callers
+# had to write `if (v >= 128) v = v - 256` everywhere they wanted the
+# signed interpretation.  arr_i8_get bakes the movsx into the load.
+# This test stores -50 and +120, then verifies arr_i8_get returns
+# them in the signed range (vs byte_at which would give 206 and 120).
+cat > /tmp/edge_i8_get.ari << 'EOF'
+fn main() -> i32 {
+    let buf: i32 = arr_i8_new(2);
+    arr_i8_set(buf, 0, 0 - 50);     // store -50 (byte = 206)
+    arr_i8_set(buf, 1, 120);        // store +120
+    let a: i32 = arr_i8_get(buf, 0);
+    let b: i32 = arr_i8_get(buf, 1);
+    let u: i32 = byte_at(buf, 0);   // unsigned cousin: 206
+    if (a == 0 - 50 && b == 120 && u == 206) {
+        print_str("I8_GET_OK");
+    }
+    return 0;
+}
+EOF
+run_test "arr_i8_get_sign_extend" /tmp/edge_i8_get.ari "I8_GET_OK" \
+    "arr_i8_get sign-extends i8 → i32 in hardware (movsx); byte_at stays unsigned for the loop case"
+
 # ────────────────────────────────────────────────────────────────────
 
 echo ""

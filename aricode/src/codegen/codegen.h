@@ -22,12 +22,14 @@
 /*  Code buffer                                                       */
 /* ------------------------------------------------------------------ */
 
-/* Max code/data buffer.  Large enough to hold both the compiled .text
- * and any inline payloads emitted by embed_file (e.g. CNN weight blobs
- * baked into a deploy binary).  16 MiB covers small models with room
- * to spare; the buffer is heap-allocated so this number doesn't show
- * up in CodegenState's stack footprint. */
-#define CODEGEN_MAX_CODE   (16 * 1024 * 1024)
+/* Max code/data buffer.  Holds the compiled .text plus any inline
+ * payloads emitted by embed_file (e.g. CNN weight blobs and full
+ * transformer encoders baked into a deploy binary).  256 MiB is a
+ * mmap-backed virtual reservation, so the cost is address space — not
+ * RSS — until weights actually populate the buffer.  Sized to fit a
+ * full distilbert-base int8 (~67 MB weights + ~few-MB code) with
+ * comfortable headroom; small models pay nothing extra. */
+#define CODEGEN_MAX_CODE   (256 * 1024 * 1024)
 #define CODEGEN_MAX_FUNCS  256           /* max function definitions  */
 #define CODEGEN_MAX_VARS   256           /* max locals per function   */
 

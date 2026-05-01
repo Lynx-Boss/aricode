@@ -3089,6 +3089,38 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
                  * preceded by `movq rax, xmm0` from a hot-var read). */
                 emit_sync_xmm0_from_rax_smart(cg);
 
+                /* Defensive input clamp: math_exp's polynomial path
+                 * computes 2^k via the IEEE-bit trick (k+1023)<<52,
+                 * which is only valid for k ∈ [-1023, +1023].  Beyond
+                 * that, the shift produces garbage (negative exponent
+                 * fields wrap into the sign bit).  Pre-v0.25 symptom:
+                 *   math_exp(+848) ≈ -0.0
+                 *   math_exp(-848) ≈ -9.22e18
+                 * Caught the GELU saturation flip in v0.24's
+                 * distilbert regression.  Clamping x to [-700, +700]
+                 * keeps |k| < 1023 with margin, so 2^k stays in the
+                 * f64 normal range:
+                 *   exp(+700) ≈ 1.01e304  (well under f64 max 1.79e308)
+                 *   exp(-700) ≈ 9.86e-305 (in normal range, not denormal)
+                 * Callers that need exact exp(|x|>700) should split
+                 * the magnitude or work in log space; this is the
+                 * ML-deploy-shaped tradeoff.  minsd / maxsd pick the
+                 * second operand on NaN — NaN inputs map to +700, an
+                 * approximation chosen over silently propagating
+                 * INT64_MIN-as-f64 garbage. */
+                pn = emit_mov_reg_imm64(BUF(cg), REG_RCX,
+                                        0x4085E00000000000ULL); EMIT(cg, pn);
+                b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E;
+                b[4]=0xD1; EMIT(cg, 5);                       /* movq xmm2, rcx */
+                b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x5D;
+                b[3]=0xC2; EMIT(cg, 4);                       /* minsd xmm0, xmm2 */
+                pn = emit_mov_reg_imm64(BUF(cg), REG_RCX,
+                                        0xC085E00000000000ULL); EMIT(cg, pn);
+                b = BUF(cg); b[0]=0x66; b[1]=0x48; b[2]=0x0F; b[3]=0x6E;
+                b[4]=0xD1; EMIT(cg, 5);                       /* movq xmm2, rcx */
+                b = BUF(cg); b[0]=0xF2; b[1]=0x0F; b[2]=0x5F;
+                b[3]=0xC2; EMIT(cg, 4);                       /* maxsd xmm0, xmm2 */
+
                 /* === Step 1: k = round(x * log2e) === */
                 /* xmm1 = x * log2e */
                 /* movapd xmm1, xmm0 */

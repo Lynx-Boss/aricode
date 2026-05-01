@@ -1996,6 +1996,29 @@ EOF
 run_test "arr_i8_get_sign_extend" /tmp/edge_i8_get.ari "I8_GET_OK" \
     "arr_i8_get sign-extends i8 → i32 in hardware (movsx); byte_at stays unsigned for the loop case"
 
+# #75  math_exp saturation guard.  The polynomial path constructs
+# 2^k via the IEEE-bit trick (k+1023)<<52, which overflows the 11-bit
+# exponent for |k|>1023 (|x|≳710).  Pre-fix it returned garbage:
+# math_exp(848) ≈ -0.0, math_exp(-848) ≈ -9.22e18 (INT64_MIN as f64).
+# Caught the GELU saturation flip in the distilbert encoder demo
+# (max abs 6.18 vs 5.7e-6).  Fix clamps x to [-700, +700] so |k| ≤ 1023.
+cat > /tmp/edge_exp_clamp.ari << 'EOF'
+fn main() -> i32 {
+    let big_pos: f64 = math_exp(848.68);
+    let big_neg: f64 = math_exp(0.0 - 848.68);
+    let normal:  f64 = math_exp(1.0);
+    let ok: i32 = 1;
+    if (big_pos < 1.0e300) { ok = 0; }     // overflow path: must saturate large+
+    if (big_neg < 0.0)     { ok = 0; }     // underflow must NOT be negative
+    if (big_neg > 1.0e-200) { ok = 0; }    // underflow must saturate small+
+    if (math_abs(normal - 2.71828) > 0.001) { ok = 0; }   // normal range unchanged
+    if (ok == 1) { print_str("EXP_CLAMP_OK"); }
+    return 0;
+}
+EOF
+run_test "math_exp_clamp" /tmp/edge_exp_clamp.ari "EXP_CLAMP_OK" \
+    "math_exp clamps |x|>700 instead of returning INT64_MIN-as-f64 garbage; e^1 unchanged"
+
 # ────────────────────────────────────────────────────────────────────
 
 echo ""

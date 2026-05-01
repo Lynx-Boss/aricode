@@ -31,7 +31,7 @@
  * comfortable headroom; small models pay nothing extra. */
 #define CODEGEN_MAX_CODE   (256 * 1024 * 1024)
 #define CODEGEN_MAX_FUNCS  256           /* max function definitions  */
-#define CODEGEN_MAX_VARS   256           /* max locals per function   */
+#define CODEGEN_MAX_VARS   2048          /* max locals per function   */
 
 /* ELF constants shared with codegen for address calculation */
 #define ARICODE_ELF_BASE   0x400000ULL  /* ELF load address           */

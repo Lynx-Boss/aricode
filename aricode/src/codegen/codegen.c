@@ -631,18 +631,15 @@ static int expr_is_float(CodegenState *cg, const ASTNode *node) {
                 strcmp(fn, "arr_f32_get") == 0 || strcmp(fn, "arr_f32_sum") == 0 ||
                 strcmp(fn, "arr_f32_dot") == 0)
                 return 1;
-            /* User-defined functions: check if the function was compiled
-             * with a f64 return type by looking at any float arguments
-             * or if the function name suggests float (heuristic). */
+            /* User-defined functions: consult the actual return type
+             * recorded at emit_function_def time.  This replaced an
+             * arg-type heuristic that misclassified i32-returning
+             * functions taking f64 args, sending an inline
+             * `if (user_fn(b, a, tol) == 0)` through the SSE compare
+             * path with stale xmm0.  See FuncEntry.return_is_float
+             * comment in codegen.h. */
             FuncEntry *fe = find_func(cg, fn);
-            if (fe) {
-                /* Check if any argument to this call is float —
-                 * if so, the function likely returns float too. */
-                for (size_t i = 1; i < node->child_count; i++) {
-                    if (expr_is_float(cg, node->children[i]))
-                        return 1;
-                }
-            }
+            if (fe && fe->return_is_float) return 1;
         }
     }
     return 0;
@@ -2554,6 +2551,19 @@ static void emit_function(CodegenState *cg, const ASTNode *node) {
     FuncEntry *fe = &cg->funcs[cg->func_count++];
     fe->name     = node->string_val;
     fe->code_off = cg->code_size;
+    /* Return type lives at children[1] when child_count >= 3 (params,
+     * type, body); otherwise the function declared no -> type and is
+     * implicitly i32-returning.  String value is the type name from
+     * the lexer's lexeme: "f64" / "f32" / "i32" / "bool" / etc. */
+    fe->return_is_float = 0;
+    if (node->child_count >= 3) {
+        const ASTNode *rt = node->children[1];
+        if (rt && rt->string_val &&
+            (strcmp(rt->string_val, "f64") == 0 ||
+             strcmp(rt->string_val, "f32") == 0)) {
+            fe->return_is_float = 1;
+        }
+    }
 
     /* Set current function info for tail call optimization */
     cg->current_fn_name  = node->string_val;

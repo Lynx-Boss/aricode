@@ -69,6 +69,18 @@ typedef struct {
     const char *name;      /* function name (borrowed from AST)       */
     size_t      code_off;  /* byte offset in code buffer              */
     int         param_cnt; /* number of parameters                    */
+    int         return_is_float; /* 1 if return type is f64 / f32, 0
+                                  * otherwise (incl. void / no-return).
+                                  * Consulted by expr_is_float so an
+                                  * inline `if (user_fn(x) == 0)` with
+                                  * f64 args but i32 return goes through
+                                  * the integer compare path — without
+                                  * this the heuristic guessed by arg
+                                  * type and routed an i32-return call
+                                  * through the SSE compare, which then
+                                  * read stale xmm0 (RAX→xmm0 sync only
+                                  * happens for builtins).  Memorialised
+                                  * in tests/test_codegen_quirks.ari. */
 } FuncEntry;
 
 /* ------------------------------------------------------------------ */

@@ -24,12 +24,12 @@
 
 /* Max code/data buffer.  Holds the compiled .text plus any inline
  * payloads emitted by embed_file (e.g. CNN weight blobs and full
- * transformer encoders baked into a deploy binary).  256 MiB is a
+ * transformer encoders baked into a deploy binary).  1 GiB is a
  * mmap-backed virtual reservation, so the cost is address space — not
  * RSS — until weights actually populate the buffer.  Sized to fit a
- * full distilbert-base int8 (~67 MB weights + ~few-MB code) with
- * comfortable headroom; small models pay nothing extra. */
-#define CODEGEN_MAX_CODE   (256 * 1024 * 1024)
+ * full GPT-2-small f32 (~650 MB weights + small code) with headroom
+ * for prompt/scratch staging; smaller models still pay nothing extra. */
+#define CODEGEN_MAX_CODE   (1024 * 1024 * 1024)
 #define CODEGEN_MAX_FUNCS  256           /* max function definitions  */
 #define CODEGEN_MAX_VARS   2048          /* max locals per function   */
 

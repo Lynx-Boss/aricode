@@ -1,13 +1,13 @@
 label,binary_name,binary_size,text_size,instructions,exec_time_ns,startup_time_ns
-Python3,python3,223,N/A,N/A,13397322,11836166
-aricode,leibniz_aricode,601,481,160,438287,444193
-NASM asm,leibniz_asm,4632,93,24,426673,438643
-C (clang -O2),leibniz_clang_O2,762584,649147,120074,583521,597911
-C (clang -O2 dyn),leibniz_clang_O2_dyn,15872,1418,117,762068,792748
-C (gcc -O0),leibniz_gcc_O0,754232,640503,120071,568879,612134
-C (gcc -O2),leibniz_gcc_O2,754232,640463,120071,579778,599129
-C (gcc -O2 dyn),leibniz_gcc_O2_dyn,15832,1365,104,772052,835305
-C (gcc -O3),leibniz_gcc_O3,754232,640463,120071,593246,595043
-C (gcc -Os),leibniz_gcc_Os,754232,640399,120059,590779,588474
-Go,leibniz_go,1873447,1171378,142406,1398229,1406154
-Rust,leibniz_rust,11382368,361743,71746,1037736,1087343
+Python3,python3,223,N/A,N/A,8707415,7765685
+aricode,leibniz_aricode,598,478,159,291697,295413
+NASM asm,leibniz_asm,4632,93,24,283798,294236
+C (clang -O2),leibniz_clang_O2,762584,649147,120074,397546,397856
+C (clang -O2 dyn),leibniz_clang_O2_dyn,15872,1418,117,531389,543963
+C (gcc -O0),leibniz_gcc_O0,754232,640503,120071,417241,423723
+C (gcc -O2),leibniz_gcc_O2,754232,640463,120071,400811,405382
+C (gcc -O2 dyn),leibniz_gcc_O2_dyn,15832,1365,104,535924,541179
+C (gcc -O3),leibniz_gcc_O3,754232,640463,120071,396843,409987
+C (gcc -Os),leibniz_gcc_Os,754232,640399,120059,401435,402740
+Go,leibniz_go,1873447,1171378,142406,952181,957909
+Rust,leibniz_rust,11382368,361743,71746,707104,725883

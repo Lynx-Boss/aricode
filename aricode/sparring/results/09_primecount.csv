@@ -1,13 +1,13 @@
 label,binary_name,binary_size,text_size,instructions,exec_time_ns,startup_time_ns
-Python3,python3,337,N/A,N/A,11897186,11792207
-aricode,primecount_aricode,640,520,173,427831,495558
-NASM asm,primecount_asm,440,101,33,421093,440784
-C (clang -O2),primecount_clang_O2,762624,649203,120108,585369,588626
-C (clang -O2 dyn),primecount_clang_O2_dyn,15904,1420,145,762471,771061
-C (gcc -O0),primecount_gcc_O0,754272,640471,120085,580499,587307
-C (gcc -O2),primecount_gcc_O2,754272,640575,120124,586657,584164
-C (gcc -O2 dyn),primecount_gcc_O2_dyn,15864,1448,156,776415,755242
-C (gcc -O3),primecount_gcc_O3,754272,640511,120106,564403,446489
-C (gcc -Os),primecount_gcc_Os,754272,640383,120069,603840,640208
-Go,primecount_go,1873539,1171450,142410,1474859,1458911
-Rust,primecount_rust,11382376,361759,71739,1016258,991761
+Python3,python3,337,N/A,N/A,7814974,7760708
+aricode,primecount_aricode,637,517,172,277617,291288
+NASM asm,primecount_asm,440,101,33,278059,284094
+C (clang -O2),primecount_clang_O2,762624,649203,120108,388219,393902
+C (clang -O2 dyn),primecount_clang_O2_dyn,15904,1420,145,521800,533677
+C (gcc -O0),primecount_gcc_O0,754272,640471,120085,387381,396718
+C (gcc -O2),primecount_gcc_O2,754272,640575,120124,385293,382506
+C (gcc -O2 dyn),primecount_gcc_O2_dyn,15864,1448,156,522963,529305
+C (gcc -O3),primecount_gcc_O3,754272,640511,120106,385608,396553
+C (gcc -Os),primecount_gcc_Os,754272,640383,120069,387278,401544
+Go,primecount_go,1873539,1171450,142410,945171,958295
+Rust,primecount_rust,11382376,361759,71739,709549,672698

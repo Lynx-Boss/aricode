@@ -1,0 +1,15 @@
+fn main() -> i32 {
+    // Two rows of 4 elements.
+    let v: i32 = arr_f32_new(8);
+    arr_f32_set(v, 0, 1.0); arr_f32_set(v, 1, 2.0);
+    arr_f32_set(v, 2, 3.0); arr_f32_set(v, 3, 4.0);
+    arr_f32_set(v, 4, 0.5); arr_f32_set(v, 5, 1.5);
+    arr_f32_set(v, 6, 2.5); arr_f32_set(v, 7, 3.5);
+    arr_f32_rmsnorm(v, 4, 0.00001);
+    let i: i32 = 0;
+    while (i < 8) {
+        print_f64(arr_f32_get(v, i), 6);
+        i = i + 1;
+    }
+    return 0;
+}

@@ -1,0 +1,18 @@
+fn main() -> i32 {
+    let v: i32 = arr_f32_new(8);
+    arr_f32_set(v, 0, 0.0);    // silu(0) = 0
+    arr_f32_set(v, 1, 1.0);    // silu(1) ≈ 0.7311
+    arr_f32_set(v, 2, 2.0);    // silu(2) ≈ 1.7616
+    arr_f32_set(v, 3, -1.0);   // silu(-1) ≈ -0.2689
+    arr_f32_set(v, 4, -2.0);   // silu(-2) ≈ -0.2384
+    arr_f32_set(v, 5, 5.0);    // silu(5) ≈ 4.9665
+    arr_f32_set(v, 6, -5.0);   // silu(-5) ≈ -0.0335
+    arr_f32_set(v, 7, 10.0);   // silu(10) ≈ 9.99955
+    arr_f32_silu(v);
+    let i: i32 = 0;
+    while (i < 8) {
+        print_f64(arr_f32_get(v, i), 6);
+        i = i + 1;
+    }
+    return 0;
+}

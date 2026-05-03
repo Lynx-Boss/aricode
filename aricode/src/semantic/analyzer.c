@@ -309,6 +309,7 @@ static AriType *builtin_return_type(const char *name) {
         {"arr_f32_conv2d_3x3_p1_multi", TYPE_I32},
         {"arr_f32_mul",        TYPE_I32},
         {"arr_f32_exp",        TYPE_I32},
+        {"arr_f32_silu",       TYPE_I32},
         {"arr_f32_softmax",    TYPE_I32},
         {"arr_i8_new",         TYPE_I32},
         {"arr_i8_get",         TYPE_I32},
@@ -319,6 +320,8 @@ static AriType *builtin_return_type(const char *name) {
         {"arr_i8_conv2d_3x3_p1_multi", TYPE_I32},
         {"arr_f32_transpose",  TYPE_I32},
         {"arr_f32_layernorm",  TYPE_I32},
+        {"arr_f32_rmsnorm",    TYPE_I32},
+        {"arr_f32_rope_apply_pairs", TYPE_I32},
         {"embed_file",         TYPE_I32},
         {"embed_file_bytes",   TYPE_I32},
         /* f64 — f64 array ops that return f64 */

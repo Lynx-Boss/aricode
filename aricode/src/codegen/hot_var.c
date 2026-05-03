@@ -87,6 +87,9 @@ int call_is_xmm_safe(const char *fn) {
     /* arr_f32_transpose / layernorm: scalar kernels, only touch xmm0..xmm3. */
     if (strcmp(fn, "arr_f32_transpose")  == 0) return 1;
     if (strcmp(fn, "arr_f32_layernorm")  == 0) return 1;
+    if (strcmp(fn, "arr_f32_rmsnorm")    == 0) return 1;
+    /* arr_f32_rope_apply_pairs: scalar pair-rotation, only xmm0..xmm5. */
+    if (strcmp(fn, "arr_f32_rope_apply_pairs") == 0) return 1;
     /* Builtins that clobber ymm8..ymm15 are also callable from
      * xmm-safe bodies — the caller (emit_call_expr) wraps them with
      * a vmovupd save/restore of the cache registers when it notices
@@ -149,9 +152,12 @@ int call_needs_ymm_save(const char *fn) {
     if (strcmp(fn, "arr_f64_log1p")              == 0) return 1;
     if (strcmp(fn, "arr_f64_exp")                == 0) return 1;
     if (strcmp(fn, "arr_f64_expm1")              == 0) return 1;
-    /* arr_f32_exp / arr_f32_softmax wrap the same vec_exp_body that
-     * clobbers ymm8..ymm10 (broadcasts of log2e/ln2/1.0). */
+    /* arr_f32_exp / arr_f32_silu / arr_f32_softmax wrap the same
+     * vec_exp_body that clobbers ymm8..ymm10 (broadcasts of
+     * log2e/ln2/1.0); silu additionally writes ymm11 (saved x copy)
+     * and ymm12 (sign-bit broadcast for negation). */
     if (strcmp(fn, "arr_f32_exp")                == 0) return 1;
+    if (strcmp(fn, "arr_f32_silu")               == 0) return 1;
     if (strcmp(fn, "arr_f32_softmax")            == 0) return 1;
     return 0;
 }

@@ -1,0 +1,52 @@
+// Sanity test for arr_i8_matvec_f32_perrow.
+//
+//   W (4x4 i8):  diag(1,2,3,4)
+//   x (4 f32):   [10, 20, 30, 40]
+//   scales:      [0.5, 1.0, 0.25, 2.0]
+//
+//   y[0] = 0.5  * (1*10) =   5.0
+//   y[1] = 1.0  * (2*20) =  40.0
+//   y[2] = 0.25 * (3*30) =  22.5
+//   y[3] = 2.0  * (4*40) = 320.0
+
+fn main() -> i32 {
+    let m: i32 = 4;
+    let n: i32 = 4;
+
+    let W: i32 = arr_i8_new(m * n);
+    arr_i8_set(W,  0, 1); arr_i8_set(W,  1, 0); arr_i8_set(W,  2, 0); arr_i8_set(W,  3, 0);
+    arr_i8_set(W,  4, 0); arr_i8_set(W,  5, 2); arr_i8_set(W,  6, 0); arr_i8_set(W,  7, 0);
+    arr_i8_set(W,  8, 0); arr_i8_set(W,  9, 0); arr_i8_set(W, 10, 3); arr_i8_set(W, 11, 0);
+    arr_i8_set(W, 12, 0); arr_i8_set(W, 13, 0); arr_i8_set(W, 14, 0); arr_i8_set(W, 15, 4);
+
+    let x: i32 = arr_f32_new(n);
+    arr_f32_set(x, 0, 10.0);
+    arr_f32_set(x, 1, 20.0);
+    arr_f32_set(x, 2, 30.0);
+    arr_f32_set(x, 3, 40.0);
+
+    let scales: i32 = arr_f32_new(m);
+    arr_f32_set(scales, 0, 0.5);
+    arr_f32_set(scales, 1, 1.0);
+    arr_f32_set(scales, 2, 0.25);
+    arr_f32_set(scales, 3, 2.0);
+
+    let y: i32 = arr_f32_new(m);
+    arr_i8_matvec_f32_perrow(W, x, y, m, scales);
+
+    print_f64(arr_f32_get(y, 0), 4);
+    print_f64(arr_f32_get(y, 1), 4);
+    print_f64(arr_f32_get(y, 2), 4);
+    print_f64(arr_f32_get(y, 3), 4);
+
+    // Per-tensor variant must still work alongside.
+    // y_pt[j] = 2 * (j+1) * x[j]
+    let y_pt: i32 = arr_f32_new(m);
+    arr_i8_matvec_f32(W, x, y_pt, m, 2.0);
+    print_f64(arr_f32_get(y_pt, 0), 4);
+    print_f64(arr_f32_get(y_pt, 1), 4);
+    print_f64(arr_f32_get(y_pt, 2), 4);
+    print_f64(arr_f32_get(y_pt, 3), 4);
+
+    return 0;
+}

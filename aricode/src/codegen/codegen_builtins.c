@@ -8758,6 +8758,218 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             pn = emit_xor_reg_reg(BUF(cg), REG_RAX, REG_RAX); EMIT(cg, pn);
             return 1;
         }
+        if (strcmp(name, "arr_i8_matvec_f32_perrow") == 0 && argc == 5) {
+            /* arr_i8_matvec_f32_perrow(W_i8, x_f32, y_f32, m, scales_f32)
+             *
+             *   y[j] = scales[j] · Σ_i W_i8[j, i] · x[i]
+             *
+             * Per-row int8 quantisation: each output row gets its own
+             * scale, loaded from a flat f32 buffer of length m.  This is
+             * the gating quantisation precision for Llama-2-7B / Mistral
+             * class deploys — per-tensor scale on the SwiGLU matrices is
+             * coarse enough that greedy argmax flips at 7B parameters.
+             *
+             * Cloned 1:1 from the per-tensor `arr_i8_matvec_f32` kernel
+             * directly above with two localised changes:
+             *   1. The pre-loop `cvtsd2ss` + `vbroadcastss` sequence is
+             *      replaced with a single `mov r14, [rsp+56]` — the f64
+             *      scale slot now holds a *pointer* to the scales[] f32
+             *      buffer, and we just stash that into the (already
+             *      callee-saved) r14.
+             *   2. Per-row, just before the final `mulss xmm0, xmm5`, we
+             *      load `xmm5 = scales[rbx]` via `movss xmm5, [r14+rbx*4]`
+             *      instead of using the loop-invariant broadcast.
+             *
+             * Everything else — argument marshalling, bounds check,
+             * vectorised inner loop, scalar tail, store — is byte-for-byte
+             * identical to the per-tensor variant.  Same xmm-safe footprint
+             * (only ymm0..ymm5 touched).
+             */
+            emit_expression(cg, node->children[5]); /* scales_f32 ptr → RAX */
+            int pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
+            emit_expression(cg, node->children[4]); /* m */
+            pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
+            emit_expression(cg, node->children[3]); /* y_f32 */
+            pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
+            emit_expression(cg, node->children[2]); /* x_f32 */
+            pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
+            emit_expression(cg, node->children[1]); /* W_i8 → RAX */
+            uint8_t *b;
+
+            pn = emit_push(BUF(cg), REG_RBX); EMIT(cg, pn);
+            b = BUF(cg); b[0]=0x41; b[1]=0x54; EMIT(cg, 2);          /* push r12 */
+            b = BUF(cg); b[0]=0x41; b[1]=0x55; EMIT(cg, 2);          /* push r13 */
+            b = BUF(cg); b[0]=0x41; b[1]=0x56; EMIT(cg, 2);          /* push r14 */
+
+            /* Stack after 5 child pushes + 4 callee-saves (identical
+             * layout to per-tensor variant):
+             *   [rsp+ 0] r14_saved
+             *   [rsp+ 8] r13_saved
+             *   [rsp+16] r12_saved
+             *   [rsp+24] rbx_saved
+             *   [rsp+32] x_f32
+             *   [rsp+40] y_f32
+             *   [rsp+48] m
+             *   [rsp+56] scales_f32 (pointer this time, not f64 bits)
+             */
+            pn = emit_mov_reg_reg(BUF(cg), REG_RDI, REG_RAX); EMIT(cg, pn);  /* rdi = W */
+            b = BUF(cg); b[0]=0x48; b[1]=0x8B; b[2]=0x74; b[3]=0x24; b[4]=0x20; EMIT(cg, 5); /* mov rsi, [rsp+32] x */
+            b = BUF(cg); b[0]=0x4C; b[1]=0x8B; b[2]=0x44; b[3]=0x24; b[4]=0x28; EMIT(cg, 5); /* mov r8,  [rsp+40] y */
+            b = BUF(cg); b[0]=0x4C; b[1]=0x8B; b[2]=0x4C; b[3]=0x24; b[4]=0x30; EMIT(cg, 5); /* mov r9,  [rsp+48] m */
+
+            /* mov r14, [rsp+56]  —  scales pointer.  Replaces the
+             * cvtsd2ss + vbroadcastss block from the per-tensor variant
+             * (which built ymm5 = broadcast(scale)).  r14 was already
+             * pushed at entry but unused in the original kernel, so this
+             * costs zero additional callee-save bookkeeping.
+             *
+             *   REX.W=1 REX.R=1 (r14 dst) REX.X=0 REX.B=0  → 0x4C
+             *   opcode 8B (mov r64, r/m64)
+             *   ModRM mod=01 reg=r14&7=110 r/m=100(SIB)    → 0x74
+             *   SIB   scale=00 idx=100(none) base=100(rsp) → 0x24
+             *   disp8 = 56                                  → 0x38
+             */
+            b = BUF(cg); b[0]=0x4C; b[1]=0x8B; b[2]=0x74; b[3]=0x24; b[4]=0x38; EMIT(cg, 5);
+
+            /* rcx = n = x_f32 length (i64 at [rsi - 8]). */
+            pn = emit_mov_reg_mem(BUF(cg), REG_RCX, REG_RSI, -8); EMIT(cg, pn);
+
+            /* Defensive bounds check: m·n must fit inside W's byte length
+             * (header at [rdi - 8]).  Same rationale as the per-tensor
+             * matvec — without this, a too-small W silently reads bytes
+             * past the heap object, producing undefined output and a
+             * potential information-disclosure primitive on untrusted
+             * weights.  Error string mentions the per-row variant by name
+             * so callers debugging W-shape mismatches know which kernel
+             * tripped. */
+            b = BUF(cg); b[0]=0x4C; b[1]=0x89; b[2]=0xC8; EMIT(cg, 3);          /* mov rax, r9 (m) */
+            b = BUF(cg); b[0]=0x48; b[1]=0x0F; b[2]=0xAF; b[3]=0xC1; EMIT(cg, 4);/* imul rax, rcx */
+            b = BUF(cg); b[0]=0x48; b[1]=0x8B; b[2]=0x57; b[3]=0xF8; EMIT(cg, 4);/* mov rdx, [rdi - 8] */
+            b = BUF(cg); b[0]=0x48; b[1]=0x39; b[2]=0xD0; EMIT(cg, 3);          /* cmp rax, rdx */
+            size_t i8mvpr_jbe_pos = cg->code_size;
+            b = BUF(cg); b[0]=0x0F; b[1]=0x86; memset(b+2,0,4); EMIT(cg, 6);    /* jbe .ok (ahead) */
+            {
+                const char *errmsg = "Runtime error: arr_i8_matvec_f32_perrow W length < m*n\n";
+                size_t errmsg_len = strlen(errmsg);
+                size_t jmp_str = cg->code_size;
+                pn = emit_jmp(BUF(cg), 0); EMIT(cg, pn);
+                size_t str_pos = cg->code_size;
+                memcpy(BUF(cg), errmsg, errmsg_len); cg->code_size += errmsg_len;
+                int32_t jo = (int32_t)(cg->code_size - (jmp_str + 5));
+                memcpy(cg->code + jmp_str + 1, &jo, 4);
+                int32_t rip_off = (int32_t)((int64_t)str_pos - (int64_t)(cg->code_size + 7));
+                b = BUF(cg);
+                b[0]=rex(1,reg_ext(REG_RSI),0,0); b[1]=0x8D;
+                b[2]=modrm(0,REG_RSI,5); memcpy(b+3,&rip_off,4); EMIT(cg,7);
+                pn = emit_mov_reg_imm32(BUF(cg), REG_RDX, (uint32_t)errmsg_len); EMIT(cg, pn);
+                pn = emit_mov_reg_imm32(BUF(cg), REG_RDI, 2); EMIT(cg, pn);
+                pn = emit_mov_reg_imm32(BUF(cg), REG_RAX, 1); EMIT(cg, pn);
+                pn = emit_syscall(BUF(cg)); EMIT(cg, pn);
+                pn = emit_mov_reg_imm32(BUF(cg), REG_RDI, 1); EMIT(cg, pn);
+                pn = emit_mov_reg_imm32(BUF(cg), REG_RAX, 60); EMIT(cg, pn);
+                pn = emit_syscall(BUF(cg)); EMIT(cg, pn);
+            }
+            { int32_t jbe_off = (int32_t)(cg->code_size - (i8mvpr_jbe_pos + 6));
+              memcpy(cg->code + i8mvpr_jbe_pos + 2, &jbe_off, 4); }
+
+            b = BUF(cg); b[0]=0x49; b[1]=0x89; b[2]=0xCA; EMIT(cg, 3);  /* mov r10, rcx */
+            b = BUF(cg); b[0]=0x49; b[1]=0x83; b[2]=0xE2; b[3]=0xF8; EMIT(cg, 4); /* and r10, -8 */
+
+            pn = emit_xor_reg_reg(BUF(cg), REG_RBX, REG_RBX); EMIT(cg, pn);
+
+            CgCountedLoop outer = cg_loop_begin(cg, REG_RBX, 9 /* R9 = m */);
+
+            /* Compute row base in r13 = rdi + rbx * n  (n in rcx, byte stride). */
+            b = BUF(cg); b[0]=0x48; b[1]=0x89; b[2]=0xD8; EMIT(cg, 3);             /* mov rax, rbx */
+            b = BUF(cg); b[0]=0x48; b[1]=0x0F; b[2]=0xAF; b[3]=0xC1; EMIT(cg, 4);   /* imul rax, rcx */
+            /* lea r13, [rdi + rax*1]  —  base + byte_offset */
+            b = BUF(cg); b[0]=0x4C; b[1]=0x8D; b[2]=0x2C; b[3]=0x07; EMIT(cg, 4);
+
+            /* vxorps ymm0, ymm0, ymm0  — accumulator */
+            b = BUF(cg); b[0]=0xC5; b[1]=0xFC; b[2]=0x57; b[3]=0xC0; EMIT(cg, 4);
+
+            b = BUF(cg); b[0]=0x4D; b[1]=0x31; b[2]=0xE4; EMIT(cg, 3);             /* xor r12, r12 */
+
+            CgCountedLoop vloop = cg_loop_begin(cg, 12 /* R12 */, 10 /* R10 */);
+
+            /* vpmovsxbd ymm1, [r13 + r12*1] — sign-extend 8 i8 → 8 i32 */
+            b = BUF(cg); b[0]=0xC4; b[1]=0x82; b[2]=0x7D; b[3]=0x21;
+            b[4]=(uint8_t)((1<<6) | ((1 & 7)<<3) | 4);
+            b[5]=(uint8_t)((0<<6) | ((12 & 7)<<3) | (13 & 7));
+            b[6]=0x00;
+            EMIT(cg, 7);
+
+            /* vcvtdq2ps ymm1, ymm1 */
+            b = BUF(cg); b[0]=0xC5; b[1]=0xFC; b[2]=0x5B; b[3]=0xC9; EMIT(cg, 4);
+
+            /* vmovups ymm2, [rsi + r12*4] */
+            b = BUF(cg); b[0]=0xC4; b[1]=0xA1; b[2]=0x7C; b[3]=0x10;
+            b[4]=(uint8_t)((0<<6) | ((2 & 7)<<3) | 4);
+            b[5]=(uint8_t)((2<<6) | ((12 & 7)<<3) | (REG_RSI & 7));
+            EMIT(cg, 6);
+
+            /* vfmadd231ps ymm0, ymm1, ymm2 */
+            b = BUF(cg); b[0]=0xC4; b[1]=0xE2; b[2]=0x75; b[3]=0xB8; b[4]=0xC2; EMIT(cg, 5);
+
+            cg_loop_end(cg, vloop, 8);
+
+            /* Horizontal sum ymm0 → xmm0 lane 0. */
+            b = BUF(cg); b[0]=0xC4; b[1]=0xE3; b[2]=0x7D; b[3]=0x19; b[4]=0xC3; b[5]=0x01; EMIT(cg, 6); /* vextractf128 xmm3, ymm0, 1 */
+            b = BUF(cg); b[0]=0xC5; b[1]=0xF8; b[2]=0x58; b[3]=0xC3; EMIT(cg, 4);                       /* vaddps xmm0, xmm0, xmm3 */
+            b = BUF(cg); b[0]=0xC5; b[1]=0xFB; b[2]=0x7C; b[3]=0xC0; EMIT(cg, 4);                       /* vhaddps xmm0, xmm0, xmm0 */
+            b = BUF(cg); b[0]=0xC5; b[1]=0xFB; b[2]=0x7C; b[3]=0xC0; EMIT(cg, 4);                       /* vhaddps again */
+
+            /* Scalar tail for j in [r10, rcx). */
+            CgCountedLoop tloop = cg_loop_begin(cg, 12 /* R12 */, REG_RCX);
+
+            /* movsx eax, byte ptr [r13 + r12]  —  REX.X+REX.B = 0x43 */
+            b = BUF(cg); b[0]=0x43; b[1]=0x0F; b[2]=0xBE; b[3]=0x44; b[4]=0x25; b[5]=0x00; EMIT(cg, 6);
+            /* cvtsi2ss xmm1, eax */
+            b = BUF(cg); b[0]=0xF3; b[1]=0x0F; b[2]=0x2A; b[3]=0xC8; EMIT(cg, 4);
+            /* movss xmm2, [rsi + r12*4] */
+            b = BUF(cg); b[0]=0xF3; b[1]=0x42; b[2]=0x0F; b[3]=0x10;
+            b[4]=(uint8_t)((0<<6) | ((2 & 7)<<3) | 4);
+            b[5]=(uint8_t)((2<<6) | ((12 & 7)<<3) | (REG_RSI & 7));
+            EMIT(cg, 6);
+            /* vfmadd231ss xmm0, xmm1, xmm2 */
+            b = BUF(cg); b[0]=0xC4; b[1]=0xE2; b[2]=0x71; b[3]=0xB9; b[4]=0xC2; EMIT(cg, 5);
+
+            cg_loop_end(cg, tloop, 1);
+
+            /* Per-row scale load: xmm5 = scales[rbx]
+             *   movss xmm5, [r14 + rbx*4]
+             *
+             *   F3 prefix for movss
+             *   REX.W=0 REX.R=0(xmm5<8) REX.X=0(rbx<8) REX.B=1(r14≥8) → 0x41
+             *   opcode 0F 10 (movss xmm, m32)
+             *   ModRM mod=00 reg=xmm5&7=101 r/m=100(SIB) → 00 101 100 = 0x2C
+             *     (mod=00 is fine for r14 base; only r13/rbp need disp8=0)
+             *   SIB scale=10(×4) idx=rbx&7=011 base=r14&7=110 → 10 011 110 = 0x9E
+             */
+            b = BUF(cg); b[0]=0xF3; b[1]=0x41; b[2]=0x0F; b[3]=0x10; b[4]=0x2C; b[5]=0x9E; EMIT(cg, 6);
+
+            /* Multiply by per-row scale (lane 0 of xmm5). */
+            /* mulss xmm0, xmm5     F3 0F 59 C5 */
+            b = BUF(cg); b[0]=0xF3; b[1]=0x0F; b[2]=0x59; b[3]=0xC5; EMIT(cg, 4);
+
+            /* Store y[rbx] = xmm0   movss [r8 + rbx*4], xmm0 */
+            b = BUF(cg); b[0]=0xF3; b[1]=0x41; b[2]=0x0F; b[3]=0x11;
+            b[4]=(uint8_t)((0<<6) | ((0 & 7)<<3) | 4);
+            b[5]=(uint8_t)((2<<6) | ((REG_RBX & 7)<<3) | (8 & 7));
+            EMIT(cg, 6);
+
+            cg_loop_end(cg, outer, 1);
+
+            /* vzeroupper, restore callee-saved, drop the 4 stacked args. */
+            b = BUF(cg); b[0]=0xC5; b[1]=0xF8; b[2]=0x77; EMIT(cg, 3);
+            b = BUF(cg); b[0]=0x41; b[1]=0x5E; EMIT(cg, 2);  /* pop r14 */
+            b = BUF(cg); b[0]=0x41; b[1]=0x5D; EMIT(cg, 2);  /* pop r13 */
+            b = BUF(cg); b[0]=0x41; b[1]=0x5C; EMIT(cg, 2);  /* pop r12 */
+            pn = emit_pop(BUF(cg), REG_RBX); EMIT(cg, pn);
+            b = BUF(cg); b[0]=0x48; b[1]=0x83; b[2]=0xC4; b[3]=32; EMIT(cg, 4); /* add rsp, 32 */
+            pn = emit_xor_reg_reg(BUF(cg), REG_RAX, REG_RAX); EMIT(cg, pn);
+            return 1;
+        }
         if (strcmp(name, "arr_f64_copy_slice") == 0 && argc == 5) {
             /* Copy n f64 elements from src[src_offset..] into
              * dst[dst_offset..].  The explicit length decouples this

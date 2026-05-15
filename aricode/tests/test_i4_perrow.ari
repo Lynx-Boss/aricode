@@ -1,0 +1,55 @@
+// Correctness test for arr_i4_matvec_f32_perrow.
+//
+// W is packed int4: byte k of a row holds column 2k in the low
+// nibble, column 2k+1 in the high nibble.  Signed nibble v is
+// stored as the unsigned form (v & 0x0F); the kernel sign-extends
+// back via (n ^ 8) - 8.
+//
+// m=2 rows, n=12 cols → 6 packed bytes/row.  n=12 exercises BOTH
+// the 8-wide AVX2 body AND the 4-element scalar tail.
+//
+// Row 0 weights: [1,-1,2,-2,3,-3,4,-4,5,-5,6,-6]  scale 0.5
+// Row 1 weights: [2]*12                            scale 1.0
+// x = [1,2,3,...,12]
+//
+//   dot0 = 1-2+6-8+15-18+28-32 + 45-50+66-72 = -21
+//   y[0] = 0.5 * -21  = -10.5
+//   dot1 = 2*(1+2+...+12) = 2*78 = 156
+//   y[1] = 1.0 * 156  = 156.0
+//
+// Packing row 0 (nibbles 1,F,2,E,3,D,4,C,5,B,6,A):
+//   b0 = 1|(F<<4)=0xF1=-15   b1 = 2|(E<<4)=0xE2=-30
+//   b2 = 3|(D<<4)=0xD3=-45   b3 = 4|(C<<4)=0xC4=-60
+//   b4 = 5|(B<<4)=0xB5=-75   b5 = 6|(A<<4)=0xA6=-90
+// Row 1: every nibble 0x2 → byte 0x22 = 34.
+
+fn main() -> i32 {
+    let m: i32 = 2;
+    let n: i32 = 12;
+
+    // W: m * (n/2) = 12 packed bytes.
+    let W: i32 = arr_i8_new(m * (n / 2));
+    arr_i8_set(W,  0, -15); arr_i8_set(W,  1, -30); arr_i8_set(W,  2, -45);
+    arr_i8_set(W,  3, -60); arr_i8_set(W,  4, -75); arr_i8_set(W,  5, -90);
+    arr_i8_set(W,  6,  34); arr_i8_set(W,  7,  34); arr_i8_set(W,  8,  34);
+    arr_i8_set(W,  9,  34); arr_i8_set(W, 10,  34); arr_i8_set(W, 11,  34);
+
+    let x: i32 = arr_f32_new(n);
+    arr_f32_set(x, 0,  1.0); arr_f32_set(x, 1,  2.0); arr_f32_set(x, 2,  3.0);
+    arr_f32_set(x, 3,  4.0); arr_f32_set(x, 4,  5.0); arr_f32_set(x, 5,  6.0);
+    arr_f32_set(x, 6,  7.0); arr_f32_set(x, 7,  8.0); arr_f32_set(x, 8,  9.0);
+    arr_f32_set(x, 9, 10.0); arr_f32_set(x,10, 11.0); arr_f32_set(x,11, 12.0);
+
+    let scales: i32 = arr_f32_new(m);
+    arr_f32_set(scales, 0, 0.5);
+    arr_f32_set(scales, 1, 1.0);
+
+    let y: i32 = arr_f32_new(m);
+    arr_i4_matvec_f32_perrow(W, x, y, m, scales);
+
+    // Expected: -10.5 then 156.0
+    print_f64(arr_f32_get(y, 0), 4);
+    print_f64(arr_f32_get(y, 1), 4);
+
+    return 0;
+}

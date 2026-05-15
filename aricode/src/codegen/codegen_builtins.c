@@ -9305,6 +9305,189 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             pn = emit_xor_reg_reg(BUF(cg), REG_RAX, REG_RAX); EMIT(cg, pn);
             return 1;
         }
+        if (strcmp(name, "arr_i4_matvec_f32_perrow") == 0 && argc == 5) {
+            /* arr_i4_matvec_f32_perrow(W_i4, x_f32, y_f32, m, scales_f32)
+             *
+             *   y[j] = scales[j] · Σ_i W4[j,i] · x[i]
+             *
+             * W_i4 packs two signed 4-bit weights per byte: the low
+             * nibble is the even column, the high nibble the odd
+             * column.  Each nibble is sign-extended from [0..15] to
+             * [-8..7] via the branchless (v ^ 8) - 8 map.
+             *
+             * Strategy: per output row, unpack the n/2 packed bytes
+             * into an n-byte int8 scratch on the stack, then run the
+             * EXACT vectorised int8 dot-product from
+             * arr_i8_matvec_f32_perrow on the scratch.  The dominant
+             * cost (the AVX2 FMA loop) is byte-for-byte the proven
+             * int8 kernel; only the scalar nibble unpack is new.
+             * Scratch is a fixed 16 KB stack region — covers any
+             * matvec input dim n ≤ 16384 (every transformer matvec
+             * we emit is far below that: LM head n=256, SwiGLU
+             * n≤1024).  n MUST be even (pack.py guarantees it for
+             * --int4-linear; the bounds check below uses n/2). */
+            emit_expression(cg, node->children[5]); /* scales_f32 ptr → RAX */
+            int pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
+            emit_expression(cg, node->children[4]); /* m */
+            pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
+            emit_expression(cg, node->children[3]); /* y_f32 */
+            pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
+            emit_expression(cg, node->children[2]); /* x_f32 */
+            pn = emit_push(BUF(cg), REG_RAX); EMIT(cg, pn);
+            emit_expression(cg, node->children[1]); /* W_i4 → RAX */
+            uint8_t *b;
+
+            pn = emit_push(BUF(cg), REG_RBX); EMIT(cg, pn);
+            b = BUF(cg); b[0]=0x41; b[1]=0x54; EMIT(cg, 2);          /* push r12 */
+            b = BUF(cg); b[0]=0x41; b[1]=0x55; EMIT(cg, 2);          /* push r13 */
+            b = BUF(cg); b[0]=0x41; b[1]=0x56; EMIT(cg, 2);          /* push r14 */
+            /* Identical stack layout to the int8 variant:
+             *   [rsp+32] x  [rsp+40] y  [rsp+48] m  [rsp+56] scales */
+            pn = emit_mov_reg_reg(BUF(cg), REG_RDI, REG_RAX); EMIT(cg, pn);  /* rdi = W */
+            b = BUF(cg); b[0]=0x48; b[1]=0x8B; b[2]=0x74; b[3]=0x24; b[4]=0x20; EMIT(cg, 5); /* rsi = [rsp+32] x */
+            b = BUF(cg); b[0]=0x4C; b[1]=0x8B; b[2]=0x44; b[3]=0x24; b[4]=0x28; EMIT(cg, 5); /* r8  = [rsp+40] y */
+            b = BUF(cg); b[0]=0x4C; b[1]=0x8B; b[2]=0x4C; b[3]=0x24; b[4]=0x30; EMIT(cg, 5); /* r9  = [rsp+48] m */
+            b = BUF(cg); b[0]=0x4C; b[1]=0x8B; b[2]=0x74; b[3]=0x24; b[4]=0x38; EMIT(cg, 5); /* r14 = [rsp+56] scales */
+
+            /* rcx = n = x length (i64 at [rsi-8]). */
+            pn = emit_mov_reg_mem(BUF(cg), REG_RCX, REG_RSI, -8); EMIT(cg, pn);
+
+            /* r11 = n / 2  (packed bytes per row). */
+            b = BUF(cg); b[0]=0x49; b[1]=0x89; b[2]=0xCB; EMIT(cg, 3);  /* mov r11, rcx */
+            b = BUF(cg); b[0]=0x49; b[1]=0xD1; b[2]=0xEB; EMIT(cg, 3);  /* shr r11, 1 */
+
+            /* Bounds check: m·(n/2) must fit inside W's byte length. */
+            b = BUF(cg); b[0]=0x4C; b[1]=0x89; b[2]=0xC8; EMIT(cg, 3);          /* mov rax, r9 (m) */
+            b = BUF(cg); b[0]=0x49; b[1]=0x0F; b[2]=0xAF; b[3]=0xC3; EMIT(cg, 4);/* imul rax, r11 */
+            b = BUF(cg); b[0]=0x48; b[1]=0x8B; b[2]=0x57; b[3]=0xF8; EMIT(cg, 4);/* mov rdx, [rdi-8] */
+            b = BUF(cg); b[0]=0x48; b[1]=0x39; b[2]=0xD0; EMIT(cg, 3);          /* cmp rax, rdx */
+            size_t i4_jbe_pos = cg->code_size;
+            b = BUF(cg); b[0]=0x0F; b[1]=0x86; memset(b+2,0,4); EMIT(cg, 6);    /* jbe .ok */
+            {
+                const char *errmsg = "Runtime error: arr_i4_matvec_f32_perrow W length < m*n/2\n";
+                size_t errmsg_len = strlen(errmsg);
+                size_t jmp_str = cg->code_size;
+                pn = emit_jmp(BUF(cg), 0); EMIT(cg, pn);
+                size_t str_pos = cg->code_size;
+                memcpy(BUF(cg), errmsg, errmsg_len); cg->code_size += errmsg_len;
+                int32_t jo = (int32_t)(cg->code_size - (jmp_str + 5));
+                memcpy(cg->code + jmp_str + 1, &jo, 4);
+                int32_t rip_off = (int32_t)((int64_t)str_pos - (int64_t)(cg->code_size + 7));
+                b = BUF(cg);
+                b[0]=rex(1,reg_ext(REG_RSI),0,0); b[1]=0x8D;
+                b[2]=modrm(0,REG_RSI,5); memcpy(b+3,&rip_off,4); EMIT(cg,7);
+                pn = emit_mov_reg_imm32(BUF(cg), REG_RDX, (uint32_t)errmsg_len); EMIT(cg, pn);
+                pn = emit_mov_reg_imm32(BUF(cg), REG_RDI, 2); EMIT(cg, pn);
+                pn = emit_mov_reg_imm32(BUF(cg), REG_RAX, 1); EMIT(cg, pn);
+                pn = emit_syscall(BUF(cg)); EMIT(cg, pn);
+                pn = emit_mov_reg_imm32(BUF(cg), REG_RDI, 1); EMIT(cg, pn);
+                pn = emit_mov_reg_imm32(BUF(cg), REG_RAX, 60); EMIT(cg, pn);
+                pn = emit_syscall(BUF(cg)); EMIT(cg, pn);
+            }
+            { int32_t jbe_off = (int32_t)(cg->code_size - (i4_jbe_pos + 6));
+              memcpy(cg->code + i4_jbe_pos + 2, &jbe_off, 4); }
+
+            /* r10 = n & ~7  (vectorisable count for the int8 inner loop). */
+            b = BUF(cg); b[0]=0x49; b[1]=0x89; b[2]=0xCA; EMIT(cg, 3);  /* mov r10, rcx */
+            b = BUF(cg); b[0]=0x49; b[1]=0x83; b[2]=0xE2; b[3]=0xF8; EMIT(cg, 4); /* and r10, -8 */
+
+            /* Scratch frame: push r15, sub rsp 16384, r15 = rsp.  All
+             * [rsp+N] arg reads are already done (registers loaded
+             * above), so shifting rsp here is safe. */
+            b = BUF(cg); b[0]=0x41; b[1]=0x57; EMIT(cg, 2);            /* push r15 */
+            b = BUF(cg); b[0]=0x48; b[1]=0x81; b[2]=0xEC;
+            b[3]=0x00; b[4]=0x40; b[5]=0x00; b[6]=0x00; EMIT(cg, 7);   /* sub rsp, 16384 */
+            b = BUF(cg); b[0]=0x49; b[1]=0x89; b[2]=0xE7; EMIT(cg, 3); /* mov r15, rsp */
+
+            pn = emit_xor_reg_reg(BUF(cg), REG_RBX, REG_RBX); EMIT(cg, pn);
+            CgCountedLoop outer = cg_loop_begin(cg, REG_RBX, 9 /* R9 = m */);
+
+            /* Packed row base: r13 = rdi + rbx*r11  (n/2 bytes/row). */
+            b = BUF(cg); b[0]=0x48; b[1]=0x89; b[2]=0xD8; EMIT(cg, 3);             /* mov rax, rbx */
+            b = BUF(cg); b[0]=0x49; b[1]=0x0F; b[2]=0xAF; b[3]=0xC3; EMIT(cg, 4);   /* imul rax, r11 */
+            b = BUF(cg); b[0]=0x4C; b[1]=0x8D; b[2]=0x2C; b[3]=0x07; EMIT(cg, 4);   /* lea r13, [rdi+rax] */
+
+            /* ---- Unpack: scratch[0..n) ← sign-extended nibbles ---- */
+            b = BUF(cg); b[0]=0x4D; b[1]=0x31; b[2]=0xE4; EMIT(cg, 3);  /* xor r12, r12 */
+            CgCountedLoop uloop = cg_loop_begin(cg, 12 /* R12 */, 11 /* R11 = n/2 */);
+            /* movzx eax, byte [r13 + r12]  (43 0F B6 44 25 00) */
+            b = BUF(cg); b[0]=0x43; b[1]=0x0F; b[2]=0xB6; b[3]=0x44; b[4]=0x25; b[5]=0x00; EMIT(cg, 6);
+            b = BUF(cg); b[0]=0x89; b[1]=0xC2; EMIT(cg, 2);            /* mov edx, eax */
+            b = BUF(cg); b[0]=0x83; b[1]=0xE2; b[2]=0x0F; EMIT(cg, 3); /* and edx, 0x0F  (lo) */
+            b = BUF(cg); b[0]=0xC1; b[1]=0xE8; b[2]=0x04; EMIT(cg, 3); /* shr eax, 4     (hi) */
+            b = BUF(cg); b[0]=0x83; b[1]=0xF2; b[2]=0x08; EMIT(cg, 3); /* xor edx, 8 */
+            b = BUF(cg); b[0]=0x83; b[1]=0xEA; b[2]=0x08; EMIT(cg, 3); /* sub edx, 8  → sign4(lo) */
+            b = BUF(cg); b[0]=0x83; b[1]=0xF0; b[2]=0x08; EMIT(cg, 3); /* xor eax, 8 */
+            b = BUF(cg); b[0]=0x83; b[1]=0xE8; b[2]=0x08; EMIT(cg, 3); /* sub eax, 8  → sign4(hi) */
+            /* mov [r15 + r12*2], dl   (43 88 14 67) */
+            b = BUF(cg); b[0]=0x43; b[1]=0x88; b[2]=0x14; b[3]=0x67; EMIT(cg, 4);
+            /* mov [r15 + r12*2 + 1], al  (43 88 44 67 01) */
+            b = BUF(cg); b[0]=0x43; b[1]=0x88; b[2]=0x44; b[3]=0x67; b[4]=0x01; EMIT(cg, 5);
+            cg_loop_end(cg, uloop, 1);
+
+            /* ---- Vectorised dot-product on scratch (r15) ----
+             * Byte-for-byte the int8 kernel's inner loop, with the
+             * data source SIB base changed from r13 (101) to r15
+             * (111).  Everything else identical. */
+            b = BUF(cg); b[0]=0xC5; b[1]=0xFC; b[2]=0x57; b[3]=0xC0; EMIT(cg, 4); /* vxorps ymm0,ymm0,ymm0 */
+            b = BUF(cg); b[0]=0x4D; b[1]=0x31; b[2]=0xE4; EMIT(cg, 3);            /* xor r12, r12 */
+            CgCountedLoop vloop = cg_loop_begin(cg, 12 /* R12 */, 10 /* R10 */);
+            /* vpmovsxbd ymm1, [r15 + r12*1] */
+            b = BUF(cg); b[0]=0xC4; b[1]=0x82; b[2]=0x7D; b[3]=0x21;
+            b[4]=(uint8_t)((1<<6) | ((1 & 7)<<3) | 4);
+            b[5]=(uint8_t)((0<<6) | ((12 & 7)<<3) | (15 & 7));
+            b[6]=0x00;
+            EMIT(cg, 7);
+            b = BUF(cg); b[0]=0xC5; b[1]=0xFC; b[2]=0x5B; b[3]=0xC9; EMIT(cg, 4); /* vcvtdq2ps ymm1,ymm1 */
+            /* vmovups ymm2, [rsi + r12*4] */
+            b = BUF(cg); b[0]=0xC4; b[1]=0xA1; b[2]=0x7C; b[3]=0x10;
+            b[4]=(uint8_t)((0<<6) | ((2 & 7)<<3) | 4);
+            b[5]=(uint8_t)((2<<6) | ((12 & 7)<<3) | (REG_RSI & 7));
+            EMIT(cg, 6);
+            /* vfmadd231ps ymm0, ymm1, ymm2 */
+            b = BUF(cg); b[0]=0xC4; b[1]=0xE2; b[2]=0x75; b[3]=0xB8; b[4]=0xC2; EMIT(cg, 5);
+            cg_loop_end(cg, vloop, 8);
+            /* Horizontal sum ymm0 → xmm0 lane 0. */
+            b = BUF(cg); b[0]=0xC4; b[1]=0xE3; b[2]=0x7D; b[3]=0x19; b[4]=0xC3; b[5]=0x01; EMIT(cg, 6);
+            b = BUF(cg); b[0]=0xC5; b[1]=0xF8; b[2]=0x58; b[3]=0xC3; EMIT(cg, 4);
+            b = BUF(cg); b[0]=0xC5; b[1]=0xFB; b[2]=0x7C; b[3]=0xC0; EMIT(cg, 4);
+            b = BUF(cg); b[0]=0xC5; b[1]=0xFB; b[2]=0x7C; b[3]=0xC0; EMIT(cg, 4);
+            /* Scalar tail j in [r10, rcx): scratch byte at r15+r12. */
+            CgCountedLoop tloop = cg_loop_begin(cg, 12 /* R12 */, REG_RCX);
+            /* movsx eax, byte [r15 + r12]  (43 0F BE 44 27 00) */
+            b = BUF(cg); b[0]=0x43; b[1]=0x0F; b[2]=0xBE; b[3]=0x44; b[4]=0x27; b[5]=0x00; EMIT(cg, 6);
+            b = BUF(cg); b[0]=0xF3; b[1]=0x0F; b[2]=0x2A; b[3]=0xC8; EMIT(cg, 4); /* cvtsi2ss xmm1, eax */
+            /* movss xmm2, [rsi + r12*4] */
+            b = BUF(cg); b[0]=0xF3; b[1]=0x42; b[2]=0x0F; b[3]=0x10;
+            b[4]=(uint8_t)((0<<6) | ((2 & 7)<<3) | 4);
+            b[5]=(uint8_t)((2<<6) | ((12 & 7)<<3) | (REG_RSI & 7));
+            EMIT(cg, 6);
+            /* vfmadd231ss xmm0, xmm1, xmm2 */
+            b = BUF(cg); b[0]=0xC4; b[1]=0xE2; b[2]=0x71; b[3]=0xB9; b[4]=0xC2; EMIT(cg, 5);
+            cg_loop_end(cg, tloop, 1);
+            /* xmm5 = scales[rbx] : movss xmm5, [r14 + rbx*4]. */
+            b = BUF(cg); b[0]=0xF3; b[1]=0x41; b[2]=0x0F; b[3]=0x10; b[4]=0x2C; b[5]=0x9E; EMIT(cg, 6);
+            b = BUF(cg); b[0]=0xF3; b[1]=0x0F; b[2]=0x59; b[3]=0xC5; EMIT(cg, 4); /* mulss xmm0, xmm5 */
+            /* movss [r8 + rbx*4], xmm0 */
+            b = BUF(cg); b[0]=0xF3; b[1]=0x41; b[2]=0x0F; b[3]=0x11;
+            b[4]=(uint8_t)((0<<6) | ((0 & 7)<<3) | 4);
+            b[5]=(uint8_t)((2<<6) | ((REG_RBX & 7)<<3) | (8 & 7));
+            EMIT(cg, 6);
+            cg_loop_end(cg, outer, 1);
+
+            /* Epilogue: vzeroupper, free scratch, restore, return 0. */
+            b = BUF(cg); b[0]=0xC5; b[1]=0xF8; b[2]=0x77; EMIT(cg, 3);          /* vzeroupper */
+            b = BUF(cg); b[0]=0x48; b[1]=0x81; b[2]=0xC4;
+            b[3]=0x00; b[4]=0x40; b[5]=0x00; b[6]=0x00; EMIT(cg, 7);            /* add rsp, 16384 */
+            b = BUF(cg); b[0]=0x41; b[1]=0x5F; EMIT(cg, 2);  /* pop r15 */
+            b = BUF(cg); b[0]=0x41; b[1]=0x5E; EMIT(cg, 2);  /* pop r14 */
+            b = BUF(cg); b[0]=0x41; b[1]=0x5D; EMIT(cg, 2);  /* pop r13 */
+            b = BUF(cg); b[0]=0x41; b[1]=0x5C; EMIT(cg, 2);  /* pop r12 */
+            pn = emit_pop(BUF(cg), REG_RBX); EMIT(cg, pn);
+            b = BUF(cg); b[0]=0x48; b[1]=0x83; b[2]=0xC4; b[3]=32; EMIT(cg, 4); /* add rsp, 32 */
+            pn = emit_xor_reg_reg(BUF(cg), REG_RAX, REG_RAX); EMIT(cg, pn);
+            return 1;
+        }
         if (strcmp(name, "arr_f64_copy_slice") == 0 && argc == 5) {
             /* Copy n f64 elements from src[src_offset..] into
              * dst[dst_offset..].  The explicit length decouples this

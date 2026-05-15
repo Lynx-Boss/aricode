@@ -1337,6 +1337,30 @@ int emit_builtin(CodegenState *cg, const ASTNode *node,
             emit_builtin_read_int(cg);
             return 1;
         }
+        if (strcmp(name, "rdtsc") == 0 && argc == 0) {
+            /* rdtsc() -> f64 : 64-bit timestamp counter as a double.
+             * Zero syscall overhead — ideal for relative profiling of
+             * decoder sections.  Returned as f64 (not i32) because
+             * aric has no i64 and the raw TSC overflows i32 every
+             * ~1.4 s at 3 GHz; an f64 mantissa represents the integer
+             * cycle count exactly up to 2^52 (~17 days at 3 GHz).
+             * It's CPU cycles, not wall-ns, but the RATIO between
+             * sections is exactly what "where does per-token time go"
+             * needs.  Same f64-in-RAX return convention as
+             * read_float. */
+            uint8_t *b = BUF(cg);
+            b[0]=0x0F; b[1]=0x31;                       /* rdtsc: EDX:EAX = TSC */
+            EMIT(cg, 2);
+            b = BUF(cg);
+            b[0]=0x48; b[1]=0xC1; b[2]=0xE2; b[3]=0x20; /* shl rdx, 32 */
+            EMIT(cg, 4);
+            b = BUF(cg);
+            b[0]=0x48; b[1]=0x09; b[2]=0xD0;            /* or rax, rdx (RAX=full TSC) */
+            EMIT(cg, 3);
+            int pn = emit_cvtsi2sd(BUF(cg), 0, REG_RAX); EMIT(cg, pn);
+            pn = emit_movq_reg_xmm(BUF(cg), REG_RAX, 0); EMIT(cg, pn);
+            return 1;
+        }
         /*
          * ARRAY BUILTINS
          * arr_new(n): allocate n-element array on stack, store length, return base

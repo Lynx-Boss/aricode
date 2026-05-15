@@ -391,6 +391,7 @@ static AriType *builtin_return_type(const char *name) {
         {"print_str",       TYPE_VOID},
         /* i32 — read helpers */
         {"read_float",      TYPE_F64},
+        {"rdtsc",           TYPE_F64},
         {"read_int",        TYPE_I32},
         /* i32 — socket builtins */
         {"socket_accept",   TYPE_I32},

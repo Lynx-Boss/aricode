@@ -151,10 +151,26 @@ Keep the inline path as a fallback emitted when an
 `--inline-int4-matmul` debug flag is set — useful for differential
 testing during the builtin implementation.
 
-## Status (2026-05-13)
+## Status (2026-05-15) — SHIPPED
 
-- Inline path: SHIPPED in `bc8b735` of aricode-stdlib/aricode-ml
-- SIMD builtin: deferred to the next session.  All groundwork
-  (packing format, scales sidecar, .i4 extension, even-dim
-  invariants) is established and validated in production binaries
-  (`aricode_tiny_qat`).
+- Inline path: shipped in `bc8b735` of aricode-stdlib/aricode-ml
+- **SIMD builtin: SHIPPED in `aa8c738` of aricoderoot.**
+  Implemented as the scratch-unpack + cloned-int8-AVX2-dotproduct
+  variant described above (not the in-register vpcmpgtb unpack —
+  that remains a possible future micro-opt but the scratch
+  approach already delivers the target speedup with far less
+  machine-code risk).
+- pack.py `emit_linear` bits=4 path now emits the builtin call
+  instead of the inline scalar loop.
+- Verified: `test_i4_perrow.ari` exact; aricode_tiny_qat 64-token
+  completion 4.02 s → 1.03 s (3.9x), bit-identical generation.
+- Residual gap vs int8's 0.8 s = embedding + attention (f32/int8,
+  out of scope for this builtin).
+
+### Possible future micro-opt (not needed)
+
+The in-register AVX2 unpack (vpand + vpcmpgtb sign-extend, no
+scratch round-trip) would shave the unpack cost further, but the
+unpack is already a small fraction of total time vs the FMA loop.
+Not worth the machine-code risk unless profiling shows the
+scratch store/load as a bottleneck (it isn't at our matvec sizes).
